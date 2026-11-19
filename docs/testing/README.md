@@ -87,7 +87,9 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。
 
-首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（12 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。
+首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（12 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。加入 65% 覆盖门禁后的复跑：<https://github.com/bfxh/trit-db/actions/runs/44595879346>。
+
+nightly stress 手动首跑：<https://github.com/bfxh/trit-db/actions/runs/44596129132>（crash matrix、txn store 压力测试 3 个 job 全绿）。
 
 ## 6. CD
 
@@ -102,6 +104,8 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 ```bash
 cargo build --release --locked -p tritdb -p tritdb-bench
 ```
+
+当前 `release` workflow 已注册但尚未打 tag，因此还没有公开 Release 产物；首次推送 `v*` tag 才会实际执行跨平台打包和 `gh release create`。
 
 ## 7. 已知边界
 
