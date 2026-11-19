@@ -1,6 +1,6 @@
 # M1 SQL 3VL：最小纵向切片读数
 
-状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN 已实现。
+状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / LEFT JOIN 已实现。
 日期：2026-11-20
 
 ## 1. 交付
@@ -20,6 +20,7 @@ docs/specs/SQL.md
 - `SELECT`：`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT`、别名、`*`
 - `GROUP BY` 直接列引用、`NULL` 键同组、分组聚合、分组结果排序
 - 多表 `INNER JOIN`：表别名、`alias.column` 限定列、非限定唯一列、自连接、JOIN 后分组/排序
+- `LEFT [OUTER] JOIN`：未匹配左行保留、右侧列补 `NULL`、空右表、LEFT JOIN 后 `WHERE/GROUP BY`
 - `DELETE`、`DROP TABLE`
 - `COUNT(*)`、`COUNT(expr)`、`SUM`、`MIN`、`MAX`
 - `INT` / `TEXT` / `BOOL`，`NOT NULL`
@@ -38,7 +39,7 @@ python tools/crosscheck/sql_oracle.py --tritdb target/debug/tritdb
 本机结果：
 
 ```text
-sql oracle: 57/57 passed
+sql oracle: 63/63 passed
 ```
 
 对拍口径：
@@ -53,17 +54,17 @@ sql oracle: 57/57 passed
 | 层 | 新增 |
 |---|---:|
 | `tritdb-exec` 单元测试 | 8 |
-| `tritdb-sql` 单元测试 | 12 |
-| `tritdb-sql` 引擎集成测试 | 17 |
+| `tritdb-sql` 单元测试 | 13 |
+| `tritdb-sql` 引擎集成测试 | 19 |
 | `tritdb` SQL CLI 集成测试 | 2 |
-| **合计** | **39** |
+| **合计** | **42** |
 
-其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，7 个来自 INNER JOIN 切片（2 个 parser + 5 个 engine）。工作区测试从 158 增至 **197 个正常测试 + 4 个 ignored 压力测试**。
+其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine）。工作区测试从 158 增至 **200 个正常测试 + 4 个 ignored 压力测试**。
 
 ## 4. 负结果 / 边界
 
 1. **整表重写**：每次 INSERT/DELETE 都把整张表重新编码成一个 KV value。数据量增大后写放大和内存峰值会先撞墙，M1 不解决。
-2. **JOIN 只做 INNER，且是嵌套循环**：不支持 `LEFT/RIGHT/FULL/CROSS/NATURAL JOIN`、`USING`、逗号 join 或子查询；左右表都物化，复杂度是行数乘积，后续再引入 hash join/优化器。`GROUP BY` 只支持列引用，不支持分组表达式、位置序号、GROUPING SETS/CUBE/ROLLUP。SQLite 对拍已覆盖单表表达式、分组聚合、`HAVING` 和多表 join。
+2. **JOIN 只做 INNER/LEFT，且是嵌套循环**：不支持 `RIGHT/FULL/CROSS/NATURAL JOIN`、`USING`、逗号 join 或子查询；左右表都物化，复杂度是行数乘积，后续再引入 hash join/优化器。`GROUP BY` 只支持列引用，不支持分组表达式、位置序号、GROUPING SETS/CUBE/ROLLUP。SQLite 对拍已覆盖单表表达式、分组聚合、`HAVING`、INNER JOIN 和 LEFT JOIN。
 3. **没有 pgwire**：`psql` 还连不上；CLI 是当前唯一入口。
 4. **每个语句自动提交**：脚本不是一个大事务；`INSERT` 多行在一个事务内，但 `CREATE`/`INSERT`/`SELECT` 之间不共享事务。
 5. **没有跨进程锁**：两个进程写同一个 SQL WAL 仍是未定义行为，和 M0 一致。
@@ -82,7 +83,7 @@ sql oracle: 57/57 passed
 
 ## 6. 下一步
 
-- INNER JOIN 已做嵌套循环；下一步做 hash join、`LEFT JOIN`，并把 JOIN 对拍扩到更多 NULL/复合键组合。
+- INNER JOIN 已做嵌套循环；LEFT JOIN 复用同一循环并补未匹配行。下一步做 hash join、`RIGHT/FULL JOIN`，并把 JOIN 对拍扩到更多 NULL/复合键组合。
 - `tritdb-plan`：逻辑计划、列裁剪、谓词下推、常量折叠。
 - `tritdb-proto`：pgwire v3 simple query + extended query，先让 `psql` 能连。
 - 表存储从整表重写改成页/行格式，接 `tritdb-page`。

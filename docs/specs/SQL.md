@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN`（表别名 + 限定列）；`LEFT/RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -21,11 +21,14 @@ SELECT d.name, COUNT(*) AS n
 FROM users AS u JOIN depts AS d ON u.dept = d.id
 GROUP BY d.name
 ORDER BY d.name;
+SELECT u.name, d.name AS dept
+FROM users AS u LEFT JOIN depts AS d ON u.dept = d.id
+ORDER BY u.name;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名和多表 `INNER JOIN`；只做 inner join，不支持 `LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL JOIN`、`USING`、逗号 join 或子查询。
+- 支持表别名、多表 `INNER JOIN` 和 `LEFT [OUTER] JOIN`；不支持 `RIGHT`/`FULL`/`CROSS`/`NATURAL JOIN`、`USING`、逗号 join 或子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次写重写整张表。
@@ -69,7 +72,7 @@ INSERT INTO name [(column, ...)] VALUES (expr, ...) [, (expr, ...)];
 ```sql
 SELECT * | expr [AS alias], ...
 FROM name [AS alias]
-[[INNER] JOIN name [AS alias] ON predicate]...
+[[INNER | LEFT [OUTER]] JOIN name [AS alias] ON predicate]...
 [WHERE predicate]
 [GROUP BY column, ...]
 [HAVING predicate]
@@ -78,8 +81,10 @@ FROM name [AS alias]
 ```
 
 - `FROM` 后可带 `AS alias` 或裸别名；别名定义限定名命名空间。
-- `JOIN` 只支持 `INNER`（`JOIN` 等价于 `INNER JOIN`），可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
-- `ON` 是逐行谓词，只保留结果为 `TRUE` 的组合；`FALSE` 和 `UNKNOWN` 都不产生结果行。`ON` 中不接受聚合或子查询。
+- `JOIN` 支持 `INNER`（`JOIN` 等价于 `INNER JOIN`）和 `LEFT [OUTER] JOIN`，可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
+- `ON` 是逐行谓词，只保留结果为 `TRUE` 的组合；`FALSE` 和 `UNKNOWN` 都不产生匹配行。`ON` 中不接受聚合或子查询。
+- `INNER JOIN` 只输出匹配组合；`LEFT JOIN` 对每个左行，若没有任何 `ON=TRUE` 的右行，就输出该左行并把右侧所有列置为 `NULL`。右表为空时，左表每一行都以右侧全 `NULL` 输出。
+- `LEFT JOIN` 的右侧列在输出 schema 中一律标记为可空；`WHERE` 在 join 之后执行，因此 `WHERE right.col IS NULL` 可筛出未匹配左行。
 - 限定列写作 `alias.column`；非限定列先精确匹配，再按唯一列名解析，多表同名列必须限定，否则报 `ambiguous column`。
 - 别名/表名在同一 `FROM` 子句内必须唯一；自连接必须给同一张表分配不同别名，否则报 `duplicate table name or alias`。
 - JOIN 使用嵌套循环实现，不引入 hash join 或优化器；左右表都物化为临时结果，内存随行数乘积增长。
@@ -166,6 +171,6 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER JOIN、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 57/57 通过。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 63/63 通过。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。
