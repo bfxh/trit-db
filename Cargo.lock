@@ -9,6 +9,7 @@ dependencies = [
  "tritdb-format",
  "tritdb-page",
  "tritdb-radix",
+ "tritdb-sql",
  "tritdb-store",
  "tritdb-testkit",
  "tritdb-txn",
@@ -26,6 +27,10 @@ dependencies = [
  "tritdb-txn",
  "tritdb-wal",
 ]
+
+[[package]]
+name = "tritdb-exec"
+version = "0.0.1"
 
 [[package]]
 name = "tritdb-format"
@@ -48,6 +53,15 @@ name = "tritdb-radix"
 version = "0.0.1"
 dependencies = [
  "tritdb-testkit",
+]
+
+[[package]]
+name = "tritdb-sql"
+version = "0.0.1"
+dependencies = [
+ "tritdb-exec",
+ "tritdb-testkit",
+ "tritdb-txn",
 ]
 
 [[package]]

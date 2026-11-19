@@ -68,6 +68,7 @@ jobs:
       - run: cargo build --locked -p tritdb
       - run: python tools/crosscheck/gen_vectors.py --check
       - run: python tools/crosscheck/check_cli.py
+      - run: python tools/crosscheck/sql_oracle.py --tritdb target/debug/tritdb
 
   coverage:
     name: coverage

@@ -1,0 +1,11 @@
+[package]
+name = "tritdb-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "SQL values, three-valued logic, and expression evaluation for trit-db"
+
+[lints]
+workspace = true

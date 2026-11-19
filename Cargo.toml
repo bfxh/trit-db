@@ -7,6 +7,8 @@ members = [
     "crates/tritdb-wal",
     "crates/tritdb-txn",
     "crates/tritdb-store",
+    "crates/tritdb-exec",
+    "crates/tritdb-sql",
     "crates/tritdb-bench",
     "crates/tritdb",
     "crates/tritdb-testkit",
@@ -26,6 +28,8 @@ tritdb-format = { path = "crates/tritdb-format" }
 tritdb-wal = { path = "crates/tritdb-wal" }
 tritdb-txn = { path = "crates/tritdb-txn" }
 tritdb-store = { path = "crates/tritdb-store" }
+tritdb-exec = { path = "crates/tritdb-exec" }
+tritdb-sql = { path = "crates/tritdb-sql" }
 tritdb-testkit = { path = "crates/tritdb-testkit" }
 
 [workspace.lints.rust]

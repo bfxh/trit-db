@@ -1,6 +1,6 @@
 # trit-db 测试矩阵与 CI/CD
 
-M0 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃和并发边界拆开验证。当前工作区有 **158 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值语义拆开验证。当前工作区有 **184 个正常测试 + 4 个 `#[ignore]` 压力测试**。
 
 ## 1. 分层与计数
 
@@ -12,8 +12,10 @@ M0 的测试目标不是“覆盖率数字好看”，而是把格式、引擎�
 | `tritdb-wal` | 7 | 10 fuzz | 17 | 每个前缀、torn tail、LSN 连续、逐字节 mutation |
 | `tritdb-txn` | 14 | 11 model | 25 | 随机事务 + checkpoint/reopen、提交组、读者单调性、snapshot-only reopen LSN |
 | `tritdb-store` | 12 | 9 model | 21 | 页模型、abort、sidecar 截断/损坏、并发读者 |
-| `tritdb`（集成） | — | — | 14 | CLI 4、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
-| **合计** | **77** | **81** | **158** | 另有 4 个 ignored 压力测试 |
+| `tritdb-exec` | 8 | — | 8 | 三值 AND/OR/NOT 真值表、NULL 比较、算术、非布尔谓词 |
+| `tritdb-sql` | 9 | 7 engine | 16 | parser、TRSQ 编解码、3VL WHERE、NULL 排序、聚合、DELETE/reopen |
+| `tritdb`（集成） | — | — | 16 | CLI 4、SQL CLI 2、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
+| **合计** | **94** | **74** | **184** | 另有 4 个 ignored 压力测试 |
 
 `vectors` 的 5 个测试覆盖 `radix.txt`、`trbl.txt`、`page.txt`、`wal.txt`、`snapshot.txt`。向量由 Python 参考实现生成，Rust 只负责解码、重编码和语义恢复。
 
@@ -30,6 +32,12 @@ M0 的测试目标不是“覆盖率数字好看”，而是把格式、引擎�
 ### 引擎 ↔ 引擎
 
 - `crates/tritdb/tests/cross_engine.rs`：同一逻辑 workload 同时跑 `TxnStore` 和 `PageStore`，逐 key/页比对；TRBL 块作为同一 payload 分别塞进两个引擎，checkpoint/reopen 后仍可解码。
+
+### SQL ↔ SQLite
+
+- `tools/crosscheck/sql_oracle.py`：同一份 `CREATE TABLE` + `INSERT` 同时灌入 `tritdb-sql` 和 Python `sqlite3`；22 条基础 + 12 条扩展 SELECT 共 **34/34** 逐行一致。
+- 比较前归一化 `TRUE`/`FALSE` 为 `1`/`0`、`NULL` 为 `NULL`，只比较行值不比较列名；SQLite 不支持的 `IS UNKNOWN` 由 Rust 测试单独覆盖。
+- 覆盖三值 `WHERE`、`NOT`、`IS NULL`、NULL 参与比较、NULL 排序、聚合、别名、算术表达式、`LIMIT`。
 
 ### 格式 ↔ 引擎
 
@@ -81,7 +89,7 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 | `lint` | Ubuntu | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` |
 | `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
 | `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
-| `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge） |
+| `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge）、`sql_oracle.py`（SQLite 3VL 对拍） |
 | `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；首轮实测 3253/4791 = 67.9% |
 | `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
 
@@ -118,4 +126,6 @@ cargo build --release --locked -p tritdb -p tritdb-bench
 - 跨语言向量不覆盖真实磁盘 fsync 时序；崩溃测试只覆盖“进程被硬杀”和“WAL torn tail/short file”，不模拟断电、磁盘写缓存重排。
 - `PageStore` 没有跨页快照 API，页级并发测试只断言单页来自已提交版本。
 - 提交组没有冲突检测，同一 key 的最后 WAL 顺序获胜；模型测试按这个语义断言。
+- SQL 表每次写都重写整个 value；对拍只覆盖小表，不覆盖大表写放大、并发 SQL 写者或跨进程锁。
+- SQL `IS UNKNOWN` 没有进 SQLite 对拍（SQLite 不支持该语法），由 `tritdb-exec` / `tritdb-sql` 单元测试覆盖。
 - `checkpoint_commit_loop` 在 debug 下可能需要数分钟；nightly 用 release，本地调试请降低 `TRITDB_STRESS_ROUNDS`。

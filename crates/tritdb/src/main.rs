@@ -18,6 +18,7 @@ use std::time::Duration;
 use tritdb_format::Block;
 use tritdb_page::{Page, PageKind, PAGE_SIZE};
 use tritdb_radix::{pack, unpack, Radix, Trit};
+use tritdb_sql::{QueryResult, SqlEngine};
 use tritdb_store::{PageId, PageStore};
 use tritdb_txn::TxnStore;
 use tritdb_wal::{TailState, WalReader};
@@ -38,6 +39,7 @@ fn run() -> Result<(), String> {
         Some("wal") => run_wal(&args),
         Some("txn") => run_txn(&args),
         Some("pstore") => run_pstore(&args),
+        Some("sql") => run_sql(&args),
         Some("crosscheck") => run_crosscheck(),
         Some("help") | Some("--help") | None => {
             print_help();
@@ -66,6 +68,8 @@ fn print_help() {
     println!("  pstore dump --data pstore.pages --wal pstore.wal");
     println!("  pstore checkpoint --data pstore.pages --wal pstore.wal");
     println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
+    println!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
+    println!("  sql --db sql.db --file script.sql");
     println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
 
@@ -596,6 +600,46 @@ fn pstore_writer(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn run_sql(args: &[String]) -> Result<(), String> {
+    let db = required_arg(args, "--db")?;
+    if arg_value(args, "--sql").is_some() && arg_value(args, "--file").is_some() {
+        return Err("use either --sql or --file, not both".to_string());
+    }
+    let script = if let Some(sql) = arg_value(args, "--sql") {
+        sql
+    } else if let Some(file) = arg_value(args, "--file") {
+        std::fs::read_to_string(&file).map_err(|error| format!("read {file}: {error}"))?
+    } else {
+        return Err("sql requires --sql or --file".to_string());
+    };
+
+    let mut engine =
+        SqlEngine::open(Path::new(&db)).map_err(|error| format!("open {db}: {error}"))?;
+    let results = engine
+        .execute_script(&script)
+        .map_err(|error| error.to_string())?;
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_query_result(result);
+    }
+    Ok(())
+}
+
+fn print_query_result(result: &QueryResult) {
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            println!("{}", columns.join("\t"));
+            for row in rows {
+                let values: Vec<String> = row.iter().map(|value| value.display()).collect();
+                println!("{}", values.join("\t"));
+            }
+        }
+        QueryResult::Message(message) => println!("{message}"),
+    }
 }
 
 fn preview_bytes(bytes: &[u8]) -> String {

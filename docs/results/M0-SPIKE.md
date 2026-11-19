@@ -282,6 +282,8 @@ cargo run -q -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --k
 
 另有 4 个 `#[ignore]` 压力测试（txn 2、store 2），由 nightly `stress.yml` 在 release 下执行。
 
+> M1 最小 SQL 切片在此基线之上追加 26 个测试（`tritdb-exec` 8、`tritdb-sql` 16、SQL CLI 2），当前全量为 **184 个正常测试 + 4 个 ignored**。SQL 语义与边界见 [`M1-SQL.md`](M1-SQL.md)。
+
 测试分层、交叉矩阵、崩溃注入与 CI/CD 细节见 [`docs/testing/README.md`](../testing/README.md)。
 
 2026-11-20 复验：158 个测试已在 debug、release 下全工作区通过；`fmt --check` 与 `clippy --workspace --all-targets -- -D warnings` 通过。Python `gen_vectors.py --check`、`check_cli.py` 与 framed bridge 通过。Rust 1.88 的全量复验见 CI `msrv` job。
