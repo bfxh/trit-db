@@ -73,9 +73,9 @@ sql oracle: 45/45 passed
 
 ## 5. CI 与覆盖
 
-- CI run：<https://github.com/bfxh/trit-db/actions/runs/44608271037>，11 个 job 全绿。
-- Ubuntu/Windows/macOS 三平台 `python-crosscheck` 都执行 `sql_oracle.py`，均为 34/34。
-- 新增两个 SQL crate 后，行覆盖从 3253/4791 = 67.9% 变为 **4710/6559 = 71.81%**，65% 门禁仍有余量。
+- CI run：<https://github.com/bfxh/trit-db/actions/runs/44610635876>，11 个 job 全绿。
+- Ubuntu/Windows/macOS 三平台 `python-crosscheck` 都执行 `sql_oracle.py`，均为 45/45。
+- SQL 3VL 切片（184 测试）行覆盖为 4710/6559 = 71.81%；加入 GROUP BY/HAVING 后为 **4906/6777 = 72.39%**，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
