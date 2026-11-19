@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`；pgwire、优化器、JOIN、子查询仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN`（表别名 + 限定列）；`LEFT/RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -17,11 +17,16 @@ SELECT id, name, flag FROM t
 WHERE flag IS NULL OR id >= 2
 ORDER BY id DESC
 LIMIT 2;
+SELECT d.name, COUNT(*) AS n
+FROM users AS u JOIN depts AS d ON u.dept = d.id
+GROUP BY d.name
+ORDER BY d.name;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 单表、无 JOIN、无子查询；`GROUP BY` 只接受列引用，不接受表达式、位置序号或 GROUPING SETS。
+- 支持表别名和多表 `INNER JOIN`；只做 inner join，不支持 `LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL JOIN`、`USING`、逗号 join 或子查询。
+- `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次写重写整张表。
 - 没有 pgwire、没有优化器、没有索引、没有 MVCC。
@@ -63,7 +68,8 @@ INSERT INTO name [(column, ...)] VALUES (expr, ...) [, (expr, ...)];
 
 ```sql
 SELECT * | expr [AS alias], ...
-FROM name
+FROM name [AS alias]
+[[INNER] JOIN name [AS alias] ON predicate]...
 [WHERE predicate]
 [GROUP BY column, ...]
 [HAVING predicate]
@@ -71,8 +77,16 @@ FROM name
 [LIMIT n];
 ```
 
-- `WHERE` 只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
-- `GROUP BY` 只支持直接列引用；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
+- `FROM` 后可带 `AS alias` 或裸别名；别名定义限定名命名空间。
+- `JOIN` 只支持 `INNER`（`JOIN` 等价于 `INNER JOIN`），可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
+- `ON` 是逐行谓词，只保留结果为 `TRUE` 的组合；`FALSE` 和 `UNKNOWN` 都不产生结果行。`ON` 中不接受聚合或子查询。
+- 限定列写作 `alias.column`；非限定列先精确匹配，再按唯一列名解析，多表同名列必须限定，否则报 `ambiguous column`。
+- 别名/表名在同一 `FROM` 子句内必须唯一；自连接必须给同一张表分配不同别名，否则报 `duplicate table name or alias`。
+- JOIN 使用嵌套循环实现，不引入 hash join 或优化器；左右表都物化为临时结果，内存随行数乘积增长。
+- 输出列标签去掉限定前缀；`SELECT *` 在多表 join 中遇到同名列会产生重复标签。
+
+- `WHERE` 在 join 之后执行，只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
+- `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
 - `HAVING` 在分组聚合之后、投影/排序之前执行，只保留 `TRUE`；可以引用分组键和聚合表达式，不能引用未分组列。
 - `SELECT` 聚合项支持 `COUNT(*)`、`COUNT(expr)`、`SUM(expr)`、`MIN(expr)`、`MAX(expr)`；分组查询中的裸列必须是 `GROUP BY` 列，标量表达式只能引用分组列。
 - `ORDER BY` 支持源列、SELECT 别名、聚合表达式；分组查询按分组键/聚合结果排序。`NULL` 在 ASC 时排最前，DESC 时排最后。
@@ -152,6 +166,6 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 45/45 通过。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER JOIN、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 57/57 通过。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

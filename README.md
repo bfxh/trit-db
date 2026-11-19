@@ -1,6 +1,6 @@
 # trit-db
 
-多进制列存 + 多值语义数据库的 **M0 骨架 + M1 最小 SQL 3VL/分组切片**。当前十一个 crate 只做这些事：
+多进制列存 + 多值语义数据库的 **M0 骨架 + M1 最小 SQL 3VL/分组/JOIN 切片**。当前十一个 crate 只做这些事：
 
 1. `tritdb-radix`：三值序列的 3/4/16 进制打包与解包；r3 走 10-bit 查表；逐位往返、非法输入结构化报错。
 2. `tritdb-page`：8 KiB 页 + 头 + CRC32；坏 magic/版本/长度/校验和/半写检测。
@@ -12,9 +12,9 @@
 8. `tritdb-testkit`：零依赖测试工具；唯一临时目录、确定性 xorshift64*、hex 编解码。
 9. `tools/crosscheck/` + `testdata/vectors/`：独立 Python 字节级参考实现、确定性向量、Rust→Python 反向校验和二进制 framed bridge。
 10. `tritdb-exec`：SQL 值、schema、三值逻辑真值表、比较/算术表达式求值。
-11. `tritdb-sql`：最小 lexer/parser/binder/executor；`CREATE/INSERT/SELECT/DELETE/DROP`、`WHERE/ORDER BY/LIMIT`、单表 `GROUP BY`/`HAVING`、分组聚合与聚合结果排序；表以 `TRSQ` 整表 value 存进 `TxnStore`。
+11. `tritdb-sql`：最小 lexer/parser/binder/executor；`CREATE/INSERT/SELECT/DELETE/DROP`、`WHERE/ORDER BY/LIMIT`、`GROUP BY`/`HAVING`、多表 `INNER JOIN`（表别名 + 限定列）、分组聚合与聚合结果排序；表以 `TRSQ` 整表 value 存进 `TxnStore`。
 
-**还没有做**：多表 SQL（JOIN、子查询、UPDATE、窗口函数）、优化器、pgwire、MVCC、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、跨进程文件锁。不要把这个骨架当成数据库。
+**还没有做**：`LEFT/RIGHT/FULL JOIN`、子查询、`UPDATE`、窗口函数、优化器、pgwire、MVCC、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、跨进程文件锁。不要把这个骨架当成数据库。
 
 ## 发布
 
@@ -48,6 +48,7 @@ python tools/crosscheck/sql_oracle.py --tritdb target/debug/tritdb
 cargo run -p tritdb -- sql --db sql.db --sql "CREATE TABLE t (id INT NOT NULL, flag BOOL); INSERT INTO t VALUES (1, TRUE), (2, NULL);"
 cargo run -p tritdb -- sql --db sql.db --sql "SELECT id, flag FROM t WHERE flag IS NULL;"
 cargo run -p tritdb -- sql --db sql.db --sql "SELECT flag, COUNT(*) AS n FROM t GROUP BY flag HAVING COUNT(*) >= 1 ORDER BY flag;"
+cargo run -p tritdb -- sql --db sql.db --sql "CREATE TABLE d (id INT NOT NULL, name TEXT); INSERT INTO d VALUES (1, 'eng'); SELECT t.id, d.name FROM t JOIN d ON t.id = d.id;"
 cargo run -p tritdb-bench --release -- radix --trits 1000000 --rounds 6
 cargo run -p tritdb-bench --release -- baseline --trits 1000000 --rounds 6
 cargo run -p tritdb-bench --release -- block --trits 1000000 --rounds 6 --radix r3
@@ -66,7 +67,7 @@ cargo run -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --keys
 
 ## 测试与 CI
 
-当前 **190 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
+当前 **197 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN 分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
 
 - `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / 三平台 Python 交叉校验（向量 + CLI + SQLite SQL 对拍）/ coverage / docs。
 - `stress.yml`：每天 04:00 UTC 跑 release 模式压力测试与 crash matrix。
@@ -117,4 +118,4 @@ docs/results/          M0/M1 读数与负结果
 - `已设计`：只有文档。
 - `未做`：没有代码。
 
-当前：radix/page/format/wal/txn/store/页 checkpoint/键值 checkpoint/提交组/CLI/bench/最小 SQL 3VL/单表 GROUP BY 为 `已实现`；多表 SQL/优化器/pgwire/MVCC/WAL 段轮转/后台 checkpoint/跨进程锁 为 `未做`。
+当前：radix/page/format/wal/txn/store/页 checkpoint/键值 checkpoint/提交组/CLI/bench/最小 SQL 3VL/单表 GROUP BY/多表 INNER JOIN 为 `已实现`；LEFT/RIGHT/FULL JOIN、子查询、优化器/pgwire/MVCC/WAL 段轮转/后台 checkpoint/跨进程锁 为 `未做`。
