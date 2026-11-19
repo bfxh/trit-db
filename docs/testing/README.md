@@ -87,7 +87,7 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。
 
-首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（12 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。加入 65% 覆盖门禁后的复跑：<https://github.com/bfxh/trit-db/actions/runs/44595879346>。
+首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（11 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。加入 65% 覆盖门禁后的复跑：<https://github.com/bfxh/trit-db/actions/runs/44595879346>。
 
 nightly stress 手动首跑：<https://github.com/bfxh/trit-db/actions/runs/44596129132>（crash matrix、txn store 压力测试 3 个 job 全绿）。
 
@@ -105,7 +105,13 @@ nightly stress 手动首跑：<https://github.com/bfxh/trit-db/actions/runs/4459
 cargo build --release --locked -p tritdb -p tritdb-bench
 ```
 
-当前 `release` workflow 已注册但尚未打 tag，因此还没有公开 Release 产物；首次推送 `v*` tag 才会实际执行跨平台打包和 `gh release create`。
+首次发布 `v0.0.1` 已实际跑通：
+
+- Release：<https://github.com/bfxh/trit-db/releases/tag/v0.0.1>
+- Release run：<https://github.com/bfxh/trit-db/actions/runs/44603091304>
+- 产物：`tritdb-linux-x86_64.tar.gz`、`tritdb-windows-x86_64.tar.gz`、`tritdb-macos-arm64.tar.gz`
+
+首跑暴露并修复了两个 workflow 问题：macOS job 使用的 `macos-14` runner image 已退役，改为 `macos-15`；publish job 缺 `actions/checkout`，导致 `gh release create --verify-tag` 找不到 git 仓库上下文。修复后三个平台构建和 Release 发布全部成功，Windows 产物已下载并做过 `radix` / `txn put/get/dump` 冒烟验证。
 
 ## 7. 已知边界
 

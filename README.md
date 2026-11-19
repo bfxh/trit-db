@@ -14,6 +14,10 @@
 
 **还没有做**：SQL、parser、binder、MVCC、pgwire、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、跨进程文件锁。不要把这个骨架当成数据库。
 
+## 发布
+
+M0 首个版本 **v0.0.1**：<https://github.com/bfxh/trit-db/releases/tag/v0.0.1>。提供 Linux x86_64、Windows x86_64、macOS arm64 三个平台的 `tritdb` / `tritdb-bench` 压缩包；由 `v*` tag 触发的 GitHub Actions release 工作流构建和发布。
+
 ## 快速开始
 
 ```bash
