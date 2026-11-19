@@ -82,10 +82,12 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 | `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
 | `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
 | `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge） |
-| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，上传 `lcov.info` |
+| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；首轮实测 3253/4791 = 67.9% |
 | `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。
+
+首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（12 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。
 
 ## 6. CD
 
