@@ -111,6 +111,10 @@ pub struct Select {
     pub table: String,
     /// Optional filter.
     pub filter: Option<Expr>,
+    /// Grouping columns.
+    pub group_by: Vec<Expr>,
+    /// Optional group filter.
+    pub having: Option<Expr>,
     /// Sort keys.
     pub order_by: Vec<OrderBy>,
     /// Optional limit.

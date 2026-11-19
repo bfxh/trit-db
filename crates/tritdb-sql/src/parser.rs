@@ -256,6 +256,24 @@ impl Parser {
             None
         };
 
+        let mut group_by = Vec::new();
+        if self.eat_keyword(Keyword::Group) {
+            self.expect_keyword(Keyword::By)?;
+            loop {
+                group_by.push(self.parse_expr()?);
+                if self.eat_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+
+        let having = if self.eat_keyword(Keyword::Having) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         let mut order_by = Vec::new();
         if self.eat_keyword(Keyword::Order) {
             self.expect_keyword(Keyword::By)?;
@@ -289,6 +307,8 @@ impl Parser {
             items,
             table,
             filter,
+            group_by,
+            having,
             order_by,
             limit,
         }))
@@ -518,6 +538,24 @@ mod tests {
                 assert_eq!(select.items.len(), 2);
                 assert_eq!(select.order_by.len(), 1);
                 assert_eq!(select.limit, Some(3));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_group_by_and_having() {
+        let statements = parse_script(
+            "SELECT score, COUNT(*) AS n FROM t WHERE id > 0 \
+             GROUP BY score, flag HAVING COUNT(*) > 1 ORDER BY score DESC LIMIT 2;",
+        )
+        .expect("parse");
+        match &statements[0] {
+            Statement::Select(select) => {
+                assert_eq!(select.group_by.len(), 2);
+                assert!(select.having.is_some());
+                assert_eq!(select.order_by.len(), 1);
+                assert_eq!(select.limit, Some(2));
             }
             other => panic!("unexpected {other:?}"),
         }

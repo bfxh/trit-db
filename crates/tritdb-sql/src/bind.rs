@@ -1,44 +1,85 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use tritdb_exec::{eval, Expr as ExecExpr, Schema, Table, Value};
+use tritdb_exec::{eval, BinaryOp, Expr as ExecExpr, Schema, Table, TruthValue, Value};
 
 use crate::ast::{AggregateKind, Expr, Select, SelectItem};
 use crate::error::SqlError;
 
-/// A bound select item.
+/// A bound expression that may contain aggregate calls.
 #[derive(Clone, Debug)]
-pub(crate) enum BoundItem {
-    /// Scalar projection.
-    Expr {
-        /// Bound expression.
-        expr: ExecExpr,
-        /// Output name.
-        name: String,
-    },
-    /// Aggregate projection.
+pub(crate) enum GroupExpr {
+    /// Scalar expression evaluated against a source row.
+    Scalar(ExecExpr),
+    /// Aggregate call.
     Aggregate {
         /// Function.
         kind: AggregateKind,
         /// Argument; `None` for `COUNT(*)`.
         input: Option<ExecExpr>,
-        /// Output name.
-        name: String,
     },
+    /// `expr IS [NOT] NULL`.
+    IsNull {
+        /// Input.
+        expr: Box<GroupExpr>,
+        /// Negated.
+        negated: bool,
+    },
+    /// `expr IS [NOT] TRUE|FALSE|UNKNOWN`.
+    IsTruth {
+        /// Input.
+        expr: Box<GroupExpr>,
+        /// Expected truth value.
+        expected: TruthValue,
+        /// Negated.
+        negated: bool,
+    },
+    /// `NOT expr`.
+    Not(Box<GroupExpr>),
+    /// Binary operator.
+    Binary {
+        /// Operator.
+        op: BinaryOp,
+        /// Left.
+        left: Box<GroupExpr>,
+        /// Right.
+        right: Box<GroupExpr>,
+    },
+}
+
+impl GroupExpr {
+    pub(crate) fn has_aggregate(&self) -> bool {
+        match self {
+            GroupExpr::Scalar(_) => false,
+            GroupExpr::Aggregate { .. } => true,
+            GroupExpr::IsNull { expr, .. } | GroupExpr::IsTruth { expr, .. } => {
+                expr.has_aggregate()
+            }
+            GroupExpr::Not(expr) => expr.has_aggregate(),
+            GroupExpr::Binary { left, right, .. } => left.has_aggregate() || right.has_aggregate(),
+        }
+    }
+}
+
+/// A bound select item.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundItem {
+    /// Bound expression.
+    pub(crate) expr: GroupExpr,
+    /// Output name.
+    pub(crate) name: String,
 }
 
 impl BoundItem {
     pub(crate) fn name(&self) -> &str {
-        match self {
-            BoundItem::Expr { name, .. } | BoundItem::Aggregate { name, .. } => name,
-        }
+        &self.name
     }
 }
 
 /// A bound sort key.
 #[derive(Clone, Debug)]
 pub(crate) struct BoundOrder {
-    /// Source-row expression.
-    pub(crate) expr: ExecExpr,
+    /// Expression evaluated against a row or a group.
+    pub(crate) expr: GroupExpr,
     /// Ascending.
     pub(crate) ascending: bool,
 }
@@ -50,6 +91,10 @@ pub(crate) struct BoundSelect {
     pub(crate) filter: Option<ExecExpr>,
     /// Projection list.
     pub(crate) items: Vec<BoundItem>,
+    /// Grouping columns, empty for a global aggregate.
+    pub(crate) group_by: Vec<ExecExpr>,
+    /// Group filter.
+    pub(crate) having: Option<GroupExpr>,
     /// Sort keys.
     pub(crate) order_by: Vec<BoundOrder>,
     /// Limit.
@@ -58,9 +103,13 @@ pub(crate) struct BoundSelect {
 
 impl BoundSelect {
     pub(crate) fn has_aggregate(&self) -> bool {
-        self.items
-            .iter()
-            .any(|item| matches!(item, BoundItem::Aggregate { .. }))
+        self.items.iter().any(|item| item.expr.has_aggregate())
+            || self.having.as_ref().is_some_and(GroupExpr::has_aggregate)
+            || self.order_by.iter().any(|order| order.expr.has_aggregate())
+    }
+
+    pub(crate) fn is_grouped(&self) -> bool {
+        !self.group_by.is_empty() || self.has_aggregate()
     }
 }
 
@@ -94,7 +143,7 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             right: Box::new(bind_expr(right, schema)?),
         }),
         Expr::Aggregate { .. } => Err(SqlError::Unsupported(
-            "aggregate is only allowed as a top-level SELECT item".to_string(),
+            "aggregate is only allowed in SELECT, HAVING, or ORDER BY".to_string(),
         )),
     }
 }
@@ -122,16 +171,146 @@ fn expr_label(expr: &Expr) -> String {
     }
 }
 
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } => expr_has_aggregate(expr),
+        Expr::Not(expr) => expr_has_aggregate(expr),
+        Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        Expr::Aggregate { .. } => true,
+    }
+}
+
+fn select_has_aggregate(select: &Select) -> bool {
+    select.items.iter().any(|item| match item {
+        SelectItem::Wildcard => false,
+        SelectItem::Expr { expr, .. } => expr_has_aggregate(expr),
+    }) || select.having.as_ref().is_some_and(expr_has_aggregate)
+        || select
+            .order_by
+            .iter()
+            .any(|order| expr_has_aggregate(&order.expr))
+}
+
+fn bind_group_expr(
+    expr: &Expr,
+    schema: &Schema,
+    grouped: bool,
+    aggregate_query: bool,
+    group_columns: &BTreeSet<usize>,
+) -> Result<GroupExpr, SqlError> {
+    match expr {
+        Expr::Literal(value) => Ok(GroupExpr::Scalar(ExecExpr::Literal(value.clone()))),
+        Expr::Column(name) => {
+            let index = schema
+                .index_of(name)
+                .ok_or_else(|| SqlError::UnknownColumn(name.clone()))?;
+            if aggregate_query && !grouped {
+                return Err(SqlError::ColumnOutsideAggregate(name.clone()));
+            }
+            if grouped && !group_columns.contains(&index) {
+                return Err(SqlError::ColumnOutsideGroup(name.clone()));
+            }
+            Ok(GroupExpr::Scalar(ExecExpr::Column(index)))
+        }
+        Expr::IsNull { expr, negated } => Ok(GroupExpr::IsNull {
+            expr: Box::new(bind_group_expr(
+                expr,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            negated: *negated,
+        }),
+        Expr::IsTruth {
+            expr,
+            expected,
+            negated,
+        } => Ok(GroupExpr::IsTruth {
+            expr: Box::new(bind_group_expr(
+                expr,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            expected: *expected,
+            negated: *negated,
+        }),
+        Expr::Not(expr) => Ok(GroupExpr::Not(Box::new(bind_group_expr(
+            expr,
+            schema,
+            grouped,
+            aggregate_query,
+            group_columns,
+        )?))),
+        Expr::Binary { op, left, right } => Ok(GroupExpr::Binary {
+            op: *op,
+            left: Box::new(bind_group_expr(
+                left,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            right: Box::new(bind_group_expr(
+                right,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+        }),
+        Expr::Aggregate { kind, input } => {
+            let input = match input {
+                Some(input) => {
+                    if expr_has_aggregate(input) {
+                        return Err(SqlError::NestedAggregate);
+                    }
+                    Some(bind_expr(input, schema)?)
+                }
+                None => None,
+            };
+            Ok(GroupExpr::Aggregate { kind: *kind, input })
+        }
+    }
+}
+
 /// Binds `SELECT` against a table.
 pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect, SqlError> {
     let schema = &table.schema;
+
+    let mut group_by = Vec::new();
+    let mut group_columns = BTreeSet::new();
+    for expr in &select.group_by {
+        let Expr::Column(name) = expr else {
+            return Err(SqlError::Unsupported(
+                "GROUP BY only supports column references".to_string(),
+            ));
+        };
+        let index = schema
+            .index_of(name)
+            .ok_or_else(|| SqlError::UnknownColumn(name.clone()))?;
+        if group_columns.insert(index) {
+            group_by.push(ExecExpr::Column(index));
+        }
+    }
+    let grouped = !group_by.is_empty();
+    let aggregate_query = grouped || select_has_aggregate(select);
+
     let mut items = Vec::new();
     for (position, item) in select.items.iter().enumerate() {
         match item {
             SelectItem::Wildcard => {
+                if aggregate_query {
+                    return Err(SqlError::Unsupported(
+                        "SELECT * with GROUP BY or aggregate is not supported".to_string(),
+                    ));
+                }
                 for (index, column) in schema.columns.iter().enumerate() {
-                    items.push(BoundItem::Expr {
-                        expr: ExecExpr::Column(index),
+                    items.push(BoundItem {
+                        expr: GroupExpr::Scalar(ExecExpr::Column(index)),
                         name: column.name.clone(),
                     });
                 }
@@ -147,30 +326,10 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
                         _ => None,
                     })
                     .unwrap_or_else(|| format!("col{}", position + 1));
-                match expr {
-                    Expr::Aggregate { kind, input } => {
-                        let input = match input {
-                            Some(input) => {
-                                if matches!(**input, Expr::Aggregate { .. }) {
-                                    return Err(SqlError::NestedAggregate);
-                                }
-                                Some(bind_expr(input, schema)?)
-                            }
-                            None => None,
-                        };
-                        items.push(BoundItem::Aggregate {
-                            kind: *kind,
-                            input,
-                            name,
-                        });
-                    }
-                    other => {
-                        items.push(BoundItem::Expr {
-                            expr: bind_expr(other, schema)?,
-                            name,
-                        });
-                    }
-                }
+                items.push(BoundItem {
+                    expr: bind_group_expr(expr, schema, grouped, aggregate_query, &group_columns)?,
+                    name,
+                });
             }
         }
     }
@@ -185,12 +344,26 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
         .map(|expr| bind_expr(expr, schema))
         .transpose()?;
 
-    let mut aliases: BTreeMap<&str, &ExecExpr> = BTreeMap::new();
-    for item in &items {
-        if let BoundItem::Expr { expr, name } = item {
-            aliases.insert(name.as_str(), expr);
+    let having = match &select.having {
+        Some(having) => {
+            if !aggregate_query {
+                return Err(SqlError::Unsupported(
+                    "HAVING requires GROUP BY or an aggregate".to_string(),
+                ));
+            }
+            Some(bind_group_expr(
+                having,
+                schema,
+                grouped,
+                aggregate_query,
+                &group_columns,
+            )?)
         }
-    }
+        None => None,
+    };
+
+    let aliases: BTreeMap<&str, &GroupExpr> =
+        items.iter().map(|item| (item.name(), &item.expr)).collect();
 
     let mut order_by = Vec::new();
     for order in &select.order_by {
@@ -202,10 +375,22 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
                     return Err(SqlError::UnknownColumn(name.clone()));
                 }
             } else {
-                bind_expr(&order.expr, schema)?
+                bind_group_expr(
+                    &order.expr,
+                    schema,
+                    grouped,
+                    aggregate_query,
+                    &group_columns,
+                )?
             }
         } else {
-            bind_expr(&order.expr, schema)?
+            bind_group_expr(
+                &order.expr,
+                schema,
+                grouped,
+                aggregate_query,
+                &group_columns,
+            )?
         };
         order_by.push(BoundOrder {
             expr,
@@ -213,27 +398,12 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
         });
     }
 
-    let bound = BoundSelect {
+    Ok(BoundSelect {
         filter,
         items,
+        group_by,
+        having,
         order_by,
         limit: select.limit,
-    };
-    if bound.has_aggregate() && !bound.order_by.is_empty() {
-        return Err(SqlError::Unsupported(
-            "ORDER BY with aggregate is not supported".to_string(),
-        ));
-    }
-    Ok(bound)
-}
-
-/// Checks that an expression has no column references.
-pub(crate) fn has_column(expr: &ExecExpr) -> bool {
-    match expr {
-        ExecExpr::Column(_) => true,
-        ExecExpr::Literal(_) => false,
-        ExecExpr::IsNull { expr, .. } | ExecExpr::IsTruth { expr, .. } => has_column(expr),
-        ExecExpr::Not(expr) => has_column(expr),
-        ExecExpr::Binary { left, right, .. } => has_column(left) || has_column(right),
-    }
+    })
 }

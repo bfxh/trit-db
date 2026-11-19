@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍；pgwire、优化器、GROUP BY、JOIN、子查询仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`；pgwire、优化器、JOIN、子查询仍未做。
 
 ## 1. 范围
 
@@ -9,6 +9,10 @@
 ```sql
 CREATE TABLE t (id INT NOT NULL, name TEXT, flag BOOL);
 INSERT INTO t VALUES (1, 'a', TRUE), (2, NULL, UNKNOWN);
+SELECT flag, COUNT(*) AS n FROM t
+GROUP BY flag
+HAVING COUNT(*) >= 1
+ORDER BY flag;
 SELECT id, name, flag FROM t
 WHERE flag IS NULL OR id >= 2
 ORDER BY id DESC
@@ -17,7 +21,7 @@ DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 单表、无 JOIN、无子查询、无 GROUP BY。
+- 单表、无 JOIN、无子查询；`GROUP BY` 只接受列引用，不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次写重写整张表。
 - 没有 pgwire、没有优化器、没有索引、没有 MVCC。
@@ -61,15 +65,19 @@ INSERT INTO name [(column, ...)] VALUES (expr, ...) [, (expr, ...)];
 SELECT * | expr [AS alias], ...
 FROM name
 [WHERE predicate]
+[GROUP BY column, ...]
+[HAVING predicate]
 [ORDER BY expr [ASC|DESC], ...]
 [LIMIT n];
 ```
 
 - `WHERE` 只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
-- `ORDER BY` 支持源列和 SELECT 别名；`NULL` 在 ASC 时排最前，DESC 时排最后。
+- `GROUP BY` 只支持直接列引用；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
+- `HAVING` 在分组聚合之后、投影/排序之前执行，只保留 `TRUE`；可以引用分组键和聚合表达式，不能引用未分组列。
+- `SELECT` 聚合项支持 `COUNT(*)`、`COUNT(expr)`、`SUM(expr)`、`MIN(expr)`、`MAX(expr)`；分组查询中的裸列必须是 `GROUP BY` 列，标量表达式只能引用分组列。
+- `ORDER BY` 支持源列、SELECT 别名、聚合表达式；分组查询按分组键/聚合结果排序。`NULL` 在 ASC 时排最前，DESC 时排最后。
 - `LIMIT` 在排序和投影之后截断。
-- 聚合查询只支持单组：`COUNT(*)`、`COUNT(expr)`、`SUM(expr)`、`MIN(expr)`、`MAX(expr)`；聚合查询不能混入裸列引用。
-- `ORDER BY` 与聚合同时使用暂不支持。
+- `SELECT *` 不能与 `GROUP BY` 或聚合同时使用；`GROUP BY` 表达式、聚合查询中的未分组裸列会被 binder 拒绝。
 
 ### DELETE / DROP
 
@@ -144,6 +152,6 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 34/34 通过。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 45/45 通过。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

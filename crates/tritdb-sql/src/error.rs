@@ -42,6 +42,8 @@ pub enum SqlError {
     NestedAggregate,
     /// A column reference appears outside an aggregate in an aggregate query.
     ColumnOutsideAggregate(String),
+    /// A column reference is not part of the `GROUP BY` key.
+    ColumnOutsideGroup(String),
     /// Unsupported SQL feature.
     Unsupported(String),
     /// Persisted table value is corrupt.
@@ -92,6 +94,9 @@ impl fmt::Display for SqlError {
             SqlError::NestedAggregate => write!(f, "nested aggregate is not supported"),
             SqlError::ColumnOutsideAggregate(name) => {
                 write!(f, "column {name} must appear inside an aggregate")
+            }
+            SqlError::ColumnOutsideGroup(name) => {
+                write!(f, "column {name} must appear in GROUP BY")
             }
             SqlError::Unsupported(feature) => write!(f, "unsupported SQL: {feature}"),
             SqlError::CorruptTable { table, reason } => {

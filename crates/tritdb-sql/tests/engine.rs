@@ -219,6 +219,178 @@ fn not_null_and_type_checks_are_enforced() {
 }
 
 #[test]
+fn group_by_counts_and_aggregates_per_key() {
+    let dir = TempDir::new("sql-group");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, score INT, name TEXT); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a'), (2, 20, 'a'), (3, NULL, 'b'), \
+               (4, 30, 'b'), (5, 10, NULL);",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT score, COUNT(*) AS n, SUM(id) AS total \
+             FROM t GROUP BY score ORDER BY score;",
+        )
+        .expect("group");
+    let (columns, rows) = as_rows(&results[0]);
+    assert_eq!(columns, ["score", "n", "total"]);
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Null, Value::Int(1), Value::Int(3)],
+            vec![Value::Int(10), Value::Int(2), Value::Int(6)],
+            vec![Value::Int(20), Value::Int(1), Value::Int(2)],
+            vec![Value::Int(30), Value::Int(1), Value::Int(4)],
+        ]
+    );
+}
+
+#[test]
+fn group_by_having_and_order_by_aggregate_alias() {
+    let dir = TempDir::new("sql-group-having");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, score INT, name TEXT); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a'), (2, 20, 'a'), (3, NULL, 'b'), \
+               (4, 30, 'b'), (5, 10, NULL);",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT name, COUNT(*) AS n, SUM(id) AS total \
+             FROM t GROUP BY name HAVING COUNT(*) >= 2 \
+             ORDER BY n DESC, name ASC;",
+        )
+        .expect("having");
+    assert_eq!(
+        as_rows(&results[0]).1,
+        [
+            vec![Value::Text("a".to_string()), Value::Int(2), Value::Int(3),],
+            vec![Value::Text("b".to_string()), Value::Int(2), Value::Int(7),],
+        ]
+    );
+
+    let scalar_having = engine
+        .execute_script(
+            "SELECT name, COUNT(*) FROM t GROUP BY name \
+             HAVING name IS NOT NULL ORDER BY name;",
+        )
+        .expect("having column");
+    assert_eq!(
+        as_rows(&scalar_having[0]).1,
+        [
+            vec![Value::Text("a".to_string()), Value::Int(2)],
+            vec![Value::Text("b".to_string()), Value::Int(2)],
+        ]
+    );
+}
+
+#[test]
+fn group_by_without_aggregate_and_aggregate_order() {
+    let dir = TempDir::new("sql-group-order");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, score INT, name TEXT); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a'), (2, 20, 'a'), (3, NULL, 'b'), \
+               (4, 30, 'b'), (5, 10, NULL);",
+        )
+        .expect("seed");
+
+    let groups = engine
+        .execute_script("SELECT name FROM t GROUP BY name ORDER BY name;")
+        .expect("group without aggregate");
+    assert_eq!(
+        as_rows(&groups[0]).1,
+        [
+            vec![Value::Null],
+            vec![Value::Text("a".to_string())],
+            vec![Value::Text("b".to_string())],
+        ]
+    );
+
+    let ordered = engine
+        .execute_script(
+            "SELECT score AS s, COUNT(*) AS n FROM t \
+             GROUP BY score ORDER BY n DESC, s ASC LIMIT 2;",
+        )
+        .expect("aggregate order");
+    assert_eq!(
+        as_rows(&ordered[0]).1,
+        [
+            vec![Value::Int(10), Value::Int(2)],
+            vec![Value::Null, Value::Int(1)],
+        ]
+    );
+}
+
+#[test]
+fn group_by_empty_input_and_global_aggregate() {
+    let dir = TempDir::new("sql-group-empty");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script("CREATE TABLE t (x INT);")
+        .expect("create");
+    let empty = engine
+        .execute_script("SELECT COUNT(*), SUM(x) FROM t;")
+        .expect("global aggregate");
+    assert_eq!(as_rows(&empty[0]).1, [vec![Value::Int(0), Value::Null]]);
+
+    let no_groups = engine
+        .execute_script("SELECT x, COUNT(*) FROM t GROUP BY x;")
+        .expect("empty groups");
+    assert!(as_rows(&no_groups[0]).1.is_empty());
+}
+
+#[test]
+fn group_by_rejects_ungrouped_columns_and_bad_having() {
+    let dir = TempDir::new("sql-group-errors");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script("CREATE TABLE t (id INT, score INT); INSERT INTO t VALUES (1, 10);")
+        .expect("seed");
+
+    let error = engine
+        .execute_script("SELECT id, COUNT(*) FROM t GROUP BY score;")
+        .expect_err("ungrouped column")
+        .to_string();
+    assert!(error.contains("must appear in GROUP BY"), "{error}");
+
+    let error = engine
+        .execute_script("SELECT id FROM t GROUP BY score + 1;")
+        .expect_err("group expression")
+        .to_string();
+    assert!(
+        error.contains("GROUP BY only supports column references"),
+        "{error}"
+    );
+
+    let error = engine
+        .execute_script("SELECT id FROM t HAVING id > 1;")
+        .expect_err("having without group")
+        .to_string();
+    assert!(error.contains("HAVING requires GROUP BY"), "{error}");
+
+    let error = engine
+        .execute_script("SELECT * FROM t GROUP BY score;")
+        .expect_err("wildcard with group")
+        .to_string();
+    assert!(error.contains("SELECT * with GROUP BY"), "{error}");
+}
+
+#[test]
 fn aliases_work_in_select_and_order_by() {
     let dir = TempDir::new("sql-alias");
     let db = dir.join("sql.db");

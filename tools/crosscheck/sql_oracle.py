@@ -62,6 +62,17 @@ CASES = [
     "SELECT id FROM t WHERE (score * 2) >= 40 ORDER BY id;",
     "SELECT id FROM t WHERE (score / 10) = 2 ORDER BY id;",
     "SELECT id FROM t WHERE -(score) < 0 ORDER BY id;",
+    "SELECT score, COUNT(*) FROM t GROUP BY score ORDER BY score;",
+    "SELECT score, COUNT(*), SUM(id), MIN(id), MAX(id) FROM t GROUP BY score ORDER BY score;",
+    "SELECT flag, COUNT(*) FROM t GROUP BY flag ORDER BY flag;",
+    "SELECT name, COUNT(*) FROM t GROUP BY name HAVING COUNT(*) >= 2 ORDER BY name;",
+    "SELECT name, SUM(score) FROM t GROUP BY name HAVING SUM(score) > 10 ORDER BY name;",
+    "SELECT score AS s, COUNT(*) AS n FROM t GROUP BY score ORDER BY n DESC, s ASC LIMIT 2;",
+    "SELECT name FROM t GROUP BY name ORDER BY name;",
+    "SELECT score + 1 AS s, COUNT(*) FROM t GROUP BY score ORDER BY s;",
+    "SELECT COUNT(*) FROM t HAVING COUNT(*) > 0;",
+    "SELECT score FROM t GROUP BY score HAVING score IS NULL;",
+    "SELECT COUNT(*), score FROM t GROUP BY score HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC, score;",
 ]
 
 
@@ -89,8 +100,6 @@ def run_tritdb(binary: str, db: str, sql: str) -> list[tuple[str, ...]]:
         raise RuntimeError(f"tritdb returned no output for {sql!r}")
     rows = []
     for line in lines[1:]:
-        if line == "":
-            continue
         rows.append(tuple(normalize_tritdb(value) for value in line.split("\t")))
     return rows
 

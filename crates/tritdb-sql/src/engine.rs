@@ -10,7 +10,7 @@ use tritdb_exec::{
 use tritdb_txn::TxnStore;
 
 use crate::ast::{AggregateKind, Statement};
-use crate::bind::{bind_expr, bind_select, eval_constant, has_column, BoundItem, BoundSelect};
+use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
 use crate::storage::{decode_table, encode_table, table_key, TABLE_KEY_PREFIX};
@@ -295,18 +295,21 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
         )
         .collect::<Result<Vec<_>, _>>()?;
 
-    if plan.has_aggregate() {
-        return execute_aggregate(table, plan, &filtered);
+    if plan.is_grouped() {
+        return execute_grouped(table, plan, &filtered);
     }
 
     let mut rows = filtered;
     if !plan.order_by.is_empty() {
         let mut keyed = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut keys = Vec::with_capacity(plan.order_by.len());
-            for order in &plan.order_by {
-                keys.push(eval(&order.expr, &table.schema, &row)?);
-            }
+            let keys = {
+                let group = Group { rows: vec![&row] };
+                plan.order_by
+                    .iter()
+                    .map(|order| eval_group_expr(&order.expr, &table.schema, &group))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             keyed.push((keys, row));
         }
         validate_sort_types(&keyed, plan.order_by.len())?;
@@ -321,16 +324,10 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
         .collect::<Vec<_>>();
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
+        let group = Group { rows: vec![&row] };
         let mut projected = Vec::with_capacity(plan.items.len());
         for item in &plan.items {
-            match item {
-                BoundItem::Expr { expr, .. } => projected.push(eval(expr, &table.schema, &row)?),
-                BoundItem::Aggregate { .. } => {
-                    return Err(SqlError::Unsupported(
-                        "aggregate in non-aggregate projection".to_string(),
-                    ));
-                }
-            }
+            projected.push(eval_group_expr(&item.expr, &table.schema, &group)?);
         }
         output.push(projected);
     }
@@ -341,6 +338,150 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
         columns,
         rows: output,
     })
+}
+
+fn execute_grouped(
+    table: &Table,
+    plan: &BoundSelect,
+    rows: &[Row],
+) -> Result<QueryResult, SqlError> {
+    let columns = plan
+        .items
+        .iter()
+        .map(|item| item.name().to_string())
+        .collect::<Vec<_>>();
+
+    let groups = if plan.group_by.is_empty() {
+        vec![Group {
+            rows: rows.iter().collect(),
+        }]
+    } else {
+        let mut grouped: BTreeMap<Vec<GroupKeyPart>, Vec<&Row>> = BTreeMap::new();
+        for row in rows {
+            let mut key = Vec::with_capacity(plan.group_by.len());
+            for expr in &plan.group_by {
+                let value = eval(expr, &table.schema, row)?;
+                key.push(GroupKeyPart::from(&value));
+            }
+            grouped.entry(key).or_default().push(row);
+        }
+        grouped.into_values().map(|rows| Group { rows }).collect()
+    };
+
+    let mut kept = Vec::new();
+    for group in groups {
+        if let Some(having) = &plan.having {
+            let value = eval_group_expr(having, &table.schema, &group)?;
+            if truth_of(&value)? != TruthValue::True {
+                continue;
+            }
+        }
+        kept.push(group);
+    }
+
+    let mut keyed = Vec::with_capacity(kept.len());
+    for group in kept {
+        let mut projected = Vec::with_capacity(plan.items.len());
+        for item in &plan.items {
+            projected.push(eval_group_expr(&item.expr, &table.schema, &group)?);
+        }
+        let mut keys = Vec::with_capacity(plan.order_by.len());
+        for order in &plan.order_by {
+            keys.push(eval_group_expr(&order.expr, &table.schema, &group)?);
+        }
+        keyed.push((keys, projected));
+    }
+
+    if !plan.order_by.is_empty() {
+        validate_sort_types(&keyed, plan.order_by.len())?;
+        keyed.sort_by(|left, right| compare_keys(&left.0, &right.0, plan));
+    }
+
+    let mut output: Vec<Vec<Value>> = keyed.into_iter().map(|(_, row)| row).collect();
+    if let Some(limit) = plan.limit {
+        output.truncate(limit);
+    }
+    Ok(QueryResult::Rows {
+        columns,
+        rows: output,
+    })
+}
+
+/// A value used as part of a grouping key. `NULL` compares and groups equal.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GroupKeyPart {
+    Null,
+    Int(i64),
+    Text(String),
+    Bool(bool),
+}
+
+impl From<&Value> for GroupKeyPart {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => GroupKeyPart::Null,
+            Value::Int(value) => GroupKeyPart::Int(*value),
+            Value::Text(value) => GroupKeyPart::Text(value.clone()),
+            Value::Bool(value) => GroupKeyPart::Bool(*value),
+        }
+    }
+}
+
+/// A group of source rows. A global aggregate over an empty table has one
+/// group with no rows.
+struct Group<'a> {
+    rows: Vec<&'a Row>,
+}
+
+impl Group<'_> {
+    fn representative(&self) -> Option<&Row> {
+        self.rows.first().copied()
+    }
+}
+
+fn eval_group_expr(
+    expr: &GroupExpr,
+    schema: &Schema,
+    group: &Group<'_>,
+) -> Result<Value, SqlError> {
+    match expr {
+        GroupExpr::Scalar(expr) => match group.representative() {
+            Some(row) => Ok(eval(expr, schema, row)?),
+            None => Ok(eval(expr, &Schema::default(), &[])?),
+        },
+        GroupExpr::Aggregate { kind, input } => {
+            eval_aggregate(*kind, input.as_ref(), schema, &group.rows)
+        }
+        GroupExpr::IsNull { expr, negated } => {
+            let value = eval_group_expr(expr, schema, group)?;
+            let is_null = value.is_null();
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
+        GroupExpr::IsTruth {
+            expr,
+            expected,
+            negated,
+        } => {
+            let value = eval_group_expr(expr, schema, group)?;
+            let truth = truth_of(&value)?;
+            let matched = truth == *expected;
+            Ok(Value::Bool(if *negated { !matched } else { matched }))
+        }
+        GroupExpr::Not(expr) => {
+            let value = eval_group_expr(expr, schema, group)?;
+            Ok(truth_of(&value)?.not().to_value())
+        }
+        GroupExpr::Binary { op, left, right } => {
+            let left = eval_group_expr(left, schema, group)?;
+            let right = eval_group_expr(right, schema, group)?;
+            let expr = ExecExpr::Binary {
+                op: *op,
+                left: Box::new(ExecExpr::Literal(left)),
+                right: Box::new(ExecExpr::Literal(right)),
+            };
+            Ok(eval(&expr, &Schema::default(), &[])?)
+        }
+    }
 }
 
 fn validate_sort_types(keyed: &[(Vec<Value>, Row)], count: usize) -> Result<(), SqlError> {
@@ -388,41 +529,11 @@ fn compare_keys(left: &[Value], right: &[Value], plan: &BoundSelect) -> Ordering
     Ordering::Equal
 }
 
-fn execute_aggregate(
-    table: &Table,
-    plan: &BoundSelect,
-    rows: &[Row],
-) -> Result<QueryResult, SqlError> {
-    let columns = plan
-        .items
-        .iter()
-        .map(|item| item.name().to_string())
-        .collect::<Vec<_>>();
-    let mut output = Vec::with_capacity(plan.items.len());
-    for item in &plan.items {
-        match item {
-            BoundItem::Expr { expr, .. } => {
-                if has_column(expr) {
-                    return Err(SqlError::ColumnOutsideAggregate("SELECT item".to_string()));
-                }
-                output.push(eval(expr, &Schema::default(), &[])?);
-            }
-            BoundItem::Aggregate { kind, input, .. } => {
-                output.push(eval_aggregate(*kind, input.as_ref(), &table.schema, rows)?);
-            }
-        }
-    }
-    Ok(QueryResult::Rows {
-        columns,
-        rows: vec![output],
-    })
-}
-
 fn eval_aggregate(
     kind: AggregateKind,
     input: Option<&ExecExpr>,
     schema: &Schema,
-    rows: &[Row],
+    rows: &[&Row],
 ) -> Result<Value, SqlError> {
     match kind {
         AggregateKind::Count => match input {
