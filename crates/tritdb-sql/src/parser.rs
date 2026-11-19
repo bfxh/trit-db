@@ -1,7 +1,8 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
-    AggregateKind, ColumnDef, Expr, Join, JoinKind, OrderBy, Select, SelectItem, Statement,
+    AggregateKind, Assignment, ColumnDef, Expr, Join, JoinKind, OrderBy, Select, SelectItem,
+    Statement,
 };
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -123,8 +124,9 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Drop)) => self.parse_drop(),
             Some(TokenKind::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(TokenKind::Keyword(Keyword::Select)) => self.parse_select(),
+            Some(TokenKind::Keyword(Keyword::Update)) => self.parse_update(),
             Some(TokenKind::Keyword(Keyword::Delete)) => self.parse_delete(),
-            Some(_) => Err(self.error("expected CREATE, DROP, INSERT, SELECT, or DELETE")),
+            Some(_) => Err(self.error("expected CREATE, DROP, INSERT, SELECT, UPDATE, or DELETE")),
             None => Err(self.error("empty statement")),
         }
     }
@@ -368,6 +370,33 @@ impl Parser {
         Ok((table, alias))
     }
 
+    fn parse_update(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Update)?;
+        let table = self.parse_ident()?;
+        self.expect_keyword(Keyword::Set)?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.parse_ident()?;
+            self.expect_symbol(Symbol::Eq)?;
+            let value = self.parse_expr()?;
+            assignments.push(Assignment { column, value });
+            if self.eat_symbol(Symbol::Comma) {
+                continue;
+            }
+            break;
+        }
+        let filter = if self.eat_keyword(Keyword::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Update {
+            table,
+            assignments,
+            filter,
+        })
+    }
+
     fn parse_delete(&mut self) -> Result<Statement, SqlError> {
         self.expect_keyword(Keyword::Delete)?;
         self.expect_keyword(Keyword::From)?;
@@ -584,6 +613,26 @@ mod tests {
             Statement::Insert { table, rows, .. } => {
                 assert_eq!(table, "t");
                 assert_eq!(rows.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_update_assignments_and_where() {
+        let statements = parse_script("UPDATE t SET score = score + 1, name = NULL WHERE id >= 2;")
+            .expect("parse");
+        match &statements[0] {
+            Statement::Update {
+                table,
+                assignments,
+                filter,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(assignments.len(), 2);
+                assert_eq!(assignments[0].column, "score");
+                assert_eq!(assignments[1].column, "name");
+                assert!(filter.is_some());
             }
             other => panic!("unexpected {other:?}"),
         }

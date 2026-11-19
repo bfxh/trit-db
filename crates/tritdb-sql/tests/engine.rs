@@ -728,3 +728,136 @@ fn aliases_work_in_select_and_order_by() {
         ]
     );
 }
+
+#[test]
+fn update_sets_values_filters_and_persists() {
+    let dir = TempDir::new("sql-update");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    let results = engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT); \
+             INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'); \
+             UPDATE t SET score = score + 5, name = 'x' WHERE id = 2;",
+        )
+        .expect("update");
+    assert_eq!(message(&results[2]), "updated 1 row(s) in t");
+
+    let selected = engine
+        .execute_script("SELECT id, score, name FROM t ORDER BY id;")
+        .expect("select");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [
+            vec![Value::Int(1), Value::Int(10), Value::Text("a".to_string())],
+            vec![Value::Int(2), Value::Int(25), Value::Text("x".to_string())],
+            vec![Value::Int(3), Value::Int(30), Value::Text("c".to_string())],
+        ]
+    );
+    drop(engine);
+
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    let after = reopened
+        .execute_script("SELECT score FROM t WHERE id = 2;")
+        .expect("select");
+    assert_eq!(as_rows(&after[0]).1, [vec![Value::Int(25)]]);
+}
+
+#[test]
+fn update_evaluates_all_assignments_against_the_old_row() {
+    let dir = TempDir::new("sql-update-old-row");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (a INT, b INT); \
+             INSERT INTO t VALUES (1, 2); \
+             UPDATE t SET a = b, b = a;",
+        )
+        .expect("swap");
+
+    let swapped = engine
+        .execute_script("SELECT a, b FROM t;")
+        .expect("select swap");
+    assert_eq!(as_rows(&swapped[0]).1, [vec![Value::Int(2), Value::Int(1)]]);
+
+    engine
+        .execute_script("UPDATE t SET a = a + 1, b = a;")
+        .expect("old value in second assignment");
+    let chained = engine
+        .execute_script("SELECT a, b FROM t;")
+        .expect("select chained");
+    assert_eq!(as_rows(&chained[0]).1, [vec![Value::Int(3), Value::Int(2)]]);
+}
+
+#[test]
+fn update_checks_null_type_and_target_column() {
+    let dir = TempDir::new("sql-update-constraints");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT); \
+             INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b');",
+        )
+        .expect("seed");
+
+    engine
+        .execute_script("UPDATE t SET name = NULL WHERE id = 1;")
+        .expect("nullable assignment");
+
+    let not_null = engine
+        .execute_script("UPDATE t SET id = NULL WHERE id = 1;")
+        .expect_err("not null")
+        .to_string();
+    assert!(not_null.contains("t.id is NOT NULL"), "{not_null}");
+
+    assert!(engine
+        .execute_script("UPDATE t SET score = 'x' WHERE id = 1;")
+        .is_err());
+    assert!(engine.execute_script("UPDATE t SET missing = 1;").is_err());
+    let duplicate = engine
+        .execute_script("UPDATE t SET score = 1, score = 2;")
+        .expect_err("duplicate target")
+        .to_string();
+    assert!(duplicate.contains("duplicate column: score"), "{duplicate}");
+    assert!(engine.execute_script("UPDATE t SET t.score = 1;").is_err());
+
+    let unchanged = engine
+        .execute_script("SELECT id, score, name FROM t WHERE id = 1;")
+        .expect("select");
+    assert_eq!(
+        as_rows(&unchanged[0]).1,
+        [vec![Value::Int(1), Value::Int(10), Value::Null]]
+    );
+}
+
+#[test]
+fn update_without_matches_and_empty_table_reports_zero() {
+    let dir = TempDir::new("sql-update-empty");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, score INT); \
+             INSERT INTO t VALUES (1, 10); \
+             UPDATE t SET score = 1 WHERE id = 99;",
+        )
+        .expect("no match");
+    let results = engine
+        .execute_script("UPDATE t SET score = 2 WHERE id = 99;")
+        .expect("second no match");
+    assert_eq!(message(&results[0]), "updated 0 row(s) in t");
+    let untouched = engine
+        .execute_script("SELECT score FROM t;")
+        .expect("select");
+    assert_eq!(as_rows(&untouched[0]).1, [vec![Value::Int(10)]]);
+
+    engine
+        .execute_script("CREATE TABLE e (id INT);")
+        .expect("create empty");
+    let empty = engine
+        .execute_script("UPDATE e SET id = 1;")
+        .expect("empty update");
+    assert_eq!(message(&empty[0]), "updated 0 row(s) in e");
+}

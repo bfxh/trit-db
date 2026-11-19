@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -102,6 +103,34 @@ CASES = [
 
 
 
+UPDATE_SETUP = """
+CREATE TABLE w (id INT NOT NULL, score INT, name TEXT, flag BOOL);
+INSERT INTO w VALUES
+  (1, 10, 'a', TRUE),
+  (2, NULL, NULL, NULL),
+  (3, 20, 'c', FALSE),
+  (4, 20, 'd', TRUE),
+  (5, NULL, 'e', NULL);
+"""
+
+UPDATE_STEPS = [
+    "UPDATE w SET score = 42 WHERE id = 1;",
+    "UPDATE w SET name = 'nil', flag = NULL WHERE id = 2;",
+    "UPDATE w SET score = id + score WHERE id >= 3;",
+    "UPDATE w SET id = id + 100, score = id WHERE id = 4;",
+    "UPDATE w SET score = 7 WHERE id = 2;",
+    "UPDATE w SET name = 'none' WHERE id = 999;",
+]
+
+UPDATE_CASES = [
+    "SELECT id, score, name, flag FROM w ORDER BY id;",
+    "SELECT COUNT(*) FROM w WHERE score IS NULL;",
+    "SELECT SUM(score), MIN(score), MAX(score) FROM w;",
+    "SELECT name, COUNT(*) FROM w GROUP BY name ORDER BY name;",
+    "SELECT id FROM w WHERE score > 20 ORDER BY id;",
+]
+
+
 def resolve_binary(path: str) -> str:
     candidate = Path(path)
     if candidate.exists():
@@ -128,6 +157,17 @@ def run_tritdb(binary: str, db: str, sql: str) -> list[tuple[str, ...]]:
     for line in lines[1:]:
         rows.append(tuple(normalize_tritdb(value) for value in line.split("\t")))
     return rows
+
+
+def run_tritdb_message(binary: str, db: str, sql: str) -> str:
+    result = subprocess.run(
+        [binary, "sql", "--db", db, "--sql", sql],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"tritdb failed for {sql!r}: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 def normalize_tritdb(value: str) -> str:
@@ -161,6 +201,7 @@ def main() -> int:
 
     binary = resolve_binary(args.tritdb)
     failures = 0
+    checks = 0
     with tempfile.TemporaryDirectory(prefix="tritdb-sql-oracle-") as temp_dir:
         db = str(Path(temp_dir) / "sql.db")
         run_tritdb(binary, db, SETUP)
@@ -169,6 +210,40 @@ def main() -> int:
         sqlite.executescript(SETUP)
 
         for sql in CASES:
+            checks += 1
+            try:
+                actual = run_tritdb(binary, db, sql)
+                expected = run_sqlite(sqlite, sql)
+            except Exception as error:  # noqa: BLE001 - report and continue
+                failures += 1
+                print(f"FAIL {sql}\n  error: {error}")
+                continue
+            if actual != expected:
+                failures += 1
+                print(f"FAIL {sql}\n  tritdb: {actual}\n  sqlite: {expected}")
+
+        run_tritdb_message(binary, db, UPDATE_SETUP)
+        sqlite.executescript(UPDATE_SETUP)
+
+        for sql in UPDATE_STEPS:
+            checks += 1
+            try:
+                message = run_tritdb_message(binary, db, sql)
+                match = re.fullmatch(r"updated (\d+) row\(s\) in w", message)
+                if match is None:
+                    raise RuntimeError(f"unexpected tritdb output: {message!r}")
+                actual = int(match.group(1))
+                expected = sqlite.execute(sql).rowcount
+            except Exception as error:  # noqa: BLE001 - report and continue
+                failures += 1
+                print(f"FAIL {sql}\n  error: {error}")
+                continue
+            if actual != expected:
+                failures += 1
+                print(f"FAIL {sql}\n  tritdb rows: {actual}\n  sqlite rows: {expected}")
+
+        for sql in UPDATE_CASES:
+            checks += 1
             try:
                 actual = run_tritdb(binary, db, sql)
                 expected = run_sqlite(sqlite, sql)
@@ -182,11 +257,13 @@ def main() -> int:
 
         sqlite.close()
 
-    total = len(CASES)
+    total = checks
     if failures:
         print(f"sql oracle: {total - failures}/{total} passed, {failures} failed")
         return 1
-    print(f"sql oracle: {total}/{total} passed")
+    selects = len(CASES) + len(UPDATE_CASES)
+    updates = len(UPDATE_STEPS)
+    print(f"sql oracle: {total}/{total} passed ({selects} SELECT, {updates} UPDATE row counts)")
     return 0
 
 

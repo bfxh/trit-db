@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -24,6 +24,7 @@ ORDER BY d.name;
 SELECT u.name, d.name AS dept
 FROM users AS u LEFT JOIN depts AS d ON u.dept = d.id
 ORDER BY u.name;
+UPDATE t SET name = 'b', flag = NULL WHERE id = 2;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
@@ -31,7 +32,7 @@ DROP TABLE t;
 - 支持表别名、多表 `INNER JOIN` 和 `LEFT [OUTER] JOIN`；不支持 `RIGHT`/`FULL`/`CROSS`/`NATURAL JOIN`、`USING`、逗号 join 或子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
-- 表整表保存在 `TxnStore` 的一个 value 里；每次写重写整张表。
+- 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE 重写整张表。
 - 没有 pgwire、没有优化器、没有索引、没有 MVCC。
 - 类型严格：不会把 TEXT 隐式转成 INT。
 
@@ -97,6 +98,20 @@ FROM name [AS alias]
 - `ORDER BY` 支持源列、SELECT 别名、聚合表达式；分组查询按分组键/聚合结果排序。`NULL` 在 ASC 时排最前，DESC 时排最后。
 - `LIMIT` 在排序和投影之后截断。
 - `SELECT *` 不能与 `GROUP BY` 或聚合同时使用；`GROUP BY` 表达式、聚合查询中的未分组裸列会被 binder 拒绝。
+
+### UPDATE
+
+```sql
+UPDATE name SET column = expr [, column = expr]... [WHERE predicate];
+```
+
+- 目标列必须是不带限定的列名；未知列、重复目标列直接报错。
+- 所有 `SET` 右值都针对**更新前的整行**求值，再统一写回；`UPDATE t SET a = b, b = a` 是交换，不会级联看到新值。
+- 右值按目标列类型严格转换；把 `NULL` 写进 `NOT NULL` 列会拒绝整条语句。
+- 只有 `WHERE` 结果为 `TRUE` 的行被更新；`FALSE`/`UNKNOWN` 与 `DELETE` 一样跳过。
+- 先在整个表的副本上算完；任一行的求值或约束失败时不会落盘，表保持原状。
+- 返回消息 `updated N row(s) in <table>`，`N` 是谓词为 `TRUE` 的行数；零行不重写表值。
+- 不支持 `UPDATE ... FROM`、多表更新、子查询或限定目标列。
 
 ### DELETE / DROP
 
@@ -171,6 +186,6 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 63/63 通过。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UPDATE、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 74/74 项通过（68 条 SELECT + 6 条 UPDATE 行数）。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

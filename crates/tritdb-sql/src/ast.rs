@@ -152,6 +152,15 @@ pub struct Select {
     pub limit: Option<usize>,
 }
 
+/// One `SET` assignment in an `UPDATE`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Assignment {
+    /// Target column.
+    pub column: String,
+    /// Replacement expression.
+    pub value: Expr,
+}
+
 /// Parsed statement.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
@@ -186,6 +195,15 @@ pub enum Statement {
     Delete {
         /// Table name.
         table: String,
+        /// Optional filter.
+        filter: Option<Expr>,
+    },
+    /// `UPDATE ... SET ...`.
+    Update {
+        /// Table name.
+        table: String,
+        /// Assignments in order.
+        assignments: Vec<Assignment>,
         /// Optional filter.
         filter: Option<Expr>,
     },

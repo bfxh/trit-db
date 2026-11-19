@@ -9,7 +9,7 @@ use tritdb_exec::{
 };
 use tritdb_txn::TxnStore;
 
-use crate::ast::{AggregateKind, JoinKind, Select, Statement};
+use crate::ast::{AggregateKind, Assignment, JoinKind, Select, Statement};
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
@@ -94,6 +94,11 @@ impl SqlEngine {
             } => self.insert(table, columns.as_deref(), rows),
             Statement::Select(select) => self.select(select),
             Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
+            Statement::Update {
+                table,
+                assignments,
+                filter,
+            } => self.update(table, assignments, filter.as_ref()),
         }
     }
 
@@ -252,6 +257,62 @@ impl SqlEngine {
         }
         Ok(QueryResult::Message(format!(
             "deleted {deleted} row(s) from {name}"
+        )))
+    }
+
+    fn update(
+        &mut self,
+        name: &str,
+        assignments: &[Assignment],
+        filter: Option<&crate::ast::Expr>,
+    ) -> Result<QueryResult, SqlError> {
+        let mut table = self
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| SqlError::UnknownTable(name.to_string()))?;
+        let schema = &table.schema;
+        let mut targets = Vec::with_capacity(assignments.len());
+        let mut seen = BTreeMap::new();
+        for assignment in assignments {
+            if seen.insert(assignment.column.clone(), ()).is_some() {
+                return Err(SqlError::DuplicateColumn(assignment.column.clone()));
+            }
+            let index = schema
+                .index_of(&assignment.column)
+                .ok_or_else(|| SqlError::UnknownColumn(assignment.column.clone()))?;
+            targets.push((index, bind_expr(&assignment.value, schema)?));
+        }
+        let filter = filter.map(|expr| bind_expr(expr, schema)).transpose()?;
+
+        let mut updated = 0usize;
+        for row in &mut table.rows {
+            if !passes_filter(filter.as_ref(), schema, row)? {
+                continue;
+            }
+            let old = row.clone();
+            let mut values = Vec::with_capacity(targets.len());
+            for (index, expr) in &targets {
+                let value = eval(expr, schema, &old)?;
+                let value = schema.columns[*index].data_type.coerce(value)?;
+                if schema.columns[*index].not_null && value.is_null() {
+                    return Err(SqlError::NotNull {
+                        table: name.to_string(),
+                        column: schema.columns[*index].name.clone(),
+                    });
+                }
+                values.push((*index, value));
+            }
+            for (index, value) in values {
+                row[index] = value;
+            }
+            updated += 1;
+        }
+        if updated > 0 {
+            self.put_table(table)?;
+        }
+        Ok(QueryResult::Message(format!(
+            "updated {updated} row(s) in {name}"
         )))
     }
 
