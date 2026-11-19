@@ -25,6 +25,13 @@ INSERT INTO t VALUES
   (3, 20, 'c', FALSE),
   (4, 30, 'd', TRUE),
   (5, NULL, '', NULL);
+CREATE TABLE u (id INT, dept INT, label TEXT);
+INSERT INTO u VALUES
+  (10, 1, 'eng'),
+  (20, 2, 'sales'),
+  (30, 4, 'ops'),
+  (40, 99, 'idle'),
+  (50, NULL, 'nil');
 """
 
 CASES = [
@@ -73,7 +80,20 @@ CASES = [
     "SELECT COUNT(*) FROM t HAVING COUNT(*) > 0;",
     "SELECT score FROM t GROUP BY score HAVING score IS NULL;",
     "SELECT COUNT(*), score FROM t GROUP BY score HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC, score;",
+    "SELECT t.id, u.label FROM t JOIN u ON t.id = u.dept ORDER BY t.id;",
+    "SELECT t.id FROM t WHERE t.id = 1;",
+    "SELECT x.id FROM t AS x WHERE x.id = 2;",
+    "SELECT x.id, y.label FROM t AS x JOIN u AS y ON x.id = y.dept ORDER BY x.id;",
+    "SELECT u.label, COUNT(*), SUM(t.id) FROM t JOIN u ON t.id = u.dept GROUP BY u.label ORDER BY u.label;",
+    "SELECT t.id, u.label FROM t JOIN u ON t.id = u.dept WHERE u.label <> 'sales' ORDER BY t.id;",
+    "SELECT t.id, u.id FROM t JOIN u ON t.id + 1 = u.dept ORDER BY t.id;",
+    "SELECT COUNT(*) FROM t JOIN u ON t.id = u.dept;",
+    "SELECT t.id FROM t JOIN u ON t.id = u.dept AND u.label = 'eng' ORDER BY t.id;",
+    "SELECT t.id, u.label FROM t JOIN u ON t.id = u.dept WHERE u.label IS NULL ORDER BY t.id;",
+    "SELECT COUNT(*) FROM t JOIN u ON t.score = u.dept;",
+    "SELECT a.id, b.id FROM t AS a JOIN t AS b ON a.id < b.id AND a.id <= 2 ORDER BY a.id, b.id;",
 ]
+
 
 
 def resolve_binary(path: str) -> str:

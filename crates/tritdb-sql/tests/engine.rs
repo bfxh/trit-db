@@ -391,6 +391,207 @@ fn group_by_rejects_ungrouped_columns_and_bad_having() {
 }
 
 #[test]
+fn inner_join_matches_rows_and_qualified_columns() {
+    let dir = TempDir::new("sql-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE users (id INT, name TEXT, dept INT); \
+             CREATE TABLE depts (id INT, name TEXT); \
+             INSERT INTO users VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', NULL), (4, 'd', 10); \
+             INSERT INTO depts VALUES (10, 'eng'), (20, 'sales'), (30, 'ops');",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT u.id, u.name AS user_name, d.name AS dept_name \
+             FROM users AS u JOIN depts AS d ON u.dept = d.id \
+             ORDER BY u.id;",
+        )
+        .expect("join");
+    let (columns, rows) = as_rows(&results[0]);
+    assert_eq!(columns, ["id", "user_name", "dept_name"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Int(1),
+                Value::Text("a".to_string()),
+                Value::Text("eng".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Text("b".to_string()),
+                Value::Text("sales".to_string()),
+            ],
+            vec![
+                Value::Int(4),
+                Value::Text("d".to_string()),
+                Value::Text("eng".to_string()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn chained_join_matches_three_tables() {
+    let dir = TempDir::new("sql-join-chain");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, name TEXT); \
+             CREATE TABLE b (id INT NOT NULL, aid INT, label TEXT); \
+             CREATE TABLE c (id INT, bid INT, tag TEXT); \
+             INSERT INTO a VALUES (1, 'one'), (2, 'two'); \
+             INSERT INTO b VALUES (10, 1, 'x'), (20, 2, 'y'), (30, 2, 'z'); \
+             INSERT INTO c VALUES (100, 10, 'p'), (200, 20, 'q');",
+        )
+        .expect("seed");
+
+    let results = engine
+        .execute_script(
+            "SELECT x.name, y.label, z.tag FROM a AS x \
+             JOIN b AS y ON x.id = y.aid \
+             JOIN c AS z ON y.id = z.bid \
+             ORDER BY x.name;",
+        )
+        .expect("chained join");
+    let (columns, rows) = as_rows(&results[0]);
+    assert_eq!(columns, ["name", "label", "tag"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Text("one".to_string()),
+                Value::Text("x".to_string()),
+                Value::Text("p".to_string()),
+            ],
+            vec![
+                Value::Text("two".to_string()),
+                Value::Text("y".to_string()),
+                Value::Text("q".to_string()),
+            ],
+        ]
+    );
+
+    let filtered = engine
+        .execute_script(
+            "SELECT x.id FROM a AS x JOIN b AS y ON x.id = y.aid \
+             JOIN c AS z ON y.id = z.bid AND x.id = 1;",
+        )
+        .expect("later on sees earlier tables");
+    assert_eq!(as_rows(&filtered[0]).1, [vec![Value::Int(1)]]);
+}
+
+#[test]
+fn join_with_group_by_and_where() {
+    let dir = TempDir::new("sql-join-group");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE users (id INT, name TEXT, dept INT); \
+             CREATE TABLE depts (id INT, name TEXT); \
+             INSERT INTO users VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', NULL), (4, 'd', 10); \
+             INSERT INTO depts VALUES (10, 'eng'), (20, 'sales'), (30, 'ops');",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT d.name, COUNT(*) AS n FROM users AS u JOIN depts AS d \
+             ON u.dept = d.id GROUP BY d.name ORDER BY d.name;",
+        )
+        .expect("group join");
+    assert_eq!(
+        as_rows(&results[0]).1,
+        [
+            vec![Value::Text("eng".to_string()), Value::Int(2)],
+            vec![Value::Text("sales".to_string()), Value::Int(1)],
+        ]
+    );
+
+    let filtered = engine
+        .execute_script(
+            "SELECT users.id, depts.name FROM users JOIN depts \
+             ON users.dept = depts.id WHERE depts.name = 'eng' ORDER BY users.id;",
+        )
+        .expect("where join");
+    assert_eq!(
+        as_rows(&filtered[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("eng".to_string())],
+            vec![Value::Int(4), Value::Text("eng".to_string())],
+        ]
+    );
+}
+
+#[test]
+fn self_join_supports_compound_on_and_rejects_duplicate_alias() {
+    let dir = TempDir::new("sql-self-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE users (id INT, name TEXT, dept INT); \
+             INSERT INTO users VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', NULL), (4, 'd', 10);",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT u1.id, u2.id FROM users AS u1 JOIN users AS u2 \
+             ON u1.dept = u2.dept AND u1.id < u2.id ORDER BY u1.id, u2.id;",
+        )
+        .expect("self join");
+    assert_eq!(as_rows(&results[0]).1, [vec![Value::Int(1), Value::Int(4)]]);
+
+    let error = engine
+        .execute_script("SELECT u.id FROM users AS u JOIN users AS u ON u.id = u.id;")
+        .expect_err("duplicate alias")
+        .to_string();
+    assert!(error.contains("duplicate table name or alias"), "{error}");
+}
+
+#[test]
+fn join_rejects_ambiguous_columns_and_unknown_tables() {
+    let dir = TempDir::new("sql-join-errors");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT); \
+             CREATE TABLE b (id INT); \
+             INSERT INTO a VALUES (1); \
+             INSERT INTO b VALUES (1);",
+        )
+        .expect("seed");
+
+    let qualified = engine
+        .execute_script("SELECT a.id FROM a ORDER BY a.id;")
+        .expect("qualified single table");
+    assert_eq!(as_rows(&qualified[0]).1, [vec![Value::Int(1)]]);
+
+    let error = engine
+        .execute_script("SELECT id FROM a JOIN b ON a.id = b.id;")
+        .expect_err("ambiguous")
+        .to_string();
+    assert!(error.contains("ambiguous column: id"), "{error}");
+
+    let error = engine
+        .execute_script("SELECT a.id FROM a JOIN missing ON a.id = missing.id;")
+        .expect_err("unknown table")
+        .to_string();
+    assert!(error.contains("unknown table: missing"), "{error}");
+
+    let error = engine
+        .execute_script("SELECT a.id FROM a JOIN b ON id = 1;")
+        .expect_err("unqualified ambiguous on")
+        .to_string();
+    assert!(error.contains("ambiguous column: id"), "{error}");
+}
+
+#[test]
 fn aliases_work_in_select_and_order_by() {
     let dir = TempDir::new("sql-alias");
     let db = dir.join("sql.db");

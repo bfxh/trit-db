@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str;
 
@@ -9,7 +9,7 @@ use tritdb_exec::{
 };
 use tritdb_txn::TxnStore;
 
-use crate::ast::{AggregateKind, Statement};
+use crate::ast::{AggregateKind, Select, Statement};
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
@@ -255,13 +255,42 @@ impl SqlEngine {
         )))
     }
 
-    fn select(&self, select: &crate::ast::Select) -> Result<QueryResult, SqlError> {
+    fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {
+        let table = self.build_from(select)?;
+        let plan = bind_select(select, &table)?;
+        execute_select(&table, &plan)
+    }
+
+    fn build_from(&self, select: &Select) -> Result<Table, SqlError> {
         let table = self
             .tables
             .get(&select.table)
             .ok_or_else(|| SqlError::UnknownTable(select.table.clone()))?;
-        let plan = bind_select(select, table)?;
-        execute_select(table, &plan)
+        let mut qualifiers = BTreeSet::new();
+        let mut sources = Vec::with_capacity(select.joins.len() + 1);
+        let left_qualifier = select.table_alias.as_deref().unwrap_or(&select.table);
+        if !qualifiers.insert(left_qualifier.to_string()) {
+            return Err(SqlError::DuplicateTableAlias(left_qualifier.to_string()));
+        }
+        sources.push((table, left_qualifier));
+        for join in &select.joins {
+            let right = self
+                .tables
+                .get(&join.table)
+                .ok_or_else(|| SqlError::UnknownTable(join.table.clone()))?;
+            let qualifier = join.alias.as_deref().unwrap_or(&join.table);
+            if !qualifiers.insert(qualifier.to_string()) {
+                return Err(SqlError::DuplicateTableAlias(qualifier.to_string()));
+            }
+            sources.push((right, qualifier));
+        }
+
+        let mut joined = qualify_table(table, left_qualifier);
+        for (join, (right, qualifier)) in select.joins.iter().zip(sources.into_iter().skip(1)) {
+            let right = qualify_table(right, qualifier);
+            joined = join_tables(&joined, &right, &join.on)?;
+        }
+        Ok(joined)
     }
 
     fn put_table(&mut self, table: Table) -> Result<(), SqlError> {
@@ -273,6 +302,46 @@ impl SqlEngine {
         self.tables.insert(table.name.clone(), table);
         Ok(())
     }
+}
+
+fn qualify_table(table: &Table, qualifier: &str) -> Table {
+    let columns = table
+        .schema
+        .columns
+        .iter()
+        .map(|column| Column {
+            name: format!("{qualifier}.{}", column.name),
+            data_type: column.data_type,
+            not_null: column.not_null,
+        })
+        .collect();
+    Table {
+        name: table.name.clone(),
+        schema: Schema::new(columns),
+        rows: table.rows.clone(),
+    }
+}
+
+fn join_tables(left: &Table, right: &Table, on: &crate::ast::Expr) -> Result<Table, SqlError> {
+    let mut columns = left.schema.columns.clone();
+    columns.extend(right.schema.columns.clone());
+    let schema = Schema::new(columns);
+    let predicate = bind_expr(on, &schema)?;
+    let mut rows = Vec::new();
+    for left_row in &left.rows {
+        for right_row in &right.rows {
+            let mut row = left_row.clone();
+            row.extend(right_row.iter().cloned());
+            if passes_filter(Some(&predicate), &schema, &row)? {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(Table {
+        name: format!("{}+{}", left.name, right.name),
+        schema,
+        rows,
+    })
 }
 
 fn passes_filter(filter: Option<&ExecExpr>, schema: &Schema, row: &Row) -> Result<bool, SqlError> {

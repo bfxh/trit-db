@@ -1,6 +1,6 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
-use crate::ast::{AggregateKind, ColumnDef, Expr, OrderBy, Select, SelectItem, Statement};
+use crate::ast::{AggregateKind, ColumnDef, Expr, Join, OrderBy, Select, SelectItem, Statement};
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 
@@ -248,7 +248,39 @@ impl Parser {
         }
 
         self.expect_keyword(Keyword::From)?;
-        let table = self.parse_ident()?;
+        let (table, table_alias) = self.parse_table_ref()?;
+        if matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::Keyword(
+                Keyword::Left
+                    | Keyword::Right
+                    | Keyword::Full
+                    | Keyword::Cross
+                    | Keyword::Natural
+                    | Keyword::Outer
+            ))
+        ) {
+            return Err(SqlError::Unsupported(
+                "only INNER JOIN is supported".to_string(),
+            ));
+        }
+
+        let mut joins = Vec::new();
+        loop {
+            if self.eat_keyword(Keyword::Inner) {
+                self.expect_keyword(Keyword::Join)?;
+            } else if !self.eat_keyword(Keyword::Join) {
+                break;
+            }
+            let (join_table, alias) = self.parse_table_ref()?;
+            self.expect_keyword(Keyword::On)?;
+            let on = self.parse_expr()?;
+            joins.push(Join {
+                table: join_table,
+                alias,
+                on,
+            });
+        }
 
         let filter = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
@@ -306,12 +338,29 @@ impl Parser {
         Ok(Statement::Select(Select {
             items,
             table,
+            table_alias,
+            joins,
             filter,
             group_by,
             having,
             order_by,
             limit,
         }))
+    }
+
+    fn parse_table_ref(&mut self) -> Result<(String, Option<String>), SqlError> {
+        let table = self.parse_ident()?;
+        let alias = if self.eat_keyword(Keyword::As) {
+            Some(self.parse_ident()?)
+        } else {
+            match self.peek().map(|token| &token.kind) {
+                Some(TokenKind::Word(_)) | Some(TokenKind::QuotedIdent(_)) => {
+                    Some(self.parse_ident()?)
+                }
+                _ => None,
+            }
+        };
+        Ok((table, alias))
     }
 
     fn parse_delete(&mut self) -> Result<Statement, SqlError> {
@@ -457,7 +506,17 @@ impl Parser {
         match token.kind {
             TokenKind::Number(value) => Ok(Expr::Literal(Value::Int(value))),
             TokenKind::String(value) => Ok(Expr::Literal(Value::Text(value))),
-            TokenKind::Word(name) | TokenKind::QuotedIdent(name) => Ok(Expr::Column(name)),
+            TokenKind::Word(name) | TokenKind::QuotedIdent(name) => {
+                if self.eat_symbol(Symbol::Dot) {
+                    let column = self.parse_ident()?;
+                    Ok(Expr::Column {
+                        table: Some(name),
+                        name: column,
+                    })
+                } else {
+                    Ok(Expr::Column { table: None, name })
+                }
+            }
             TokenKind::Keyword(Keyword::True) => Ok(Expr::Literal(Value::Bool(true))),
             TokenKind::Keyword(Keyword::False) => Ok(Expr::Literal(Value::Bool(false))),
             TokenKind::Keyword(Keyword::Null) | TokenKind::Keyword(Keyword::Unknown) => {
@@ -558,6 +617,44 @@ mod tests {
                 assert_eq!(select.limit, Some(2));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_inner_join_and_qualified_columns() {
+        let statements = parse_script(
+            "SELECT u.id, d.name AS dept FROM users AS u \
+             INNER JOIN depts d ON u.dept = d.id WHERE u.id > 0 ORDER BY u.id;",
+        )
+        .expect("parse");
+        match &statements[0] {
+            Statement::Select(select) => {
+                assert_eq!(select.table, "users");
+                assert_eq!(select.table_alias.as_deref(), Some("u"));
+                assert_eq!(select.joins.len(), 1);
+                assert_eq!(select.joins[0].table, "depts");
+                assert_eq!(select.joins[0].alias.as_deref(), Some("d"));
+                assert_eq!(select.order_by.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_inner_join() {
+        for sql in [
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id;",
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id;",
+            "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
+            "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",
+            "SELECT * FROM a NATURAL JOIN b;",
+            "SELECT * FROM a OUTER JOIN b ON a.id = b.id;",
+        ] {
+            let error = parse_script(sql).expect_err("unsupported join");
+            assert!(
+                matches!(error, SqlError::Unsupported(_)),
+                "{sql} returned {error:?}"
+            );
         }
     }
 

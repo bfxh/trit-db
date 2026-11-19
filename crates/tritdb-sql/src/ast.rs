@@ -30,8 +30,13 @@ impl AggregateKind {
 pub enum Expr {
     /// Literal.
     Literal(Value),
-    /// Column reference.
-    Column(String),
+    /// Column reference, optionally qualified by a table name or alias.
+    Column {
+        /// Qualifier.
+        table: Option<String>,
+        /// Column name.
+        name: String,
+    },
     /// `expr IS [NOT] NULL`.
     IsNull {
         /// Input.
@@ -102,6 +107,17 @@ pub struct OrderBy {
     pub ascending: bool,
 }
 
+/// An inner join clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Join {
+    /// Joined table.
+    pub table: String,
+    /// Optional alias.
+    pub alias: Option<String>,
+    /// Join predicate.
+    pub on: Expr,
+}
+
 /// Parsed `SELECT`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Select {
@@ -109,6 +125,10 @@ pub struct Select {
     pub items: Vec<SelectItem>,
     /// Source table.
     pub table: String,
+    /// Source table alias.
+    pub table_alias: Option<String>,
+    /// Inner joins.
+    pub joins: Vec<Join>,
     /// Optional filter.
     pub filter: Option<Expr>,
     /// Grouping columns.

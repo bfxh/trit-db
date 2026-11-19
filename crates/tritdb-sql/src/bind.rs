@@ -113,14 +113,51 @@ impl BoundSelect {
     }
 }
 
+/// Resolves a column reference against a schema.
+fn resolve_column(schema: &Schema, table: Option<&str>, name: &str) -> Result<usize, SqlError> {
+    if let Some(table) = table {
+        let qualified = format!("{table}.{name}");
+        return schema
+            .index_of(&qualified)
+            .ok_or(SqlError::UnknownColumn(qualified));
+    }
+    if let Some(index) = schema.index_of(name) {
+        return Ok(index);
+    }
+    let mut matches = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            column
+                .name
+                .rsplit_once('.')
+                .filter(|(_, suffix)| *suffix == name)
+                .map(|_| index)
+        });
+    let Some(index) = matches.next() else {
+        return Err(SqlError::UnknownColumn(name.to_string()));
+    };
+    if matches.next().is_some() {
+        return Err(SqlError::AmbiguousColumn(name.to_string()));
+    }
+    Ok(index)
+}
+
+fn displayed_column(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, column)| column)
+}
+
+fn column_name(table: Option<&str>, name: &str) -> String {
+    table.map_or_else(|| name.to_string(), |table| format!("{table}.{name}"))
+}
+
 /// Binds an expression to a schema.
 pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlError> {
     match expr {
         Expr::Literal(value) => Ok(ExecExpr::Literal(value.clone())),
-        Expr::Column(name) => {
-            let index = schema
-                .index_of(name)
-                .ok_or_else(|| SqlError::UnknownColumn(name.clone()))?;
+        Expr::Column { table, name } => {
+            let index = resolve_column(schema, table.as_deref(), name)?;
             Ok(ExecExpr::Column(index))
         }
         Expr::IsNull { expr, negated } => Ok(ExecExpr::IsNull {
@@ -164,7 +201,7 @@ fn aggregate_label(kind: AggregateKind, input: Option<&Expr>) -> String {
 
 fn expr_label(expr: &Expr) -> String {
     match expr {
-        Expr::Column(name) => name.clone(),
+        Expr::Column { name, .. } => name.clone(),
         Expr::Literal(value) => value.display(),
         Expr::Aggregate { kind, input } => aggregate_label(*kind, input.as_deref()),
         _ => "expr".to_string(),
@@ -173,7 +210,7 @@ fn expr_label(expr: &Expr) -> String {
 
 fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Literal(_) | Expr::Column { .. } => false,
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } => expr_has_aggregate(expr),
         Expr::Not(expr) => expr_has_aggregate(expr),
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
@@ -201,15 +238,19 @@ fn bind_group_expr(
 ) -> Result<GroupExpr, SqlError> {
     match expr {
         Expr::Literal(value) => Ok(GroupExpr::Scalar(ExecExpr::Literal(value.clone()))),
-        Expr::Column(name) => {
-            let index = schema
-                .index_of(name)
-                .ok_or_else(|| SqlError::UnknownColumn(name.clone()))?;
+        Expr::Column { table, name } => {
+            let index = resolve_column(schema, table.as_deref(), name)?;
             if aggregate_query && !grouped {
-                return Err(SqlError::ColumnOutsideAggregate(name.clone()));
+                return Err(SqlError::ColumnOutsideAggregate(column_name(
+                    table.as_deref(),
+                    name,
+                )));
             }
             if grouped && !group_columns.contains(&index) {
-                return Err(SqlError::ColumnOutsideGroup(name.clone()));
+                return Err(SqlError::ColumnOutsideGroup(column_name(
+                    table.as_deref(),
+                    name,
+                )));
             }
             Ok(GroupExpr::Scalar(ExecExpr::Column(index)))
         }
@@ -284,14 +325,12 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
     let mut group_by = Vec::new();
     let mut group_columns = BTreeSet::new();
     for expr in &select.group_by {
-        let Expr::Column(name) = expr else {
+        let Expr::Column { table, name } = expr else {
             return Err(SqlError::Unsupported(
                 "GROUP BY only supports column references".to_string(),
             ));
         };
-        let index = schema
-            .index_of(name)
-            .ok_or_else(|| SqlError::UnknownColumn(name.clone()))?;
+        let index = resolve_column(schema, table.as_deref(), name)?;
         if group_columns.insert(index) {
             group_by.push(ExecExpr::Column(index));
         }
@@ -311,7 +350,7 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
                 for (index, column) in schema.columns.iter().enumerate() {
                     items.push(BoundItem {
                         expr: GroupExpr::Scalar(ExecExpr::Column(index)),
-                        name: column.name.clone(),
+                        name: displayed_column(&column.name).to_string(),
                     });
                 }
             }
@@ -319,7 +358,7 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
                 let name = alias
                     .clone()
                     .or_else(|| match expr {
-                        Expr::Column(name) => Some(name.clone()),
+                        Expr::Column { name, .. } => Some(name.clone()),
                         Expr::Aggregate { kind, input } => {
                             Some(aggregate_label(*kind, input.as_deref()))
                         }
@@ -367,14 +406,8 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
 
     let mut order_by = Vec::new();
     for order in &select.order_by {
-        let expr = if let Expr::Column(name) = &order.expr {
-            if schema.index_of(name).is_none() {
-                if let Some(alias) = aliases.get(name.as_str()) {
-                    (*alias).clone()
-                } else {
-                    return Err(SqlError::UnknownColumn(name.clone()));
-                }
-            } else {
+        let expr = if let Expr::Column { table, name } = &order.expr {
+            if table.is_some() {
                 bind_group_expr(
                     &order.expr,
                     schema,
@@ -382,6 +415,24 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
                     aggregate_query,
                     &group_columns,
                 )?
+            } else {
+                match resolve_column(schema, None, name) {
+                    Ok(_) => bind_group_expr(
+                        &order.expr,
+                        schema,
+                        grouped,
+                        aggregate_query,
+                        &group_columns,
+                    )?,
+                    Err(SqlError::UnknownColumn(_)) => {
+                        if let Some(alias) = aliases.get(name.as_str()) {
+                            (*alias).clone()
+                        } else {
+                            return Err(SqlError::UnknownColumn(name.clone()));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         } else {
             bind_group_expr(

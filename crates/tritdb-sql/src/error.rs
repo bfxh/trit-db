@@ -20,6 +20,10 @@ pub enum SqlError {
     TableExists(String),
     /// Column does not exist in the table.
     UnknownColumn(String),
+    /// Unqualified column name matches more than one joined column.
+    AmbiguousColumn(String),
+    /// Duplicate table name or alias in a `FROM` clause.
+    DuplicateTableAlias(String),
     /// Duplicate column in `CREATE TABLE`.
     DuplicateColumn(String),
     /// `INSERT` value count does not match the target column count.
@@ -79,6 +83,10 @@ impl fmt::Display for SqlError {
             SqlError::UnknownTable(name) => write!(f, "unknown table: {name}"),
             SqlError::TableExists(name) => write!(f, "table already exists: {name}"),
             SqlError::UnknownColumn(name) => write!(f, "unknown column: {name}"),
+            SqlError::AmbiguousColumn(name) => write!(f, "ambiguous column: {name}"),
+            SqlError::DuplicateTableAlias(name) => {
+                write!(f, "duplicate table name or alias: {name}")
+            }
             SqlError::DuplicateColumn(name) => write!(f, "duplicate column: {name}"),
             SqlError::ColumnCount {
                 table,
