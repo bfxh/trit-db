@@ -76,9 +76,9 @@ sql oracle: 63/63 passed
 
 ## 5. CI 与覆盖
 
-- INNER JOIN 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44613405869>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
-- 三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 **57/57**。
-- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 **5080/6957 = 73.02%**，65% 门禁仍有余量。
+- LEFT JOIN 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44615053085>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
+- 三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 **63/63**（含 macOS）。
+- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 **5117/6991 = 73.19%**，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
@@ -87,5 +87,5 @@ sql oracle: 63/63 passed
 - `tritdb-plan`：逻辑计划、列裁剪、谓词下推、常量折叠。
 - `tritdb-proto`：pgwire v3 simple query + extended query，先让 `psql` 能连。
 - 表存储从整表重写改成页/行格式，接 `tritdb-page`。
-- SQL 3VL + GROUP BY + JOIN 套件扩到 `trit-clean` 的完整原始语义用例（当前 57 条为本仓自定义对拍集）。
+- SQL 3VL + GROUP BY + JOIN 套件扩到 `trit-clean` 的完整原始语义用例（当前 63 条为本仓自定义对拍集）。
 - 并发 SQL 压力测试：多连接 SELECT + 单写者 INSERT，测读者 P99。

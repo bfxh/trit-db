@@ -90,13 +90,13 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 | `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
 | `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
 | `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge）、`sql_oracle.py`（SQLite 3VL 对拍） |
-| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 **5080/6957 = 73.02%** |
+| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 **5117/6991 = 73.19%** |
 | `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。
 
 首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（11 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。加入 65% 覆盖门禁后的复跑：<https://github.com/bfxh/trit-db/actions/runs/44595879346>。
-SQL 切片 CI：<https://github.com/bfxh/trit-db/actions/runs/44610635876>（GROUP BY 基线，三平台 `sql_oracle.py` 均 45/45）。INNER JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44613405869>（11 个 job 全绿，三平台 `sql_oracle.py` 均 57/57，覆盖 73.02%）。
+SQL 切片 CI：<https://github.com/bfxh/trit-db/actions/runs/44610635876>（GROUP BY 基线，三平台 `sql_oracle.py` 均 45/45）。INNER JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44613405869>（11 个 job 全绿，三平台 `sql_oracle.py` 均 57/57，覆盖 73.02%）。LEFT JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44615053085>（11 个 job 全绿，三平台 `sql_oracle.py` 均 63/63，覆盖 73.19%）。
 
 nightly stress 手动首跑：<https://github.com/bfxh/trit-db/actions/runs/44596129132>（crash matrix、txn store 压力测试 3 个 job 全绿）。
 
