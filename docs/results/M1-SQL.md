@@ -75,9 +75,9 @@ sql oracle: 57/57 passed
 
 ## 5. CI 与覆盖
 
-- GROUP BY/HAVING 基线 CI run：<https://github.com/bfxh/trit-db/actions/runs/44610635876>，11 个 job 全绿。
-- GROUP BY 基线三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 45/45；INNER JOIN 切片本地为 57/57，CI 结果待补。
-- SQL 3VL 切片（184 测试）行覆盖为 4710/6559 = 71.81%；GROUP BY/HAVING 后为 **4906/6777 = 72.39%**；INNER JOIN 的覆盖数字待 CI 更新，65% 门禁仍有余量。
+- INNER JOIN 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44613405869>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
+- 三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 **57/57**。
+- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 **5080/6957 = 73.02%**，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
