@@ -1,6 +1,8 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
-use crate::ast::{AggregateKind, ColumnDef, Expr, Join, OrderBy, Select, SelectItem, Statement};
+use crate::ast::{
+    AggregateKind, ColumnDef, Expr, Join, JoinKind, OrderBy, Select, SelectItem, Statement,
+};
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 
@@ -252,30 +254,33 @@ impl Parser {
         if matches!(
             self.peek().map(|token| &token.kind),
             Some(TokenKind::Keyword(
-                Keyword::Left
-                    | Keyword::Right
-                    | Keyword::Full
-                    | Keyword::Cross
-                    | Keyword::Natural
-                    | Keyword::Outer
+                Keyword::Right | Keyword::Full | Keyword::Cross | Keyword::Natural | Keyword::Outer
             ))
         ) {
             return Err(SqlError::Unsupported(
-                "only INNER JOIN is supported".to_string(),
+                "only INNER and LEFT JOIN are supported".to_string(),
             ));
         }
 
         let mut joins = Vec::new();
         loop {
-            if self.eat_keyword(Keyword::Inner) {
+            let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
-            } else if !self.eat_keyword(Keyword::Join) {
+                JoinKind::Inner
+            } else if self.eat_keyword(Keyword::Left) {
+                self.eat_keyword(Keyword::Outer);
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Left
+            } else if self.eat_keyword(Keyword::Join) {
+                JoinKind::Inner
+            } else {
                 break;
-            }
+            };
             let (join_table, alias) = self.parse_table_ref()?;
             self.expect_keyword(Keyword::On)?;
             let on = self.parse_expr()?;
             joins.push(Join {
+                kind,
                 table: join_table,
                 alias,
                 on,
@@ -632,6 +637,7 @@ mod tests {
                 assert_eq!(select.table, "users");
                 assert_eq!(select.table_alias.as_deref(), Some("u"));
                 assert_eq!(select.joins.len(), 1);
+                assert_eq!(select.joins[0].kind, JoinKind::Inner);
                 assert_eq!(select.joins[0].table, "depts");
                 assert_eq!(select.joins[0].alias.as_deref(), Some("d"));
                 assert_eq!(select.order_by.len(), 1);
@@ -641,9 +647,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_inner_join() {
+    fn parses_left_and_left_outer_join() {
         for sql in [
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id;",
+            "SELECT u.id FROM users u LEFT JOIN depts d ON u.dept = d.id;",
+            "SELECT u.id FROM users u LEFT OUTER JOIN depts d ON u.dept = d.id;",
+        ] {
+            let statements = parse_script(sql).expect("parse left join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), 1);
+                    assert_eq!(select.joins[0].kind, JoinKind::Left);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_join() {
+        for sql in [
             "SELECT * FROM a RIGHT JOIN b ON a.id = b.id;",
             "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
             "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",

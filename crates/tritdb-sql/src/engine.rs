@@ -9,7 +9,7 @@ use tritdb_exec::{
 };
 use tritdb_txn::TxnStore;
 
-use crate::ast::{AggregateKind, Select, Statement};
+use crate::ast::{AggregateKind, JoinKind, Select, Statement};
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
@@ -288,7 +288,7 @@ impl SqlEngine {
         let mut joined = qualify_table(table, left_qualifier);
         for (join, (right, qualifier)) in select.joins.iter().zip(sources.into_iter().skip(1)) {
             let right = qualify_table(right, qualifier);
-            joined = join_tables(&joined, &right, &join.on)?;
+            joined = join_tables(&joined, &right, &join.on, join.kind)?;
         }
         Ok(joined)
     }
@@ -322,19 +322,37 @@ fn qualify_table(table: &Table, qualifier: &str) -> Table {
     }
 }
 
-fn join_tables(left: &Table, right: &Table, on: &crate::ast::Expr) -> Result<Table, SqlError> {
+fn join_tables(
+    left: &Table,
+    right: &Table,
+    on: &crate::ast::Expr,
+    kind: JoinKind,
+) -> Result<Table, SqlError> {
     let mut columns = left.schema.columns.clone();
-    columns.extend(right.schema.columns.clone());
+    let mut right_columns = right.schema.columns.clone();
+    if kind == JoinKind::Left {
+        for column in &mut right_columns {
+            column.not_null = false;
+        }
+    }
+    columns.extend(right_columns);
     let schema = Schema::new(columns);
     let predicate = bind_expr(on, &schema)?;
     let mut rows = Vec::new();
     for left_row in &left.rows {
+        let mut matched = false;
         for right_row in &right.rows {
             let mut row = left_row.clone();
             row.extend(right_row.iter().cloned());
             if passes_filter(Some(&predicate), &schema, &row)? {
+                matched = true;
                 rows.push(row);
             }
+        }
+        if kind == JoinKind::Left && !matched {
+            let mut row = left_row.clone();
+            row.extend(std::iter::repeat_n(Value::Null, right.schema.columns.len()));
+            rows.push(row);
         }
     }
     Ok(Table {

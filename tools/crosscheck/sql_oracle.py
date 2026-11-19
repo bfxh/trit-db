@@ -92,6 +92,12 @@ CASES = [
     "SELECT t.id, u.label FROM t JOIN u ON t.id = u.dept WHERE u.label IS NULL ORDER BY t.id;",
     "SELECT COUNT(*) FROM t JOIN u ON t.score = u.dept;",
     "SELECT a.id, b.id FROM t AS a JOIN t AS b ON a.id < b.id AND a.id <= 2 ORDER BY a.id, b.id;",
+    "SELECT t.id, u.label FROM t LEFT JOIN u ON t.id = u.dept ORDER BY t.id;",
+    "SELECT t.id, u.label FROM t LEFT OUTER JOIN u ON t.id = u.dept WHERE u.label IS NULL ORDER BY t.id;",
+    "SELECT t.id, u.label FROM t LEFT JOIN u ON t.id = u.dept WHERE u.label = 'eng' ORDER BY t.id;",
+    "SELECT u.label, COUNT(*) FROM t LEFT JOIN u ON t.id = u.dept GROUP BY u.label ORDER BY u.label;",
+    "SELECT COUNT(*) FROM t LEFT JOIN u ON t.id = u.dept;",
+    "SELECT x.id, y.label FROM t AS x LEFT JOIN u AS y ON x.id = y.dept ORDER BY x.id;",
 ]
 
 

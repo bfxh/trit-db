@@ -107,9 +107,20 @@ pub struct OrderBy {
     pub ascending: bool,
 }
 
-/// An inner join clause.
+/// Join flavor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    /// Inner join: only matching row pairs survive.
+    Inner,
+    /// Left outer join: unmatched left rows survive with `NULL` right columns.
+    Left,
+}
+
+/// A join clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Join {
+    /// Join flavor.
+    pub kind: JoinKind,
     /// Joined table.
     pub table: String,
     /// Optional alias.

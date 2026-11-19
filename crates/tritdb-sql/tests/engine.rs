@@ -486,6 +486,119 @@ fn chained_join_matches_three_tables() {
 }
 
 #[test]
+fn left_join_preserves_unmatched_left_rows() {
+    let dir = TempDir::new("sql-left-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE users (id INT, name TEXT, dept INT); \
+             CREATE TABLE depts (id INT, name TEXT); \
+             INSERT INTO users VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', NULL), (4, 'd', 10); \
+             INSERT INTO depts VALUES (10, 'eng'), (20, 'sales'), (30, 'ops');",
+        )
+        .expect("seed");
+
+    let results = engine
+        .execute_script(
+            "SELECT u.id, d.name AS dept_name FROM users AS u \
+             LEFT JOIN depts AS d ON u.dept = d.id ORDER BY u.id;",
+        )
+        .expect("left join");
+    let (columns, rows) = as_rows(&results[0]);
+    assert_eq!(columns, ["id", "dept_name"]);
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Int(1), Value::Text("eng".to_string())],
+            vec![Value::Int(2), Value::Text("sales".to_string())],
+            vec![Value::Int(3), Value::Null],
+            vec![Value::Int(4), Value::Text("eng".to_string())],
+        ]
+    );
+
+    let outer = engine
+        .execute_script(
+            "SELECT u.id, d.name FROM users AS u \
+             LEFT OUTER JOIN depts AS d ON u.dept = d.id ORDER BY u.id;",
+        )
+        .expect("left outer join");
+    assert_eq!(as_rows(&outer[0]).1, rows);
+
+    let count = engine
+        .execute_script(
+            "SELECT COUNT(*) FROM users AS u \
+             LEFT JOIN depts AS d ON u.dept = d.id;",
+        )
+        .expect("left join count");
+    assert_eq!(as_rows(&count[0]).1, [vec![Value::Int(4)]]);
+}
+
+#[test]
+fn left_join_where_group_and_empty_right() {
+    let dir = TempDir::new("sql-left-join-group");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE users (id INT, name TEXT, dept INT); \
+             CREATE TABLE depts (id INT, name TEXT); \
+             CREATE TABLE empty (id INT, name TEXT); \
+             INSERT INTO users VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', NULL), (4, 'd', 10); \
+             INSERT INTO depts VALUES (10, 'eng'), (20, 'sales'), (30, 'ops');",
+        )
+        .expect("seed");
+
+    let matched = engine
+        .execute_script(
+            "SELECT u.id, d.name FROM users AS u \
+             LEFT JOIN depts AS d ON u.dept = d.id \
+             WHERE d.name = 'eng' ORDER BY u.id;",
+        )
+        .expect("where matched");
+    assert_eq!(
+        as_rows(&matched[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("eng".to_string())],
+            vec![Value::Int(4), Value::Text("eng".to_string())],
+        ]
+    );
+
+    let unmatched = engine
+        .execute_script(
+            "SELECT u.id FROM users AS u \
+             LEFT JOIN depts AS d ON u.dept = d.id \
+             WHERE d.name IS NULL ORDER BY u.id;",
+        )
+        .expect("where unmatched");
+    assert_eq!(as_rows(&unmatched[0]).1, [vec![Value::Int(3)]]);
+
+    let grouped = engine
+        .execute_script(
+            "SELECT d.name, COUNT(*) FROM users AS u \
+             LEFT JOIN depts AS d ON u.dept = d.id \
+             GROUP BY d.name ORDER BY d.name;",
+        )
+        .expect("group outer join");
+    assert_eq!(
+        as_rows(&grouped[0]).1,
+        [
+            vec![Value::Null, Value::Int(1)],
+            vec![Value::Text("eng".to_string()), Value::Int(2)],
+            vec![Value::Text("sales".to_string()), Value::Int(1)],
+        ]
+    );
+
+    let empty = engine
+        .execute_script(
+            "SELECT COUNT(*), COUNT(e.id) FROM users AS u \
+             LEFT JOIN empty AS e ON u.id = e.id;",
+        )
+        .expect("empty right");
+    assert_eq!(as_rows(&empty[0]).1, [vec![Value::Int(4), Value::Int(0)]]);
+}
+
+#[test]
 fn join_with_group_by_and_where() {
     let dir = TempDir::new("sql-join-group");
     let db = dir.join("sql.db");
