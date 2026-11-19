@@ -619,6 +619,54 @@ fn eval_group_expr(
             let value = eval_group_expr(expr, schema, group)?;
             Ok(truth_of(&value)?.not().to_value())
         }
+        GroupExpr::InList {
+            expr,
+            values,
+            negated,
+        } => {
+            let probe = eval_group_expr(expr, schema, group)?;
+            let list = values
+                .iter()
+                .map(|value| eval_group_expr(value, schema, group))
+                .collect::<Result<Vec<_>, _>>()?;
+            let bound = ExecExpr::InList {
+                expr: Box::new(ExecExpr::Literal(probe)),
+                values: list.into_iter().map(ExecExpr::Literal).collect(),
+                negated: *negated,
+            };
+            Ok(eval(&bound, &Schema::default(), &[])?)
+        }
+        GroupExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let probe = eval_group_expr(expr, schema, group)?;
+            let low = eval_group_expr(low, schema, group)?;
+            let high = eval_group_expr(high, schema, group)?;
+            let bound = ExecExpr::Between {
+                expr: Box::new(ExecExpr::Literal(probe)),
+                low: Box::new(ExecExpr::Literal(low)),
+                high: Box::new(ExecExpr::Literal(high)),
+                negated: *negated,
+            };
+            Ok(eval(&bound, &Schema::default(), &[])?)
+        }
+        GroupExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let probe = eval_group_expr(expr, schema, group)?;
+            let pattern = eval_group_expr(pattern, schema, group)?;
+            let bound = ExecExpr::Like {
+                expr: Box::new(ExecExpr::Literal(probe)),
+                pattern: Box::new(ExecExpr::Literal(pattern)),
+                negated: *negated,
+            };
+            Ok(eval(&bound, &Schema::default(), &[])?)
+        }
         GroupExpr::Binary { op, left, right } => {
             let left = eval_group_expr(left, schema, group)?;
             let right = eval_group_expr(right, schema, group)?;

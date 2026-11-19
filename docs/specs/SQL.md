@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -24,6 +24,7 @@ ORDER BY d.name;
 SELECT u.name, d.name AS dept
 FROM users AS u LEFT JOIN depts AS d ON u.dept = d.id
 ORDER BY u.name;
+SELECT id FROM t WHERE id IN (1, 2) AND score BETWEEN 10 AND 20 AND name LIKE 'a%';
 UPDATE t SET name = 'b', flag = NULL WHERE id = 2;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
@@ -98,6 +99,22 @@ FROM name [AS alias]
 - `ORDER BY` 支持源列、SELECT 别名、聚合表达式；分组查询按分组键/聚合结果排序。`NULL` 在 ASC 时排最前，DESC 时排最后。
 - `LIMIT` 在排序和投影之后截断。
 - `SELECT *` 不能与 `GROUP BY` 或聚合同时使用；`GROUP BY` 表达式、聚合查询中的未分组裸列会被 binder 拒绝。
+
+### 谓词
+
+```sql
+expr IN (expr, ...)
+expr NOT IN (expr, ...)
+expr BETWEEN low AND high
+expr NOT BETWEEN low AND high
+expr [NOT] LIKE pattern
+```
+
+- `IN` 对每个候选值做等值比较：任一为 `TRUE` 则结果 `TRUE`；否则只要有 `NULL` 参与（探针或候选）就为 `UNKNOWN`；否则 `FALSE`。`NOT IN` 对结果做三值取反；`NULL NOT IN (...)` 仍是 `UNKNOWN`。
+- `IN` 列表至少一个元素，不支持子查询、`IN` 空列表或 `IN` 后的行构造器。
+- `BETWEEN` 等价于 `expr >= low AND expr <= high`，两端都求值并按三值 `AND` 组合；`NOT BETWEEN` 对结果取反。边界含等号。
+- `LIKE` 左值和模式都必须是 `TEXT`（`NULL` 传播为 `NULL`）；`%` 匹配任意长度（含空串），`_` 匹配任意单个字符；ASCII 字母大小写不敏感，非 ASCII 按原字符比较。不支持 `ESCAPE`、`GLOB` 或正则。
+- 这些谓词可用于 `WHERE`、`ON`、`HAVING` 和非聚合投影表达式；`UPDATE`/`DELETE` 的 `WHERE` 复用同一求值路径。
 
 ### UPDATE
 
@@ -186,6 +203,6 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UPDATE、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 74/74 项通过（68 条 SELECT + 6 条 UPDATE 行数）。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 89/89 项通过（83 条 SELECT + 6 条 UPDATE 行数）。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

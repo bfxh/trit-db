@@ -55,6 +55,35 @@ pub enum Expr {
     },
     /// `NOT expr`.
     Not(Box<Expr>),
+    /// `expr [NOT] IN (value, ...)`.
+    InList {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Candidate expressions.
+        values: Vec<Expr>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+        /// `true` for `NOT BETWEEN`.
+        negated: bool,
+    },
+    /// `expr [NOT] LIKE pattern`.
+    Like {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Pattern expression.
+        pattern: Box<Expr>,
+        /// `true` for `NOT LIKE`.
+        negated: bool,
+    },
     /// Binary operator.
     Binary {
         /// Operator.

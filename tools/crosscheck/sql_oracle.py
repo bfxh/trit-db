@@ -99,6 +99,21 @@ CASES = [
     "SELECT u.label, COUNT(*) FROM t LEFT JOIN u ON t.id = u.dept GROUP BY u.label ORDER BY u.label;",
     "SELECT COUNT(*) FROM t LEFT JOIN u ON t.id = u.dept;",
     "SELECT x.id, y.label FROM t AS x LEFT JOIN u AS y ON x.id = y.dept ORDER BY x.id;",
+    "SELECT id FROM t WHERE id IN (1, 3, 5) ORDER BY id;",
+    "SELECT id FROM t WHERE id NOT IN (1, 3, 5) ORDER BY id;",
+    "SELECT id FROM t WHERE score IN (10, 20) ORDER BY id;",
+    "SELECT id FROM t WHERE score NOT IN (10, 20) ORDER BY id;",
+    "SELECT id FROM t WHERE name IN ('a', NULL) ORDER BY id;",
+    "SELECT id FROM t WHERE score BETWEEN 10 AND 30 ORDER BY id;",
+    "SELECT id FROM t WHERE score NOT BETWEEN 10 AND 20 ORDER BY id;",
+    "SELECT id FROM t WHERE score BETWEEN NULL AND 20 ORDER BY id;",
+    "SELECT id FROM t WHERE score BETWEEN 21 AND NULL ORDER BY id;",
+    "SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id;",
+    "SELECT id FROM t WHERE name LIKE 'A%' ORDER BY id;",
+    "SELECT id FROM t WHERE name LIKE '_' ORDER BY id;",
+    "SELECT id FROM t WHERE name NOT LIKE '%d%' ORDER BY id;",
+    "SELECT id FROM t WHERE name LIKE '%' ORDER BY id;",
+    "SELECT id FROM t WHERE id IN (1, 2) AND score BETWEEN 10 AND 20 ORDER BY id;",
 ]
 
 

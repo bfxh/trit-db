@@ -267,6 +267,35 @@ pub enum Expr {
     },
     /// `NOT expr`.
     Not(Box<Expr>),
+    /// `expr [NOT] IN (value, ...)`.
+    InList {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Candidate values.
+        values: Vec<Expr>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+        /// `true` for `NOT BETWEEN`.
+        negated: bool,
+    },
+    /// `expr [NOT] LIKE pattern`.
+    Like {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Pattern expression.
+        pattern: Box<Expr>,
+        /// `true` for `NOT LIKE`.
+        negated: bool,
+    },
     /// Binary boolean, comparison, or arithmetic operator.
     Binary {
         /// Operator.
@@ -433,6 +462,43 @@ fn compare_op(op: CmpOp, ordering: Ordering) -> bool {
     }
 }
 
+fn comparison_truth(op: CmpOp, ordering: Option<Ordering>) -> TruthValue {
+    match ordering {
+        None => TruthValue::Unknown,
+        Some(ordering) => {
+            if compare_op(op, ordering) {
+                TruthValue::True
+            } else {
+                TruthValue::False
+            }
+        }
+    }
+}
+
+/// SQLite-style `LIKE`: `%` matches any sequence, `_` matches one character,
+/// and ASCII letters compare case-insensitively.
+fn like_matches(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut table = vec![vec![false; pattern.len() + 1]; text.len() + 1];
+    table[0][0] = true;
+    for column in 1..=pattern.len() {
+        table[0][column] = pattern[column - 1] == '%' && table[0][column - 1];
+    }
+    for row in 1..=text.len() {
+        for column in 1..=pattern.len() {
+            table[row][column] = match pattern[column - 1] {
+                '%' => table[row][column - 1] || table[row - 1][column],
+                '_' => table[row - 1][column - 1],
+                expected => {
+                    table[row - 1][column - 1] && expected.eq_ignore_ascii_case(&text[row - 1])
+                }
+            };
+        }
+    }
+    table[text.len()][pattern.len()]
+}
+
 fn eval_arith(op: ArithOp, left: i64, right: i64) -> Result<Value, ExecError> {
     let value = match op {
         ArithOp::Add => left.checked_add(right),
@@ -485,6 +551,76 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
         Expr::Not(expr) => {
             let value = eval(expr, schema, row)?;
             Ok(truth_of(&value)?.not().to_value())
+        }
+        Expr::InList {
+            expr,
+            values,
+            negated,
+        } => {
+            let probe = eval(expr, schema, row)?;
+            let mut unknown = probe.is_null();
+            let mut matched = false;
+            for value in values {
+                match compare_values(&probe, &eval(value, schema, row)?)? {
+                    Some(Ordering::Equal) => {
+                        matched = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => unknown = true,
+                }
+            }
+            let truth = if matched {
+                TruthValue::True
+            } else if unknown {
+                TruthValue::Unknown
+            } else {
+                TruthValue::False
+            };
+            Ok(if *negated {
+                truth.not().to_value()
+            } else {
+                truth.to_value()
+            })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let value = eval(expr, schema, row)?;
+            let lower =
+                comparison_truth(CmpOp::Ge, compare_values(&value, &eval(low, schema, row)?)?);
+            let upper = comparison_truth(
+                CmpOp::Le,
+                compare_values(&value, &eval(high, schema, row)?)?,
+            );
+            let truth = lower.and(upper);
+            Ok(if *negated {
+                truth.not().to_value()
+            } else {
+                truth.to_value()
+            })
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval(expr, schema, row)?;
+            let pattern = eval(pattern, schema, row)?;
+            match (&value, &pattern) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(text), Value::Text(pattern)) => {
+                    let matched = like_matches(text, pattern);
+                    Ok(Value::Bool(if *negated { !matched } else { matched }))
+                }
+                (value, _) => Err(ExecError::TypeMismatch {
+                    expected: "TEXT",
+                    actual: value.type_name(),
+                }),
+            }
         }
         Expr::Binary { op, left, right } => {
             if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -668,6 +804,136 @@ mod tests {
         assert!(matches!(
             eval(&div_zero, &schema, &row),
             Err(ExecError::DivisionByZero)
+        ));
+    }
+
+    #[test]
+    fn in_list_uses_three_valued_logic() {
+        let schema = Schema::new(vec![Column::new("a", DataType::Int)]);
+        let row = vec![Value::Int(1)];
+        let probe = || Box::new(Expr::Column(0));
+        let list = |values: Vec<Value>, negated: bool| Expr::InList {
+            expr: probe(),
+            values: values.into_iter().map(Expr::Literal).collect(),
+            negated,
+        };
+        assert_eq!(
+            eval(
+                &list(vec![Value::Int(1), Value::Int(3)], false),
+                &schema,
+                &row
+            )
+            .expect("in"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval(
+                &list(vec![Value::Int(2), Value::Int(3)], false),
+                &schema,
+                &row
+            )
+            .expect("in"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval(
+                &list(vec![Value::Int(2), Value::Null], false),
+                &schema,
+                &row
+            )
+            .expect("in"),
+            Value::Null
+        );
+        assert_eq!(
+            eval(&list(vec![Value::Int(2), Value::Null], true), &schema, &row).expect("not in"),
+            Value::Null
+        );
+        assert_eq!(
+            eval(
+                &list(vec![Value::Int(1), Value::Int(2)], true),
+                &schema,
+                &row
+            )
+            .expect("not in"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn between_is_three_valued_conjunction() {
+        let schema = Schema::new(vec![Column::new("a", DataType::Int)]);
+        let row = vec![Value::Int(20)];
+        let between = |low: Value, high: Value, negated: bool| Expr::Between {
+            expr: Box::new(Expr::Column(0)),
+            low: Box::new(Expr::Literal(low)),
+            high: Box::new(Expr::Literal(high)),
+            negated,
+        };
+        assert_eq!(
+            eval(
+                &between(Value::Int(10), Value::Int(30), false),
+                &schema,
+                &row
+            )
+            .expect("between"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval(
+                &between(Value::Int(21), Value::Int(30), false),
+                &schema,
+                &row
+            )
+            .expect("between"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval(&between(Value::Null, Value::Int(30), false), &schema, &row).expect("between"),
+            Value::Null
+        );
+        assert_eq!(
+            eval(&between(Value::Int(21), Value::Null, false), &schema, &row).expect("between"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval(
+                &between(Value::Int(21), Value::Int(30), true),
+                &schema,
+                &row
+            )
+            .expect("not between"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn like_matches_wildcards_and_ascii_case() {
+        assert!(like_matches("abc", "a%"));
+        assert!(like_matches("abc", "A%"));
+        assert!(like_matches("abc", "a_c"));
+        assert!(!like_matches("abc", "a_"));
+        assert!(like_matches("", "%"));
+        assert!(like_matches("abc", "%b%"));
+        assert!(!like_matches("abc", "abd"));
+        assert!(like_matches("中", "_"));
+        assert!(!like_matches("中文", "_"));
+
+        let schema = Schema::new(vec![Column::new("a", DataType::Text)]);
+        let row = vec![Value::Null];
+        let like = Expr::Like {
+            expr: Box::new(Expr::Column(0)),
+            pattern: Box::new(Expr::Literal(Value::Text("a%".to_string()))),
+            negated: false,
+        };
+        assert_eq!(eval(&like, &schema, &row).expect("like"), Value::Null);
+
+        let row = vec![Value::Int(1)];
+        assert!(matches!(
+            eval(&like, &schema, &row),
+            Err(ExecError::TypeMismatch {
+                expected: "TEXT",
+                ..
+            })
         ));
     }
 

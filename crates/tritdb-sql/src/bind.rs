@@ -35,6 +35,35 @@ pub(crate) enum GroupExpr {
     },
     /// `NOT expr`.
     Not(Box<GroupExpr>),
+    /// `expr [NOT] IN (value, ...)`.
+    InList {
+        /// Probe.
+        expr: Box<GroupExpr>,
+        /// Candidates.
+        values: Vec<GroupExpr>,
+        /// `NOT IN`.
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        /// Probe.
+        expr: Box<GroupExpr>,
+        /// Lower bound.
+        low: Box<GroupExpr>,
+        /// Upper bound.
+        high: Box<GroupExpr>,
+        /// `NOT BETWEEN`.
+        negated: bool,
+    },
+    /// `expr [NOT] LIKE pattern`.
+    Like {
+        /// Probe.
+        expr: Box<GroupExpr>,
+        /// Pattern.
+        pattern: Box<GroupExpr>,
+        /// `NOT LIKE`.
+        negated: bool,
+    },
     /// Binary operator.
     Binary {
         /// Operator.
@@ -55,6 +84,15 @@ impl GroupExpr {
                 expr.has_aggregate()
             }
             GroupExpr::Not(expr) => expr.has_aggregate(),
+            GroupExpr::InList { expr, values, .. } => {
+                expr.has_aggregate() || values.iter().any(GroupExpr::has_aggregate)
+            }
+            GroupExpr::Between {
+                expr, low, high, ..
+            } => expr.has_aggregate() || low.has_aggregate() || high.has_aggregate(),
+            GroupExpr::Like { expr, pattern, .. } => {
+                expr.has_aggregate() || pattern.has_aggregate()
+            }
             GroupExpr::Binary { left, right, .. } => left.has_aggregate() || right.has_aggregate(),
         }
     }
@@ -174,6 +212,38 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             negated: *negated,
         }),
         Expr::Not(expr) => Ok(ExecExpr::Not(Box::new(bind_expr(expr, schema)?))),
+        Expr::InList {
+            expr,
+            values,
+            negated,
+        } => Ok(ExecExpr::InList {
+            expr: Box::new(bind_expr(expr, schema)?),
+            values: values
+                .iter()
+                .map(|value| bind_expr(value, schema))
+                .collect::<Result<_, _>>()?,
+            negated: *negated,
+        }),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Ok(ExecExpr::Between {
+            expr: Box::new(bind_expr(expr, schema)?),
+            low: Box::new(bind_expr(low, schema)?),
+            high: Box::new(bind_expr(high, schema)?),
+            negated: *negated,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Ok(ExecExpr::Like {
+            expr: Box::new(bind_expr(expr, schema)?),
+            pattern: Box::new(bind_expr(pattern, schema)?),
+            negated: *negated,
+        }),
         Expr::Binary { op, left, right } => Ok(ExecExpr::Binary {
             op: *op,
             left: Box::new(bind_expr(left, schema)?),
@@ -213,6 +283,13 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Literal(_) | Expr::Column { .. } => false,
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } => expr_has_aggregate(expr),
         Expr::Not(expr) => expr_has_aggregate(expr),
+        Expr::InList { expr, values, .. } => {
+            expr_has_aggregate(expr) || values.iter().any(expr_has_aggregate)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
+        Expr::Like { expr, pattern, .. } => expr_has_aggregate(expr) || expr_has_aggregate(pattern),
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::Aggregate { .. } => true,
     }
@@ -286,6 +363,76 @@ fn bind_group_expr(
             aggregate_query,
             group_columns,
         )?))),
+        Expr::InList {
+            expr,
+            values,
+            negated,
+        } => Ok(GroupExpr::InList {
+            expr: Box::new(bind_group_expr(
+                expr,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            values: values
+                .iter()
+                .map(|value| {
+                    bind_group_expr(value, schema, grouped, aggregate_query, group_columns)
+                })
+                .collect::<Result<_, _>>()?,
+            negated: *negated,
+        }),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Ok(GroupExpr::Between {
+            expr: Box::new(bind_group_expr(
+                expr,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            low: Box::new(bind_group_expr(
+                low,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            high: Box::new(bind_group_expr(
+                high,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            negated: *negated,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Ok(GroupExpr::Like {
+            expr: Box::new(bind_group_expr(
+                expr,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            pattern: Box::new(bind_group_expr(
+                pattern,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            negated: *negated,
+        }),
         Expr::Binary { op, left, right } => Ok(GroupExpr::Binary {
             op: *op,
             left: Box::new(bind_group_expr(

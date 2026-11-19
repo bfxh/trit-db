@@ -465,6 +465,60 @@ impl Parser {
             });
         }
 
+        let negated = if self.eat_keyword(Keyword::Not) {
+            if matches!(
+                self.peek().map(|token| &token.kind),
+                Some(TokenKind::Keyword(
+                    Keyword::In | Keyword::Between | Keyword::Like
+                ))
+            ) {
+                true
+            } else {
+                return Err(self.error("expected IN, BETWEEN, or LIKE after NOT"));
+            }
+        } else {
+            false
+        };
+
+        if self.eat_keyword(Keyword::In) {
+            self.expect_symbol(Symbol::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                values.push(self.parse_expr()?);
+                if self.eat_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect_symbol(Symbol::RParen)?;
+            return Ok(Expr::InList {
+                expr: Box::new(left),
+                values,
+                negated,
+            });
+        }
+
+        if self.eat_keyword(Keyword::Between) {
+            let low = self.parse_additive()?;
+            self.expect_keyword(Keyword::And)?;
+            let high = self.parse_additive()?;
+            return Ok(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated,
+            });
+        }
+
+        if self.eat_keyword(Keyword::Like) {
+            let pattern = self.parse_additive()?;
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                negated,
+            });
+        }
+
         let op = match self.peek().map(|token| &token.kind) {
             Some(TokenKind::Symbol(Symbol::Eq)) => Some(BinaryOp::Eq),
             Some(TokenKind::Symbol(Symbol::Ne)) => Some(BinaryOp::Ne),
@@ -636,6 +690,57 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_in_between_and_like() {
+        for (sql, expected) in [
+            (
+                "SELECT id FROM t WHERE id IN (1, 2);",
+                Predicate::InList(false),
+            ),
+            (
+                "SELECT id FROM t WHERE id NOT IN (1, 2);",
+                Predicate::InList(true),
+            ),
+            (
+                "SELECT id FROM t WHERE score BETWEEN 10 AND 20;",
+                Predicate::Between(false),
+            ),
+            (
+                "SELECT id FROM t WHERE score NOT BETWEEN 10 AND 20;",
+                Predicate::Between(true),
+            ),
+            (
+                "SELECT id FROM t WHERE name LIKE 'a%';",
+                Predicate::Like(false),
+            ),
+            (
+                "SELECT id FROM t WHERE name NOT LIKE '_';",
+                Predicate::Like(true),
+            ),
+        ] {
+            let statements = parse_script(sql).expect("parse predicate");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            let actual = match select.filter.as_ref().expect("filter") {
+                Expr::InList { negated, .. } => Predicate::InList(*negated),
+                Expr::Between { negated, .. } => Predicate::Between(*negated),
+                Expr::Like { negated, .. } => Predicate::Like(*negated),
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(actual, expected, "{sql}");
+        }
+        assert!(parse_script("SELECT id FROM t WHERE id NOT 1;").is_err());
+        assert!(parse_script("SELECT id FROM t WHERE id IN ();").is_err());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Predicate {
+        InList(bool),
+        Between(bool),
+        Like(bool),
     }
 
     #[test]

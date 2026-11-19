@@ -730,6 +730,211 @@ fn aliases_work_in_select_and_order_by() {
 }
 
 #[test]
+fn in_and_between_filter_with_three_valued_logic() {
+    let dir = TempDir::new("sql-predicates");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT); \
+             INSERT INTO t VALUES (1, 10), (2, NULL), (3, 20), (4, 30), (5, NULL), (6, 40);",
+        )
+        .expect("seed");
+
+    let ids = |engine: &mut SqlEngine, sql: &str| -> Vec<i64> {
+        let results = engine.execute_script(sql).expect("select");
+        as_rows(&results[0])
+            .1
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int(id) => id,
+                ref other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE id IN (1, 3, 5) ORDER BY id;"
+        ),
+        [1, 3, 5]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE id NOT IN (1, 3, 5) ORDER BY id;"
+        ),
+        [2, 4, 6]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE score IN (10, 20) ORDER BY id;"
+        ),
+        [1, 3]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE score NOT IN (10, 20) ORDER BY id;"
+        ),
+        [4, 6]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE score IN (10, NULL) ORDER BY id;"
+        ),
+        [1]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE score BETWEEN 10 AND 30 ORDER BY id;"
+        ),
+        [1, 3, 4]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE score NOT BETWEEN 10 AND 30 ORDER BY id;"
+        ),
+        [6]
+    );
+    assert!(ids(
+        &mut engine,
+        "SELECT id FROM t WHERE score BETWEEN NULL AND 20 ORDER BY id;"
+    )
+    .is_empty());
+    assert!(ids(
+        &mut engine,
+        "SELECT id FROM t WHERE score BETWEEN 21 AND NULL ORDER BY id;"
+    )
+    .is_empty());
+}
+
+#[test]
+fn like_matches_wildcards_case_and_text_only() {
+    let dir = TempDir::new("sql-like");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, name TEXT); \
+             INSERT INTO t VALUES (1, 'a'), (2, 'A'), (3, 'abc'), (4, ''), (5, NULL), (6, 'xbc');",
+        )
+        .expect("seed");
+
+    let ids = |engine: &mut SqlEngine, sql: &str| -> Vec<i64> {
+        let results = engine.execute_script(sql).expect("select");
+        as_rows(&results[0])
+            .1
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int(id) => id,
+                ref other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id;"
+        ),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE name LIKE '_' ORDER BY id;"
+        ),
+        [1, 2]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE name LIKE 'a_c' ORDER BY id;"
+        ),
+        [3]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE name NOT LIKE '%b%' ORDER BY id;"
+        ),
+        [1, 2, 4]
+    );
+    assert_eq!(
+        ids(
+            &mut engine,
+            "SELECT id FROM t WHERE name LIKE '%' ORDER BY id;"
+        ),
+        [1, 2, 3, 4, 6]
+    );
+    assert!(engine
+        .execute_script("SELECT id FROM t WHERE id LIKE '1';")
+        .is_err());
+}
+
+#[test]
+fn predicates_work_in_projection_having_and_update() {
+    let dir = TempDir::new("sql-predicate-context");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT); \
+             INSERT INTO t VALUES (1, 10), (2, 20), (3, NULL), (4, 30);",
+        )
+        .expect("seed");
+
+    let projected = engine
+        .execute_script("SELECT id, id IN (1, 3) AS member FROM t ORDER BY id;")
+        .expect("project predicate");
+    assert_eq!(
+        as_rows(&projected[0]).1,
+        [
+            vec![Value::Int(1), Value::Bool(true)],
+            vec![Value::Int(2), Value::Bool(false)],
+            vec![Value::Int(3), Value::Bool(true)],
+            vec![Value::Int(4), Value::Bool(false)],
+        ]
+    );
+
+    let grouped = engine
+        .execute_script(
+            "SELECT score, COUNT(*) FROM t GROUP BY score \
+             HAVING COUNT(*) BETWEEN 1 AND 2 ORDER BY score;",
+        )
+        .expect("having predicate");
+    assert_eq!(as_rows(&grouped[0]).1.len(), 4);
+
+    let first = engine
+        .execute_script("UPDATE t SET score = score + 10 WHERE id IN (1, 3);")
+        .expect("update in");
+    assert_eq!(message(&first[0]), "updated 2 row(s) in t");
+    let second = engine
+        .execute_script("UPDATE t SET score = 0 WHERE score BETWEEN 20 AND 25;")
+        .expect("update between");
+    assert_eq!(message(&second[0]), "updated 2 row(s) in t");
+
+    let final_rows = engine
+        .execute_script("SELECT score FROM t ORDER BY id;")
+        .expect("select");
+    assert_eq!(
+        as_rows(&final_rows[0]).1,
+        [
+            vec![Value::Int(0)],
+            vec![Value::Int(0)],
+            vec![Value::Null],
+            vec![Value::Int(30)],
+        ]
+    );
+}
+
+#[test]
 fn update_sets_values_filters_and_persists() {
     let dir = TempDir::new("sql-update");
     let db = dir.join("sql.db");

@@ -1,6 +1,6 @@
 # M1 SQL 3VL：最小纵向切片读数
 
-状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / LEFT JOIN / UPDATE 已实现。
+状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / LEFT JOIN / UPDATE / IN·BETWEEN·LIKE 谓词已实现。
 日期：2026-11-20
 
 ## 1. 交付
@@ -22,6 +22,7 @@ docs/specs/SQL.md
 - 多表 `INNER JOIN`：表别名、`alias.column` 限定列、非限定唯一列、自连接、JOIN 后分组/排序
 - `LEFT [OUTER] JOIN`：未匹配左行保留、右侧列补 `NULL`、空右表、LEFT JOIN 后 `WHERE/GROUP BY`
 - `UPDATE ... SET column = expr [, ...] [WHERE ...]`：旧行求值、多列赋值、类型/NOT NULL 校验
+- `IN` / `NOT IN`、`BETWEEN` / `NOT BETWEEN`、`LIKE` / `NOT LIKE`：三值逻辑、NULL 传播、ASCII 大小写不敏感
 - `DELETE`、`DROP TABLE`
 - `COUNT(*)`、`COUNT(expr)`、`SUM`、`MIN`、`MAX`
 - `INT` / `TEXT` / `BOOL`，`NOT NULL`
@@ -40,7 +41,7 @@ python tools/crosscheck/sql_oracle.py --tritdb target/debug/tritdb
 本机结果：
 
 ```text
-sql oracle: 74/74 passed (68 SELECT, 6 UPDATE row counts)
+sql oracle: 89/89 passed (83 SELECT, 6 UPDATE row counts)
 ```
 
 对拍口径：
@@ -54,18 +55,18 @@ sql oracle: 74/74 passed (68 SELECT, 6 UPDATE row counts)
 
 | 层 | 新增 |
 |---|---:|
-| `tritdb-exec` 单元测试 | 8 |
-| `tritdb-sql` 单元测试 | 14 |
-| `tritdb-sql` 引擎集成测试 | 23 |
+| `tritdb-exec` 单元测试 | 11 |
+| `tritdb-sql` 单元测试 | 15 |
+| `tritdb-sql` 引擎集成测试 | 26 |
 | `tritdb` SQL CLI 集成测试 | 2 |
-| **合计** | **47** |
+| **合计** | **54** |
 
-其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine）。工作区测试从 158 增至 **205 个正常测试 + 4 个 ignored 压力测试**。
+其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine）。工作区测试从 158 增至 **212 个正常测试 + 4 个 ignored 压力测试**。
 
 ## 4. 负结果 / 边界
 
 1. **整表重写**：每次 INSERT/DELETE/UPDATE 都把整张表重新编码成一个 KV value。数据量增大后写放大和内存峰值会先撞墙，M1 不解决。
-2. **JOIN 只做 INNER/LEFT，且是嵌套循环**：不支持 `RIGHT/FULL/CROSS/NATURAL JOIN`、`USING`、逗号 join 或子查询；左右表都物化，复杂度是行数乘积，后续再引入 hash join/优化器。`GROUP BY` 只支持列引用，不支持分组表达式、位置序号、GROUPING SETS/CUBE/ROLLUP。SQLite 对拍已覆盖单表表达式、分组聚合、`HAVING`、INNER JOIN、LEFT JOIN 和 UPDATE。
+2. **JOIN 只做 INNER/LEFT，且是嵌套循环**：不支持 `RIGHT/FULL/CROSS/NATURAL JOIN`、`USING`、逗号 join 或子查询；左右表都物化，复杂度是行数乘积，后续再引入 hash join/优化器。`GROUP BY` 只支持列引用，不支持分组表达式、位置序号、GROUPING SETS/CUBE/ROLLUP。SQLite 对拍已覆盖单表表达式、分组聚合、`HAVING`、INNER JOIN、LEFT JOIN、UPDATE 和 IN/BETWEEN/LIKE 谓词。
 3. **没有 pgwire**：`psql` 还连不上；CLI 是当前唯一入口。
 4. **每个语句自动提交**：脚本不是一个大事务；`INSERT` 多行在一个事务内，但 `CREATE`/`INSERT`/`SELECT` 之间不共享事务。
 5. **没有跨进程锁**：两个进程写同一个 SQL WAL 仍是未定义行为，和 M0 一致。
@@ -74,6 +75,7 @@ sql oracle: 74/74 passed (68 SELECT, 6 UPDATE row counts)
 8. **分组全内存**：`GROUP BY` 用 `BTreeMap<Vec<GroupKeyPart>, Vec<&Row>>`，没有 hash aggregate、分区或 spill；组数/行数受内存限制。
 9. **NULL 排序按 SQLite**：ASC 最前、DESC 最后；PostgreSQL 默认相反，后续要做方言开关。
 10. **JOIN 全内存**：每个 join 都构造新的临时表并复制行，没有流式执行、批处理或 spill；多表/大表会快速放大内存。
+11. **谓词只做标量列表**：`IN` 不支持子查询或行构造器；`LIKE` 仅支持 `TEXT`，没有 `ESCAPE`、`GLOB` 或正则，大小写折叠只覆盖 ASCII。
 
 ## 5. CI 与覆盖
 
@@ -88,5 +90,5 @@ sql oracle: 74/74 passed (68 SELECT, 6 UPDATE row counts)
 - `tritdb-plan`：逻辑计划、列裁剪、谓词下推、常量折叠。
 - `tritdb-proto`：pgwire v3 simple query + extended query，先让 `psql` 能连。
 - 表存储从整表重写改成页/行格式，接 `tritdb-page`。
-- SQL 3VL + GROUP BY + JOIN + UPDATE 套件扩到 `trit-clean` 的完整原始语义用例（当前 68 条 SELECT + 6 条 UPDATE 行数对拍为本仓自定义对拍集）。
+- SQL 3VL + GROUP BY + JOIN + DML + 谓词套件扩到 `trit-clean` 的完整原始语义用例（当前 83 条 SELECT + 6 条 UPDATE 行数对拍为本仓自定义对拍集）。
 - 并发 SQL 压力测试：多连接 SELECT + 单写者 INSERT，测读者 P99。
