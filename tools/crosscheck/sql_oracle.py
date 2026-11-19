@@ -114,6 +114,16 @@ CASES = [
     "SELECT id FROM t WHERE name NOT LIKE '%d%' ORDER BY id;",
     "SELECT id FROM t WHERE name LIKE '%' ORDER BY id;",
     "SELECT id FROM t WHERE id IN (1, 2) AND score BETWEEN 10 AND 20 ORDER BY id;",
+    "SELECT id, CASE WHEN score IS NULL THEN -1 ELSE score END AS s FROM t ORDER BY id;",
+    "SELECT id, CASE score WHEN 10 THEN 'ten' WHEN 20 THEN 'twenty' ELSE 'other' END AS label FROM t ORDER BY id;",
+    "SELECT id, CASE WHEN flag THEN 'yes' WHEN flag IS NULL THEN 'unknown' ELSE 'no' END AS f FROM t ORDER BY id;",
+    "SELECT id, CASE WHEN id = 1 THEN 'one' END AS c FROM t ORDER BY id;",
+    "SELECT id, CASE WHEN flag THEN 1 WHEN NOT flag THEN 0 END AS f FROM t ORDER BY id;",
+    "SELECT id FROM t WHERE CASE WHEN score IS NULL THEN FALSE ELSE score > 10 END ORDER BY id;",
+    "SELECT CASE WHEN COUNT(*) > 1 THEN 'many' ELSE 'one' END AS k, COUNT(*) FROM t GROUP BY score ORDER BY score;",
+    "SELECT CASE WHEN flag THEN COUNT(*) ELSE 0 END AS n FROM t GROUP BY flag ORDER BY flag;",
+    "SELECT t.id, u.label FROM t JOIN u ON CASE WHEN t.id = 1 THEN u.dept = 1 ELSE t.id = u.dept END ORDER BY t.id;",
+    "SELECT id, CASE WHEN id IN (1, 3) THEN CASE WHEN score IS NULL THEN 'null' ELSE 'set' END ELSE 'other' END AS c FROM t ORDER BY id;",
 ]
 
 

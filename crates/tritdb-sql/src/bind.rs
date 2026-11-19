@@ -64,6 +64,15 @@ pub(crate) enum GroupExpr {
         /// `NOT LIKE`.
         negated: bool,
     },
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`.
+    Case {
+        /// Simple-case operand.
+        operand: Option<Box<GroupExpr>>,
+        /// `WHEN`/`THEN` pairs.
+        branches: Vec<(GroupExpr, GroupExpr)>,
+        /// `ELSE` result.
+        else_expr: Option<Box<GroupExpr>>,
+    },
     /// Binary operator.
     Binary {
         /// Operator.
@@ -92,6 +101,17 @@ impl GroupExpr {
             } => expr.has_aggregate() || low.has_aggregate() || high.has_aggregate(),
             GroupExpr::Like { expr, pattern, .. } => {
                 expr.has_aggregate() || pattern.has_aggregate()
+            }
+            GroupExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand.as_ref().is_some_and(|expr| expr.has_aggregate())
+                    || branches
+                        .iter()
+                        .any(|(when, then)| when.has_aggregate() || then.has_aggregate())
+                    || else_expr.as_ref().is_some_and(|expr| expr.has_aggregate())
             }
             GroupExpr::Binary { left, right, .. } => left.has_aggregate() || right.has_aggregate(),
         }
@@ -244,6 +264,26 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             pattern: Box::new(bind_expr(pattern, schema)?),
             negated: *negated,
         }),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Ok(ExecExpr::Case {
+            operand: operand
+                .as_deref()
+                .map(|expr| bind_expr(expr, schema))
+                .transpose()?
+                .map(Box::new),
+            branches: branches
+                .iter()
+                .map(|(when, then)| Ok((bind_expr(when, schema)?, bind_expr(then, schema)?)))
+                .collect::<Result<_, SqlError>>()?,
+            else_expr: else_expr
+                .as_deref()
+                .map(|expr| bind_expr(expr, schema))
+                .transpose()?
+                .map(Box::new),
+        }),
         Expr::Binary { op, left, right } => Ok(ExecExpr::Binary {
             op: *op,
             left: Box::new(bind_expr(left, schema)?),
@@ -290,6 +330,17 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             expr, low, high, ..
         } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
         Expr::Like { expr, pattern, .. } => expr_has_aggregate(expr) || expr_has_aggregate(pattern),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_has_aggregate)
+                || branches
+                    .iter()
+                    .any(|(when, then)| expr_has_aggregate(when) || expr_has_aggregate(then))
+                || else_expr.as_deref().is_some_and(expr_has_aggregate)
+        }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::Aggregate { .. } => true,
     }
@@ -433,6 +484,44 @@ fn bind_group_expr(
             )?),
             negated: *negated,
         }),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            let operand = match operand {
+                Some(expr) => Some(Box::new(bind_group_expr(
+                    expr,
+                    schema,
+                    grouped,
+                    aggregate_query,
+                    group_columns,
+                )?)),
+                None => None,
+            };
+            let mut bound_branches = Vec::with_capacity(branches.len());
+            for (when, then) in branches {
+                bound_branches.push((
+                    bind_group_expr(when, schema, grouped, aggregate_query, group_columns)?,
+                    bind_group_expr(then, schema, grouped, aggregate_query, group_columns)?,
+                ));
+            }
+            let else_expr = match else_expr {
+                Some(expr) => Some(Box::new(bind_group_expr(
+                    expr,
+                    schema,
+                    grouped,
+                    aggregate_query,
+                    group_columns,
+                )?)),
+                None => None,
+            };
+            Ok(GroupExpr::Case {
+                operand,
+                branches: bound_branches,
+                else_expr,
+            })
+        }
         Expr::Binary { op, left, right } => Ok(GroupExpr::Binary {
             op: *op,
             left: Box::new(bind_group_expr(

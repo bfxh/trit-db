@@ -614,6 +614,7 @@ impl Parser {
             TokenKind::Keyword(Keyword::Sum) => self.parse_aggregate(AggregateKind::Sum),
             TokenKind::Keyword(Keyword::Min) => self.parse_aggregate(AggregateKind::Min),
             TokenKind::Keyword(Keyword::Max) => self.parse_aggregate(AggregateKind::Max),
+            TokenKind::Keyword(Keyword::Case) => self.parse_case(),
             TokenKind::Symbol(Symbol::LParen) => {
                 let expr = self.parse_expr()?;
                 self.expect_symbol(Symbol::RParen)?;
@@ -621,6 +622,39 @@ impl Parser {
             }
             _ => Err(SqlError::parse("expected expression", token.offset)),
         }
+    }
+
+    fn parse_case(&mut self) -> Result<Expr, SqlError> {
+        let operand = if self
+            .peek()
+            .is_some_and(|token| token.kind == TokenKind::Keyword(Keyword::When))
+        {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        self.expect_keyword(Keyword::When)?;
+        let mut branches = Vec::new();
+        loop {
+            let when = self.parse_expr()?;
+            self.expect_keyword(Keyword::Then)?;
+            let then = self.parse_expr()?;
+            branches.push((when, then));
+            if !self.eat_keyword(Keyword::When) {
+                break;
+            }
+        }
+        let else_expr = if self.eat_keyword(Keyword::Else) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::End)?;
+        Ok(Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        })
     }
 
     fn parse_aggregate(&mut self, kind: AggregateKind) -> Result<Expr, SqlError> {
@@ -832,6 +866,69 @@ mod tests {
                 "{sql} returned {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_searched_and_simple_case() {
+        let statements =
+            parse_script("SELECT CASE WHEN flag THEN 1 WHEN id > 1 THEN 2 ELSE 3 END AS c FROM t;")
+                .expect("parse searched case");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let SelectItem::Expr { expr, alias } = &select.items[0] else {
+            panic!("expected expression");
+        };
+        assert_eq!(alias.as_deref(), Some("c"));
+        match expr {
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                assert!(operand.is_none());
+                assert_eq!(branches.len(), 2);
+                assert!(else_expr.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let statements = parse_script("SELECT CASE id WHEN 1 THEN 'a' ELSE 'b' END AS c FROM t;")
+            .expect("parse simple case");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let SelectItem::Expr { expr, .. } = &select.items[0] else {
+            panic!("expected expression");
+        };
+        match expr {
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                assert!(operand.is_some());
+                assert_eq!(branches.len(), 1);
+                assert!(else_expr.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let statements = parse_script(
+            "SELECT CASE WHEN id = 1 THEN CASE WHEN flag THEN 2 END ELSE 3 END AS c FROM t;",
+        )
+        .expect("parse nested case");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let SelectItem::Expr { expr, .. } = &select.items[0] else {
+            panic!("expected expression");
+        };
+        assert!(matches!(expr, Expr::Case { branches, .. } if branches.len() == 1));
+
+        assert!(parse_script("SELECT CASE WHEN flag THEN 1 FROM t;").is_err());
+        assert!(parse_script("SELECT CASE WHEN flag 1 END FROM t;").is_err());
+        assert!(parse_script("SELECT CASE END FROM t;").is_err());
     }
 
     #[test]

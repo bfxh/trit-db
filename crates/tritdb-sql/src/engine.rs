@@ -667,6 +667,32 @@ fn eval_group_expr(
             };
             Ok(eval(&bound, &Schema::default(), &[])?)
         }
+        GroupExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                let probe = eval_group_expr(operand, schema, group)?;
+                for (when, then) in branches {
+                    let candidate = eval_group_expr(when, schema, group)?;
+                    if compare_values(&probe, &candidate)? == Some(Ordering::Equal) {
+                        return eval_group_expr(then, schema, group);
+                    }
+                }
+            } else {
+                for (when, then) in branches {
+                    let value = eval_group_expr(when, schema, group)?;
+                    if truth_of(&value)? == TruthValue::True {
+                        return eval_group_expr(then, schema, group);
+                    }
+                }
+            }
+            match else_expr {
+                Some(expr) => eval_group_expr(expr, schema, group),
+                None => Ok(Value::Null),
+            }
+        }
         GroupExpr::Binary { op, left, right } => {
             let left = eval_group_expr(left, schema, group)?;
             let right = eval_group_expr(right, schema, group)?;

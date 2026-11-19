@@ -296,6 +296,15 @@ pub enum Expr {
         /// `true` for `NOT LIKE`.
         negated: bool,
     },
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`.
+    Case {
+        /// Simple-case operand; `None` for a searched case.
+        operand: Option<Box<Expr>>,
+        /// `WHEN`/`THEN` pairs in source order.
+        branches: Vec<(Expr, Expr)>,
+        /// `ELSE` result; `None` yields `NULL` when nothing matches.
+        else_expr: Option<Box<Expr>>,
+    },
     /// Binary boolean, comparison, or arithmetic operator.
     Binary {
         /// Operator.
@@ -622,6 +631,32 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
                 }),
             }
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                let probe = eval(operand, schema, row)?;
+                for (when, then) in branches {
+                    let candidate = eval(when, schema, row)?;
+                    if compare_values(&probe, &candidate)? == Some(Ordering::Equal) {
+                        return eval(then, schema, row);
+                    }
+                }
+            } else {
+                for (when, then) in branches {
+                    let value = eval(when, schema, row)?;
+                    if truth_of(&value)? == TruthValue::True {
+                        return eval(then, schema, row);
+                    }
+                }
+            }
+            match else_expr {
+                Some(expr) => eval(expr, schema, row),
+                None => Ok(Value::Null),
+            }
+        }
         Expr::Binary { op, left, right } => {
             if matches!(op, BinaryOp::And | BinaryOp::Or) {
                 let left_value = eval(left, schema, row)?;
@@ -935,6 +970,86 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn case_is_three_valued_and_lazily_evaluated() {
+        let schema = Schema::new(vec![
+            Column::new("flag", DataType::Bool),
+            Column::new("score", DataType::Int),
+        ]);
+        let true_row = vec![Value::Bool(true), Value::Int(10)];
+        let null_row = vec![Value::Null, Value::Int(20)];
+
+        let searched = Expr::Case {
+            operand: None,
+            branches: vec![
+                (
+                    Expr::Column(0),
+                    Expr::Literal(Value::Text("yes".to_string())),
+                ),
+                (
+                    Expr::IsNull {
+                        expr: Box::new(Expr::Column(0)),
+                        negated: false,
+                    },
+                    Expr::Literal(Value::Text("unknown".to_string())),
+                ),
+            ],
+            else_expr: Some(Box::new(Expr::Literal(Value::Text("no".to_string())))),
+        };
+        assert_eq!(
+            eval(&searched, &schema, &true_row).expect("true"),
+            Value::Text("yes".to_string())
+        );
+        assert_eq!(
+            eval(&searched, &schema, &null_row).expect("null"),
+            Value::Text("unknown".to_string())
+        );
+
+        let no_else = Expr::Case {
+            operand: None,
+            branches: vec![(Expr::Column(0), Expr::Literal(Value::Int(1)))],
+            else_expr: None,
+        };
+        assert_eq!(
+            eval(&no_else, &schema, &null_row).expect("no else"),
+            Value::Null
+        );
+
+        let simple = Expr::Case {
+            operand: Some(Box::new(Expr::Column(1))),
+            branches: vec![
+                (Expr::Literal(Value::Int(10)), Expr::Literal(Value::Int(1))),
+                (Expr::Literal(Value::Int(20)), Expr::Literal(Value::Int(2))),
+            ],
+            else_expr: Some(Box::new(Expr::Literal(Value::Int(0)))),
+        };
+        assert_eq!(
+            eval(&simple, &schema, &true_row).expect("simple ten"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            eval(&simple, &schema, &null_row).expect("simple twenty"),
+            Value::Int(2)
+        );
+
+        let lazy = Expr::Case {
+            operand: None,
+            branches: vec![(
+                Expr::Literal(Value::Bool(true)),
+                Expr::Literal(Value::Int(1)),
+            )],
+            else_expr: Some(Box::new(Expr::Binary {
+                op: BinaryOp::Div,
+                left: Box::new(Expr::Literal(Value::Int(1))),
+                right: Box::new(Expr::Literal(Value::Int(0))),
+            })),
+        };
+        assert_eq!(
+            eval(&lazy, &schema, &true_row).expect("lazy"),
+            Value::Int(1)
+        );
     }
 
     #[test]

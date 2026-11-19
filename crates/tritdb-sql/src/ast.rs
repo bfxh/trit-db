@@ -84,6 +84,15 @@ pub enum Expr {
         /// `true` for `NOT LIKE`.
         negated: bool,
     },
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`.
+    Case {
+        /// Simple-case operand; `None` for a searched case.
+        operand: Option<Box<Expr>>,
+        /// `WHEN`/`THEN` pairs in source order.
+        branches: Vec<(Expr, Expr)>,
+        /// `ELSE` result.
+        else_expr: Option<Box<Expr>>,
+    },
     /// Binary operator.
     Binary {
         /// Operator.

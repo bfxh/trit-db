@@ -1,6 +1,6 @@
 # trit-db 测试矩阵与 CI/CD
 
-M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词语义拆开验证。当前工作区有 **212 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE 语义拆开验证。当前工作区有 **217 个正常测试 + 4 个 `#[ignore]` 压力测试**。
 
 ## 1. 分层与计数
 
@@ -12,10 +12,10 @@ M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引�
 | `tritdb-wal` | 7 | 10 fuzz | 17 | 每个前缀、torn tail、LSN 连续、逐字节 mutation |
 | `tritdb-txn` | 14 | 11 model | 25 | 随机事务 + checkpoint/reopen、提交组、读者单调性、snapshot-only reopen LSN |
 | `tritdb-store` | 12 | 9 model | 21 | 页模型、abort、sidecar 截断/损坏、并发读者 |
-| `tritdb-exec` | 11 | — | 11 | 三值 AND/OR/NOT 真值表、NULL 比较、算术、IN/BETWEEN/LIKE 三值语义、非布尔谓词 |
-| `tritdb-sql` | 15 | 26 engine | 41 | parser、TRSQ 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/LEFT JOIN、IN/BETWEEN/LIKE、UPDATE、聚合排序、DELETE/reopen |
+| `tritdb-exec` | 12 | — | 12 | 三值 AND/OR/NOT 真值表、NULL 比较、算术、IN/BETWEEN/LIKE 三值语义、CASE 短路/简单式/缺省 NULL、非布尔谓词 |
+| `tritdb-sql` | 16 | 29 engine | 45 | parser、TRSQ 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/LEFT JOIN、IN/BETWEEN/LIKE、CASE（投影/WHERE/聚合/JOIN/UPDATE）、UPDATE、聚合排序、DELETE/reopen |
 | `tritdb`（集成） | — | — | 16 | CLI 4、SQL CLI 2、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
-| **合计** | **103** | **93** | **212** | 另有 4 个 ignored 压力测试 |
+| **合计** | **105** | **96** | **217** | 另有 4 个 ignored 压力测试 |
 
 `vectors` 的 5 个测试覆盖 `radix.txt`、`trbl.txt`、`page.txt`、`wal.txt`、`snapshot.txt`。向量由 Python 参考实现生成，Rust 只负责解码、重编码和语义恢复。
 
@@ -35,9 +35,9 @@ M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引�
 
 ### SQL ↔ SQLite
 
-- `tools/crosscheck/sql_oracle.py`：同一份 `CREATE TABLE` + `INSERT` 同时灌入 `tritdb-sql` 和 Python `sqlite3`；22 条基础 + 12 条扩展 + 11 条 GROUP BY/HAVING + 18 条 JOIN + 5 条 UPDATE 后查询 + 15 条 IN/BETWEEN/LIKE 共 **83 条 SELECT** 逐行一致；另对 6 条 `UPDATE` 语句比对 tritdb 返回的更新行数与 `sqlite3` 的 `rowcount`，合计 **89/89**。
+- `tools/crosscheck/sql_oracle.py`：同一份 `CREATE TABLE` + `INSERT` 同时灌入 `tritdb-sql` 和 Python `sqlite3`；22 条基础 + 12 条扩展 + 11 条 GROUP BY/HAVING + 18 条 JOIN + 5 条 UPDATE 后查询 + 15 条 IN/BETWEEN/LIKE + 10 条 CASE 共 **93 条 SELECT** 逐行一致；另对 6 条 `UPDATE` 语句比对 tritdb 返回的更新行数与 `sqlite3` 的 `rowcount`，合计 **99/99**。
 - 比较前归一化 `TRUE`/`FALSE` 为 `1`/`0`、`NULL` 为 `NULL`，只比较行值不比较列名；SQLite 不支持的 `IS UNKNOWN` 由 Rust 测试单独覆盖。
-- 覆盖三值 `WHERE`、`NOT`、`IS NULL`、NULL 参与比较、NULL 排序、聚合、分组、HAVING、表别名、限定列、INNER/LEFT JOIN、自连接、`LIMIT`、`UPDATE` 多列赋值/旧行求值/更新行数、`IN`/`BETWEEN`/`LIKE` 的 NULL 与通配符语义。
+- 覆盖三值 `WHERE`、`NOT`、`IS NULL`、NULL 参与比较、NULL 排序、聚合、分组、HAVING、表别名、限定列、INNER/LEFT JOIN、自连接、`LIMIT`、`UPDATE` 多列赋值/旧行求值/更新行数、`IN`/`BETWEEN`/`LIKE` 的 NULL 与通配符语义、`CASE` 的搜索式/简单式/嵌套/缺省 `NULL`。
 
 ### 格式 ↔ 引擎
 

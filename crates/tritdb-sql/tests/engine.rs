@@ -1038,6 +1038,245 @@ fn update_checks_null_type_and_target_column() {
 }
 
 #[test]
+fn case_projects_filters_and_defaults_to_null() {
+    let dir = TempDir::new("sql-case");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    let results = engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT, flag BOOL); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a', TRUE), (2, NULL, NULL, NULL), (3, 20, 'c', FALSE), \
+               (4, 30, 'd', TRUE), (5, NULL, '', NULL); \
+             SELECT id, \
+               CASE WHEN score IS NULL THEN -1 ELSE score END AS s, \
+               CASE WHEN flag THEN 'yes' WHEN flag IS NULL THEN 'unknown' ELSE 'no' END AS f, \
+               CASE score WHEN 10 THEN 'ten' WHEN 20 THEN 'twenty' ELSE 'other' END AS label \
+             FROM t ORDER BY id;",
+        )
+        .expect("case projection");
+    let (columns, rows) = as_rows(&results[2]);
+    assert_eq!(columns, ["id", "s", "f", "label"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("yes".to_string()),
+                Value::Text("ten".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(-1),
+                Value::Text("unknown".to_string()),
+                Value::Text("other".to_string()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(20),
+                Value::Text("no".to_string()),
+                Value::Text("twenty".to_string()),
+            ],
+            vec![
+                Value::Int(4),
+                Value::Int(30),
+                Value::Text("yes".to_string()),
+                Value::Text("other".to_string()),
+            ],
+            vec![
+                Value::Int(5),
+                Value::Int(-1),
+                Value::Text("unknown".to_string()),
+                Value::Text("other".to_string()),
+            ],
+        ]
+    );
+
+    let no_else = engine
+        .execute_script("SELECT id, CASE WHEN id = 1 THEN 'one' END AS c FROM t ORDER BY id;")
+        .expect("no else");
+    assert_eq!(
+        as_rows(&no_else[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("one".to_string())],
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Null],
+            vec![Value::Int(4), Value::Null],
+            vec![Value::Int(5), Value::Null],
+        ]
+    );
+
+    let filtered = engine
+        .execute_script(
+            "SELECT id FROM t \
+             WHERE CASE WHEN score IS NULL THEN FALSE ELSE score > 10 END ORDER BY id;",
+        )
+        .expect("case filter");
+    assert_eq!(
+        as_rows(&filtered[0]).1,
+        [vec![Value::Int(3)], vec![Value::Int(4)],]
+    );
+
+    let inserted = engine
+        .execute_script(
+            "INSERT INTO t (id, name, flag) VALUES \
+             (6, CASE WHEN TRUE THEN 'x' ELSE 'y' END, CASE WHEN FALSE THEN TRUE END);",
+        )
+        .expect("case insert");
+    assert_eq!(message(&inserted[0]), "inserted 1 row(s) into t");
+    let appended = engine
+        .execute_script("SELECT name, flag FROM t WHERE id = 6;")
+        .expect("inserted row");
+    assert_eq!(
+        as_rows(&appended[0]).1,
+        [vec![Value::Text("x".to_string()), Value::Null]]
+    );
+}
+
+#[test]
+fn case_short_circuits_and_rejects_bad_conditions() {
+    let dir = TempDir::new("sql-case-eval");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, score INT); \
+             INSERT INTO t VALUES (1, 10), (2, NULL);",
+        )
+        .expect("seed");
+
+    let results = engine
+        .execute_script("SELECT CASE WHEN TRUE THEN 1 ELSE 1 / 0 END AS c FROM t WHERE id = 1;")
+        .expect("untaken else");
+    assert_eq!(as_rows(&results[0]).1, [vec![Value::Int(1)]]);
+
+    let results = engine
+        .execute_script("SELECT CASE WHEN FALSE THEN 1 / 0 ELSE 2 END AS c FROM t WHERE id = 1;")
+        .expect("untaken then");
+    assert_eq!(as_rows(&results[0]).1, [vec![Value::Int(2)]]);
+
+    let results = engine
+        .execute_script("SELECT CASE WHEN score IS NULL THEN 1 / 0 END AS c FROM t WHERE id = 1;")
+        .expect("null condition");
+    assert_eq!(as_rows(&results[0]).1, [vec![Value::Null]]);
+
+    let division = engine
+        .execute_script("SELECT CASE WHEN score IS NULL THEN 1 / 0 END AS c FROM t WHERE id = 2;")
+        .expect_err("chosen branch runs")
+        .to_string();
+    assert!(division.contains("division by zero"), "{division}");
+
+    let predicate = engine
+        .execute_script("SELECT CASE WHEN score THEN 1 END AS c FROM t;")
+        .expect_err("non-boolean condition")
+        .to_string();
+    assert!(
+        predicate.contains("predicate must be BOOLEAN"),
+        "{predicate}"
+    );
+
+    let mismatch = engine
+        .execute_script("SELECT CASE score WHEN 'x' THEN 1 ELSE 0 END AS c FROM t;")
+        .expect_err("mixed simple-case types")
+        .to_string();
+    assert!(mismatch.contains("type mismatch"), "{mismatch}");
+}
+
+#[test]
+fn case_works_with_aggregates_joins_and_update() {
+    let dir = TempDir::new("sql-case-query");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT, flag BOOL); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a', TRUE), (2, NULL, NULL, NULL), (3, 20, 'c', FALSE), \
+               (4, 30, 'd', TRUE), (5, NULL, '', NULL); \
+             CREATE TABLE u (id INT, dept INT, label TEXT); \
+             INSERT INTO u VALUES (10, 1, 'eng'), (20, 2, 'sales'), (30, 4, 'ops'), \
+               (40, 99, 'idle'), (50, NULL, 'nil');",
+        )
+        .expect("seed");
+
+    let grouped = engine
+        .execute_script(
+            "SELECT CASE WHEN COUNT(*) > 1 THEN 'many' ELSE 'one' END AS k, COUNT(*) \
+             FROM t GROUP BY score ORDER BY score;",
+        )
+        .expect("case aggregate");
+    assert_eq!(
+        as_rows(&grouped[0]).1,
+        [
+            vec![Value::Text("many".to_string()), Value::Int(2)],
+            vec![Value::Text("one".to_string()), Value::Int(1)],
+            vec![Value::Text("one".to_string()), Value::Int(1)],
+            vec![Value::Text("one".to_string()), Value::Int(1)],
+        ]
+    );
+
+    let having = engine
+        .execute_script(
+            "SELECT score, COUNT(*) FROM t GROUP BY score \
+             HAVING CASE WHEN COUNT(*) > 1 THEN TRUE ELSE FALSE END ORDER BY score;",
+        )
+        .expect("case having");
+    assert_eq!(as_rows(&having[0]).1, [vec![Value::Null, Value::Int(2)]]);
+
+    let aggregate_branch = engine
+        .execute_script(
+            "SELECT CASE WHEN flag THEN COUNT(*) ELSE 0 END AS n \
+             FROM t GROUP BY flag ORDER BY flag;",
+        )
+        .expect("aggregate in branch");
+    assert_eq!(
+        as_rows(&aggregate_branch[0]).1,
+        [
+            vec![Value::Int(0)],
+            vec![Value::Int(0)],
+            vec![Value::Int(2)],
+        ]
+    );
+
+    let joined = engine
+        .execute_script(
+            "SELECT t.id, u.label FROM t JOIN u \
+             ON CASE WHEN t.id = 1 THEN u.dept = 1 ELSE t.id = u.dept END \
+             ORDER BY t.id;",
+        )
+        .expect("case join");
+    assert_eq!(
+        as_rows(&joined[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("eng".to_string())],
+            vec![Value::Int(2), Value::Text("sales".to_string())],
+            vec![Value::Int(4), Value::Text("ops".to_string())],
+        ]
+    );
+
+    let updated = engine
+        .execute_script(
+            "UPDATE t SET name = CASE WHEN score IS NULL THEN 'missing' ELSE name END \
+             WHERE id <= 4;",
+        )
+        .expect("case update");
+    assert_eq!(message(&updated[0]), "updated 4 row(s) in t");
+    let names = engine
+        .execute_script("SELECT id, name FROM t WHERE id <= 4 ORDER BY id;")
+        .expect("names");
+    assert_eq!(
+        as_rows(&names[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("a".to_string())],
+            vec![Value::Int(2), Value::Text("missing".to_string())],
+            vec![Value::Int(3), Value::Text("c".to_string())],
+            vec![Value::Int(4), Value::Text("d".to_string())],
+        ]
+    );
+}
+
+#[test]
 fn update_without_matches_and_empty_table_reports_zero() {
     let dir = TempDir::new("sql-update-empty");
     let db = dir.join("sql.db");

@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` 与 `LEFT [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；`RIGHT/FULL JOIN`、子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -25,6 +25,8 @@ SELECT u.name, d.name AS dept
 FROM users AS u LEFT JOIN depts AS d ON u.dept = d.id
 ORDER BY u.name;
 SELECT id FROM t WHERE id IN (1, 2) AND score BETWEEN 10 AND 20 AND name LIKE 'a%';
+SELECT id, CASE WHEN score IS NULL THEN -1 ELSE score END AS s FROM t ORDER BY id;
+SELECT id, CASE flag WHEN TRUE THEN 'yes' ELSE 'no' END AS f FROM t ORDER BY id;
 UPDATE t SET name = 'b', flag = NULL WHERE id = 2;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
@@ -116,6 +118,20 @@ expr [NOT] LIKE pattern
 - `LIKE` 左值和模式都必须是 `TEXT`（`NULL` 传播为 `NULL`）；`%` 匹配任意长度（含空串），`_` 匹配任意单个字符；ASCII 字母大小写不敏感，非 ASCII 按原字符比较。不支持 `ESCAPE`、`GLOB` 或正则。
 - 这些谓词可用于 `WHERE`、`ON`、`HAVING` 和非聚合投影表达式；`UPDATE`/`DELETE` 的 `WHERE` 复用同一求值路径。
 
+### CASE
+
+```sql
+CASE WHEN predicate THEN expr [WHEN predicate THEN expr]... [ELSE expr] END
+CASE operand WHEN value THEN expr [WHEN value THEN expr]... [ELSE expr] END
+```
+
+- 搜索式 `CASE WHEN` 的条件必须是布尔值：只有 `TRUE` 命中；`FALSE` 和 `UNKNOWN` 都跳过。简单式 `CASE operand WHEN` 用类型严格的 `=` 逐项比较，`NULL` 探针不匹配任何分支。
+- 按源码顺序取第一个命中分支，后面的 `WHEN` 不再求值；没有 `ELSE` 或全部未命中时结果为 `NULL`。
+- 只求值被选中的 `THEN`/`ELSE` 结果，未选中分支里的错误（如除零）不会触发。
+- 分支结果允许不同类型，输出值是实际选中分支的值；写入目标列时仍按列类型严格检查。
+- 可用于 `SELECT`、`WHERE`、`ON`、`HAVING`、`ORDER BY`、`UPDATE ... SET` 与 `INSERT ... VALUES` 中的常量表达式；条件/结果里可以引用分组列和聚合。
+- 不支持子查询作为 `CASE` 条件或结果；简单式遇到不同类型的探针与候选会报 `type mismatch`（比 SQLite 更严格）。
+
 ### UPDATE
 
 ```sql
@@ -204,5 +220,5 @@ tritdb sql --db sql.db --file script.sql
 ## 7. 验收门
 
 - Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 89/89 项通过（83 条 SELECT + 6 条 UPDATE 行数）。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 99/99 项通过（93 条 SELECT + 6 条 UPDATE 行数）。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。
