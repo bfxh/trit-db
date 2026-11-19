@@ -69,7 +69,14 @@ sql oracle: 34/34 passed
 7. **类型严格**：不做 SQLite 式隐式转换；`INSERT INTO t (id) VALUES ('x')` 会拒绝。
 8. **NULL 排序按 SQLite**：ASC 最前、DESC 最后；PostgreSQL 默认相反，后续要做方言开关。
 
-## 5. 下一步
+## 5. CI 与覆盖
+
+- CI run：<https://github.com/bfxh/trit-db/actions/runs/44608271037>，11 个 job 全绿。
+- Ubuntu/Windows/macOS 三平台 `python-crosscheck` 都执行 `sql_oracle.py`，均为 34/34。
+- 新增两个 SQL crate 后，行覆盖从 3253/4791 = 67.9% 变为 **4710/6559 = 71.81%**，65% 门禁仍有余量。
+- 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
+
+## 6. 下一步
 
 - 多表 JOIN 与 GROUP BY，先做 hash join / hash aggregate。
 - `tritdb-plan`：逻辑计划、列裁剪、谓词下推、常量折叠。
