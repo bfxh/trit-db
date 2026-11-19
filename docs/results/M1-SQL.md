@@ -81,9 +81,9 @@ sql oracle: 99/99 passed (93 SELECT, 6 UPDATE row counts)
 
 ## 5. CI 与覆盖
 
-- 谓词切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44620142871>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
-- 三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 **89/89**（83 SELECT + 6 UPDATE 行数，含 macOS）。
-- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 **5531/7426 = 74.48%**，65% 门禁仍有余量。
+- CASE 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44622362833>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
+- 三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 **99/99**（93 SELECT + 6 UPDATE 行数，含 macOS）。
+- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 **5766/7646 = 75.41%**，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
