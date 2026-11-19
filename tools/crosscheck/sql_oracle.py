@@ -33,6 +33,7 @@ INSERT INTO u VALUES
   (30, 4, 'ops'),
   (40, 99, 'idle'),
   (50, NULL, 'nil');
+CREATE TABLE e (id INT);
 """
 
 CASES = [
@@ -99,6 +100,16 @@ CASES = [
     "SELECT u.label, COUNT(*) FROM t LEFT JOIN u ON t.id = u.dept GROUP BY u.label ORDER BY u.label;",
     "SELECT COUNT(*) FROM t LEFT JOIN u ON t.id = u.dept;",
     "SELECT x.id, y.label FROM t AS x LEFT JOIN u AS y ON x.id = y.dept ORDER BY x.id;",
+    "SELECT t.id, u.id, u.label FROM t RIGHT JOIN u ON t.id = u.dept ORDER BY u.id;",
+    "SELECT u.id, t.id FROM u RIGHT JOIN t ON u.dept = t.id ORDER BY t.id;",
+    "SELECT COUNT(*) FROM t RIGHT JOIN u ON t.id = u.dept;",
+    "SELECT t.id, u.label FROM t RIGHT JOIN u ON t.id = u.dept WHERE t.id IS NULL ORDER BY u.id;",
+    "SELECT COUNT(*) FROM t RIGHT JOIN e ON t.id = e.id;",
+    "SELECT t.id AS tid, u.id AS uid FROM t FULL JOIN u ON t.id = u.dept ORDER BY tid, uid;",
+    "SELECT COUNT(*) FROM t FULL JOIN u ON t.id = u.dept;",
+    "SELECT t.id AS tid, u.id AS uid FROM t FULL JOIN u ON t.id = u.dept WHERE t.id IS NULL OR u.id IS NULL ORDER BY tid, uid;",
+    "SELECT u.label, COUNT(*) FROM t FULL JOIN u ON t.id = u.dept GROUP BY u.label ORDER BY u.label;",
+    "SELECT t.id, e.id FROM t FULL JOIN e ON t.id = e.id ORDER BY t.id;",
     "SELECT id FROM t WHERE id IN (1, 3, 5) ORDER BY id;",
     "SELECT id FROM t WHERE id NOT IN (1, 3, 5) ORDER BY id;",
     "SELECT id FROM t WHERE score IN (10, 20) ORDER BY id;",

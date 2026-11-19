@@ -391,7 +391,12 @@ fn join_tables(
 ) -> Result<Table, SqlError> {
     let mut columns = left.schema.columns.clone();
     let mut right_columns = right.schema.columns.clone();
-    if kind == JoinKind::Left {
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for column in &mut columns {
+            column.not_null = false;
+        }
+    }
+    if matches!(kind, JoinKind::Left | JoinKind::Full) {
         for column in &mut right_columns {
             column.not_null = false;
         }
@@ -400,19 +405,31 @@ fn join_tables(
     let schema = Schema::new(columns);
     let predicate = bind_expr(on, &schema)?;
     let mut rows = Vec::new();
+    let mut right_matched = vec![false; right.rows.len()];
     for left_row in &left.rows {
         let mut matched = false;
-        for right_row in &right.rows {
+        for (index, right_row) in right.rows.iter().enumerate() {
             let mut row = left_row.clone();
             row.extend(right_row.iter().cloned());
             if passes_filter(Some(&predicate), &schema, &row)? {
                 matched = true;
+                right_matched[index] = true;
                 rows.push(row);
             }
         }
-        if kind == JoinKind::Left && !matched {
+        if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
             let mut row = left_row.clone();
             row.extend(std::iter::repeat_n(Value::Null, right.schema.columns.len()));
+            rows.push(row);
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (index, right_row) in right.rows.iter().enumerate() {
+            if right_matched[index] {
+                continue;
+            }
+            let mut row = vec![Value::Null; left.schema.columns.len()];
+            row.extend(right_row.iter().cloned());
             rows.push(row);
         }
     }

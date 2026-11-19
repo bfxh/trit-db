@@ -256,11 +256,11 @@ impl Parser {
         if matches!(
             self.peek().map(|token| &token.kind),
             Some(TokenKind::Keyword(
-                Keyword::Right | Keyword::Full | Keyword::Cross | Keyword::Natural | Keyword::Outer
+                Keyword::Cross | Keyword::Natural | Keyword::Outer
             ))
         ) {
             return Err(SqlError::Unsupported(
-                "only INNER and LEFT JOIN are supported".to_string(),
+                "only INNER, LEFT, RIGHT, and FULL JOIN are supported".to_string(),
             ));
         }
 
@@ -273,6 +273,14 @@ impl Parser {
                 self.eat_keyword(Keyword::Outer);
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Left
+            } else if self.eat_keyword(Keyword::Right) {
+                self.eat_keyword(Keyword::Outer);
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Right
+            } else if self.eat_keyword(Keyword::Full) {
+                self.eat_keyword(Keyword::Outer);
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Full
             } else if self.eat_keyword(Keyword::Join) {
                 JoinKind::Inner
             } else {
@@ -852,10 +860,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_right_full_and_outer_join() {
+        for (sql, expected) in [
+            (
+                "SELECT u.id FROM users u RIGHT JOIN depts d ON u.dept = d.id;",
+                JoinKind::Right,
+            ),
+            (
+                "SELECT u.id FROM users u RIGHT OUTER JOIN depts d ON u.dept = d.id;",
+                JoinKind::Right,
+            ),
+            (
+                "SELECT u.id FROM users u FULL JOIN depts d ON u.dept = d.id;",
+                JoinKind::Full,
+            ),
+            (
+                "SELECT u.id FROM users u FULL OUTER JOIN depts d ON u.dept = d.id;",
+                JoinKind::Full,
+            ),
+        ] {
+            let statements = parse_script(sql).expect("parse outer join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), 1);
+                    assert_eq!(select.joins[0].kind, expected, "{sql}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_join() {
         for sql in [
-            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id;",
-            "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
             "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",
             "SELECT * FROM a NATURAL JOIN b;",
             "SELECT * FROM a OUTER JOIN b ON a.id = b.id;",

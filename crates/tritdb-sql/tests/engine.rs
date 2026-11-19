@@ -1277,6 +1277,209 @@ fn case_works_with_aggregates_joins_and_update() {
 }
 
 #[test]
+fn right_join_preserves_unmatched_right_rows() {
+    let dir = TempDir::new("sql-right-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT, flag BOOL); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a', TRUE), (2, NULL, NULL, NULL), (3, 20, 'c', FALSE), \
+               (4, 30, 'd', TRUE), (5, NULL, '', NULL); \
+             CREATE TABLE u (id INT, dept INT, label TEXT); \
+             INSERT INTO u VALUES (10, 1, 'eng'), (20, 2, 'sales'), (30, 4, 'ops'), \
+               (40, 99, 'idle'), (50, NULL, 'nil');",
+        )
+        .expect("seed");
+
+    let joined = engine
+        .execute_script(
+            "SELECT t.id, u.id, u.label FROM t RIGHT JOIN u ON t.id = u.dept \
+             ORDER BY u.id;",
+        )
+        .expect("right join");
+    assert_eq!(
+        as_rows(&joined[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("eng".to_string())
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("sales".to_string())
+            ],
+            vec![
+                Value::Int(4),
+                Value::Int(30),
+                Value::Text("ops".to_string())
+            ],
+            vec![Value::Null, Value::Int(40), Value::Text("idle".to_string())],
+            vec![Value::Null, Value::Int(50), Value::Text("nil".to_string())],
+        ]
+    );
+
+    let reversed = engine
+        .execute_script("SELECT u.id, t.id FROM u RIGHT JOIN t ON u.dept = t.id ORDER BY t.id;")
+        .expect("reversed right join");
+    assert_eq!(
+        as_rows(&reversed[0]).1,
+        [
+            vec![Value::Int(10), Value::Int(1)],
+            vec![Value::Int(20), Value::Int(2)],
+            vec![Value::Null, Value::Int(3)],
+            vec![Value::Int(30), Value::Int(4)],
+            vec![Value::Null, Value::Int(5)],
+        ]
+    );
+
+    engine
+        .execute_script("CREATE TABLE e (id INT);")
+        .expect("empty right");
+    let empty = engine
+        .execute_script("SELECT COUNT(*) FROM t RIGHT JOIN e ON t.id = e.id;")
+        .expect("empty right count");
+    assert_eq!(as_rows(&empty[0]).1, [vec![Value::Int(0)]]);
+}
+
+#[test]
+fn full_join_preserves_unmatched_rows_from_both_sides() {
+    let dir = TempDir::new("sql-full-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT, flag BOOL); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a', TRUE), (2, NULL, NULL, NULL), (3, 20, 'c', FALSE), \
+               (4, 30, 'd', TRUE), (5, NULL, '', NULL); \
+             CREATE TABLE u (id INT, dept INT, label TEXT); \
+             INSERT INTO u VALUES (10, 1, 'eng'), (20, 2, 'sales'), (30, 4, 'ops'), \
+               (40, 99, 'idle'), (50, NULL, 'nil');",
+        )
+        .expect("seed");
+
+    let joined = engine
+        .execute_script(
+            "SELECT t.id AS tid, u.id AS uid FROM t FULL JOIN u ON t.id = u.dept \
+             ORDER BY tid, uid;",
+        )
+        .expect("full join");
+    assert_eq!(
+        as_rows(&joined[0]).1,
+        [
+            vec![Value::Null, Value::Int(40)],
+            vec![Value::Null, Value::Int(50)],
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Null],
+            vec![Value::Int(4), Value::Int(30)],
+            vec![Value::Int(5), Value::Null],
+        ]
+    );
+
+    engine
+        .execute_script("CREATE TABLE e (id INT);")
+        .expect("empty table");
+    let empty_right = engine
+        .execute_script("SELECT t.id, e.id FROM t FULL JOIN e ON t.id = e.id ORDER BY t.id;")
+        .expect("empty right");
+    assert_eq!(
+        as_rows(&empty_right[0]).1,
+        [
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Null],
+            vec![Value::Int(4), Value::Null],
+            vec![Value::Int(5), Value::Null],
+        ]
+    );
+
+    let empty_left = engine
+        .execute_script("SELECT e.id, t.id FROM e FULL JOIN t ON e.id = t.id ORDER BY t.id;")
+        .expect("empty left");
+    assert_eq!(
+        as_rows(&empty_left[0]).1,
+        [
+            vec![Value::Null, Value::Int(1)],
+            vec![Value::Null, Value::Int(2)],
+            vec![Value::Null, Value::Int(3)],
+            vec![Value::Null, Value::Int(4)],
+            vec![Value::Null, Value::Int(5)],
+        ]
+    );
+}
+
+#[test]
+fn right_and_full_join_work_with_where_and_group_by() {
+    let dir = TempDir::new("sql-outer-where");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, score INT, name TEXT, flag BOOL); \
+             INSERT INTO t VALUES \
+               (1, 10, 'a', TRUE), (2, NULL, NULL, NULL), (3, 20, 'c', FALSE), \
+               (4, 30, 'd', TRUE), (5, NULL, '', NULL); \
+             CREATE TABLE u (id INT, dept INT, label TEXT); \
+             INSERT INTO u VALUES (10, 1, 'eng'), (20, 2, 'sales'), (30, 4, 'ops'), \
+               (40, 99, 'idle'), (50, NULL, 'nil');",
+        )
+        .expect("seed");
+
+    let unmatched_right = engine
+        .execute_script(
+            "SELECT u.id, u.label FROM t RIGHT JOIN u ON t.id = u.dept \
+             WHERE t.id IS NULL ORDER BY u.id;",
+        )
+        .expect("right where");
+    assert_eq!(
+        as_rows(&unmatched_right[0]).1,
+        [
+            vec![Value::Int(40), Value::Text("idle".to_string())],
+            vec![Value::Int(50), Value::Text("nil".to_string())],
+        ]
+    );
+
+    let unmatched_either = engine
+        .execute_script(
+            "SELECT t.id AS tid, u.id AS uid FROM t FULL JOIN u ON t.id = u.dept \
+             WHERE t.id IS NULL OR u.id IS NULL ORDER BY tid, uid;",
+        )
+        .expect("full where");
+    assert_eq!(
+        as_rows(&unmatched_either[0]).1,
+        [
+            vec![Value::Null, Value::Int(40)],
+            vec![Value::Null, Value::Int(50)],
+            vec![Value::Int(3), Value::Null],
+            vec![Value::Int(5), Value::Null],
+        ]
+    );
+
+    let grouped = engine
+        .execute_script(
+            "SELECT u.label, COUNT(*) FROM t FULL JOIN u ON t.id = u.dept \
+             GROUP BY u.label ORDER BY u.label;",
+        )
+        .expect("full group");
+    assert_eq!(
+        as_rows(&grouped[0]).1,
+        [
+            vec![Value::Null, Value::Int(2)],
+            vec![Value::Text("eng".to_string()), Value::Int(1)],
+            vec![Value::Text("idle".to_string()), Value::Int(1)],
+            vec![Value::Text("nil".to_string()), Value::Int(1)],
+            vec![Value::Text("ops".to_string()), Value::Int(1)],
+            vec![Value::Text("sales".to_string()), Value::Int(1)],
+        ]
+    );
+}
+
+#[test]
 fn update_without_matches_and_empty_table_reports_zero() {
     let dir = TempDir::new("sql-update-empty");
     let db = dir.join("sql.db");

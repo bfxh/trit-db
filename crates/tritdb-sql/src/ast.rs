@@ -152,6 +152,11 @@ pub enum JoinKind {
     Inner,
     /// Left outer join: unmatched left rows survive with `NULL` right columns.
     Left,
+    /// Right outer join: unmatched right rows survive with `NULL` left columns.
+    Right,
+    /// Full outer join: unmatched rows from either side survive with `NULL`
+    /// columns from the other side.
+    Full,
 }
 
 /// A join clause.
