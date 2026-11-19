@@ -15,5 +15,8 @@ tritdb-store.workspace = true
 tritdb-txn.workspace = true
 tritdb-wal.workspace = true
 
+[dev-dependencies]
+tritdb-testkit.workspace = true
+
 [lints]
 workspace = true

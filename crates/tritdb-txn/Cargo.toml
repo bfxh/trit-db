@@ -11,5 +11,8 @@ description = "单写多读事务层：WAL 提交、fsync、恢复已提交事�
 tritdb-page.workspace = true
 tritdb-wal.workspace = true
 
+[dev-dependencies]
+tritdb-testkit.workspace = true
+
 [lints]
 workspace = true

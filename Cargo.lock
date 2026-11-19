@@ -10,6 +10,7 @@ dependencies = [
  "tritdb-page",
  "tritdb-radix",
  "tritdb-store",
+ "tritdb-testkit",
  "tritdb-txn",
  "tritdb-wal",
 ]
@@ -32,29 +33,42 @@ version = "0.0.1"
 dependencies = [
  "tritdb-page",
  "tritdb-radix",
+ "tritdb-testkit",
 ]
 
 [[package]]
 name = "tritdb-page"
 version = "0.0.1"
+dependencies = [
+ "tritdb-testkit",
+]
 
 [[package]]
 name = "tritdb-radix"
 version = "0.0.1"
+dependencies = [
+ "tritdb-testkit",
+]
 
 [[package]]
 name = "tritdb-store"
 version = "0.0.1"
 dependencies = [
  "tritdb-page",
+ "tritdb-testkit",
  "tritdb-wal",
 ]
+
+[[package]]
+name = "tritdb-testkit"
+version = "0.0.1"
 
 [[package]]
 name = "tritdb-txn"
 version = "0.0.1"
 dependencies = [
  "tritdb-page",
+ "tritdb-testkit",
  "tritdb-wal",
 ]
 
@@ -63,4 +77,5 @@ name = "tritdb-wal"
 version = "0.0.1"
 dependencies = [
  "tritdb-page",
+ "tritdb-testkit",
 ]

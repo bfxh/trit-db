@@ -1,0 +1,109 @@
+# trit-db 测试矩阵与 CI/CD
+
+M0 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃和并发边界拆开验证。当前工作区有 **158 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+
+## 1. 分层与计数
+
+| crate | 单元 | conformance / fuzz / model | 小计 | 说明 |
+|---|---:|---:|---:|---|
+| `tritdb-radix` | 15 | 11 + 6 properties | 32 | 全部字节双射、跨进制重打包、canonical padding、百万 trit |
+| `tritdb-page` | 14 | 9 fuzz | 23 | 每种截断、逐字节 corruption、0..=8176 payload |
+| `tritdb-format` | 15 | 11 conformance | 26 | 全长度/进制、逐字节 corruption、块塞满页 |
+| `tritdb-wal` | 7 | 10 fuzz | 17 | 每个前缀、torn tail、LSN 连续、逐字节 mutation |
+| `tritdb-txn` | 14 | 11 model | 25 | 随机事务 + checkpoint/reopen、提交组、读者单调性、snapshot-only reopen LSN |
+| `tritdb-store` | 12 | 9 model | 21 | 页模型、abort、sidecar 截断/损坏、并发读者 |
+| `tritdb`（集成） | — | — | 14 | CLI 4、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
+| **合计** | **77** | **81** | **158** | 另有 4 个 ignored 压力测试 |
+
+`vectors` 的 5 个测试覆盖 `radix.txt`、`trbl.txt`、`page.txt`、`wal.txt`、`snapshot.txt`。向量由 Python 参考实现生成，Rust 只负责解码、重编码和语义恢复。
+
+## 2. 交叉测试
+
+### Python ↔ Rust 字节级
+
+- `tools/crosscheck/reference.py`：不导入 Rust、不调用 Rust 的独立 Python 实现。覆盖 R3/R4/R16、TRBL、TRPG、TRWS/TRWL、TRSN、TRCK。
+- `tools/crosscheck/gen_vectors.py`：确定性 LCG 生成向量；`--check` 在 CI 中重新生成并逐字节比较。
+- `crates/tritdb/tests/vectors.rs`：Python 编码 → Rust 解码 → Rust 重编码；快照向量写入 `<wal>.snap` 后由 `TxnStore::open` 恢复。
+- `tools/crosscheck/check_cli.py`：Rust CLI → Python 解码；覆盖 `radix/block/page/txn/pstore`，并检查错误退出码。
+- `tools/crosscheck/byte_stream.py` + `tritdb crosscheck`：二进制 framed stdin/stdout bridge，避免临时文件和 shell 引号差异。Python 发送 TRBL/TRPG/键值请求，Rust 引擎 checkpoint/reopen 后返回结果，Python 再解析比较。覆盖 block、page、txn、pstore 四条路径。
+
+### 引擎 ↔ 引擎
+
+- `crates/tritdb/tests/cross_engine.rs`：同一逻辑 workload 同时跑 `TxnStore` 和 `PageStore`，逐 key/页比对；TRBL 块作为同一 payload 分别塞进两个引擎，checkpoint/reopen 后仍可解码。
+
+### 格式 ↔ 引擎
+
+- `tritdb-format/tests/conformance.rs::block_inside_page_roundtrip_is_stable` 与 `block_composes_into_a_full_page`：块页嵌套、整页容量。
+- `tritdb-store/tests/model.rs`：页镜像 payload 与页文件的字节一致性。
+
+## 3. 崩溃与故障注入
+
+交叉测试已经抓到两个真实问题：
+
+- Python `packed_len` 对 R3 误用 3 trits/byte；向量期望 1,366 字节而实际 820 字节，修复为 `{3:5,4:4,16:2}`。
+- `TxnStore::checkpoint` 在“只有 snapshot、没有新 WAL 记录”的 reopen 后会把 `checkpoint_lsn` 从 snapshot 值降到 0；修复为 `max(wal.next_lsn-1, recovery.checkpoint_lsn)`，并加 `checkpoint_after_reopen_without_writes_preserves_lsn` 回归测试。
+
+- `crates/tritdb/tests/crash_recovery.rs`：硬杀键值 writer，恢复后只保留完整提交组。
+- `crates/tritdb/tests/crash_matrix.rs`：在 0/2/5/10/25/50/100/200 ms 八个杀点重复硬杀，断言 `committed_txns`、key group 数和每事务 key 数完全一致。
+- `crates/tritdb/tests/pstore_crash_recovery.rs`：页 writer 硬杀后恢复连续页前缀，页数等于已提交事务数。
+- `tritdb-wal/tests/fuzz.rs`：每个前缀解析、短段修复、torn tail 截断后 LSN 复用边界。
+- `tritdb-page/tests/fuzz.rs`、`tritdb-format/tests/conformance.rs`：每种截断偏移和每个单字节 corruption 都必须结构化报错或安全解析，不允许 panic。
+- checkpoint 竞争：`txn model` 中 writer 活跃时并发 checkpoint，验证最终状态与 snapshot；checkpoint 失败返回 `ActiveTxns` 而不是破坏状态。
+
+## 4. 压力测试（ignored，nightly）
+
+```bash
+TRITDB_STRESS_THREADS=16 \
+TRITDB_STRESS_TXNS_PER_THREAD=32 \
+TRITDB_STRESS_ROUNDS=64 \
+cargo test -p tritdb-txn --test stress -- --ignored --nocapture
+
+TRITDB_STRESS_THREADS=8 \
+TRITDB_STRESS_PAGES=200 \
+TRITDB_STRESS_READERS=4 \
+TRITDB_STRESS_ROUNDS=32 \
+cargo test -p tritdb-store --test stress -- --ignored --nocapture
+```
+
+- `group_commit_many_threads`：Barrier 同时起跑，验证总行数、`syncs` 上界、reopen 后 WAL 提交数。
+- `checkpoint_commit_loop`：writer 持续提交，主线程循环 checkpoint；统计成功/被拒绝次数，最终 reopen 验证行数。
+- `many_readers_during_commits`：多读者与页提交并发，读者只看已提交页。
+- `repeated_checkpoints`：反复提交 + checkpoint，验证页数与内容。
+
+这些测试不断言“成功 checkpoint 次数”，因为调度和 active transaction 会让它非确定；断言的是安全性和最终可恢复状态。
+
+## 5. CI
+
+`.github/workflows/ci.yml`：
+
+| job | runner | 内容 |
+|---|---|---|
+| `lint` | Ubuntu | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` |
+| `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
+| `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
+| `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge） |
+| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，上传 `lcov.info` |
+| `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
+
+`.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。
+
+## 6. CD
+
+`.github/workflows/release.yml` 在 `v*` tag 上：
+
+1. 在 Linux x86_64、Windows x86_64、macOS arm64 原生 runner 构建 release 二进制。
+2. 打包 `tritdb` 和 `tritdb-bench` 为 `tritdb-<platform>.tar.gz`。
+3. 上传 artifact，由 Ubuntu job 用 `gh release create` 创建 GitHub Release 并附带自动 release notes。
+
+本地验证 release 构建：
+
+```bash
+cargo build --release --locked -p tritdb -p tritdb-bench
+```
+
+## 7. 已知边界
+
+- 跨语言向量不覆盖真实磁盘 fsync 时序；崩溃测试只覆盖“进程被硬杀”和“WAL torn tail/short file”，不模拟断电、磁盘写缓存重排。
+- `PageStore` 没有跨页快照 API，页级并发测试只断言单页来自已提交版本。
+- 提交组没有冲突检测，同一 key 的最后 WAL 顺序获胜；模型测试按这个语义断言。
+- `checkpoint_commit_loop` 在 debug 下可能需要数分钟；nightly 用 release，本地调试请降低 `TRITDB_STRESS_ROUNDS`。

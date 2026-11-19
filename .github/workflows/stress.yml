@@ -1,0 +1,47 @@
+name: nightly-stress
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-stress
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TRITDB_STRESS_THREADS: "16"
+  TRITDB_STRESS_TXNS_PER_THREAD: "32"
+  TRITDB_STRESS_ROUNDS: "64"
+  TRITDB_STRESS_PAGES: "200"
+  TRITDB_STRESS_READERS: "4"
+
+jobs:
+  stress:
+    name: stress (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [tritdb-txn, tritdb-store]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --locked -p ${{ matrix.package }} --test stress -- --ignored --nocapture
+
+  crash:
+    name: crash matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --locked -p tritdb --test crash_matrix -- --nocapture
+      - run: cargo test --release --locked -p tritdb --test crash_recovery
+      - run: cargo test --release --locked -p tritdb --test pstore_crash_recovery

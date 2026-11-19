@@ -372,7 +372,10 @@ impl TxnStore {
         }
         let state = self.state.read().map_err(|_| TxnError::Poisoned)?;
 
-        let checkpoint_lsn = wal.next_lsn().saturating_sub(1);
+        let checkpoint_lsn = wal
+            .next_lsn()
+            .saturating_sub(1)
+            .max(self.recovery.checkpoint_lsn);
         let wal_bytes_before = fs::metadata(&self.path)?.len();
         let entries = state.len() as u64;
         let snapshot_bytes = write_snapshot(&self.snapshot_path, checkpoint_lsn, &state)?;

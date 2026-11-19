@@ -271,17 +271,20 @@ cargo run -q -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --k
 
 ## 测试计数
 
-- radix：15 单元 + 6 属性 = 21
-- page：14
-- format：15
-- wal：7
-- txn：14
-- store：12
-- txn 硬杀集成：1
-- 页存储硬杀集成：1
-- 合计 **85**
+- radix：15 单元 + 11 conformance + 6 属性 = 32
+- page：14 单元 + 9 fuzz = 23
+- format：15 单元 + 11 conformance = 26
+- wal：7 单元 + 10 fuzz = 17
+- txn：14 单元 + 11 model = 25
+- store：12 单元 + 9 model = 21
+- `tritdb` 集成：CLI 4 + crash matrix 1 + 硬杀 1 + 页存储硬杀 1 + cross-engine 2 + vectors 5 = 14
+- 合计 **158 个正常测试**
 
-2026-11-20 复验：85 个测试在 debug、release、`cargo +1.88.0 test` 三套下全过；`fmt --check` 与 `clippy --workspace --all-targets -- -D warnings` 在 1.99 和 1.88 都过（1.88 的 clippy/rustfmt 组件已安装）。
+另有 4 个 `#[ignore]` 压力测试（txn 2、store 2），由 nightly `stress.yml` 在 release 下执行。
+
+测试分层、交叉矩阵、崩溃注入与 CI/CD 细节见 [`docs/testing/README.md`](../testing/README.md)。
+
+2026-11-20 复验：158 个测试已在 debug、release 下全工作区通过；`fmt --check` 与 `clippy --workspace --all-targets -- -D warnings` 通过。Python `gen_vectors.py --check`、`check_cli.py` 与 framed bridge 通过。Rust 1.88 的全量复验见 CI `msrv` job。
 
 ## 下一步
 

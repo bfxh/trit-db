@@ -11,5 +11,8 @@ description = "8 KiB 页文件 + 缓存 + 单写事务 + WAL 页 redo"
 tritdb-page.workspace = true
 tritdb-wal.workspace = true
 
+[dev-dependencies]
+tritdb-testkit.workspace = true
+
 [lints]
 workspace = true

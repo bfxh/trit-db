@@ -9,8 +9,8 @@
 //! tritdb page check --in page.bin
 //! ```
 
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::thread;
 use std::time::Duration;
@@ -38,6 +38,7 @@ fn run() -> Result<(), String> {
         Some("wal") => run_wal(&args),
         Some("txn") => run_txn(&args),
         Some("pstore") => run_pstore(&args),
+        Some("crosscheck") => run_crosscheck(),
         Some("help") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -65,6 +66,7 @@ fn print_help() {
     println!("  pstore dump --data pstore.pages --wal pstore.wal");
     println!("  pstore checkpoint --data pstore.pages --wal pstore.wal");
     println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
+    println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
 
 fn run_radix(args: &[String]) -> Result<(), String> {
@@ -651,4 +653,199 @@ impl Rng {
     fn trit(&mut self) -> Trit {
         Trit::from_u8((self.next_u64() % 3) as u8).expect("0..=2")
     }
+}
+
+const XL_MAGIC: [u8; 4] = *b"TRX1";
+const XL_MAX_NAME: usize = 64;
+const XL_MAX_PAYLOAD: usize = 128 * 1024 * 1024;
+type KvPair = (Vec<u8>, Vec<u8>);
+
+/// Binary framed transport used only by `tools/crosscheck/byte_stream.py`.
+///
+/// Request and response frames are:
+/// `TRX1`, u32 name length, name bytes, u64 payload length, payload bytes.
+fn run_crosscheck() -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+
+    let mut header = [0u8; 12];
+    loop {
+        match input.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(format!("crosscheck: read frame header: {error}")),
+        }
+        if header[0..4] != XL_MAGIC {
+            return Err("crosscheck: bad request magic".to_string());
+        }
+        let name_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if name_len == 0 || name_len > XL_MAX_NAME {
+            return Err(format!(
+                "crosscheck: invalid request name length {name_len}"
+            ));
+        }
+        let payload_len =
+            u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        if payload_len > XL_MAX_PAYLOAD {
+            return Err(format!(
+                "crosscheck: request payload too large: {payload_len}"
+            ));
+        }
+        let mut name = vec![0u8; name_len];
+        input
+            .read_exact(&mut name)
+            .map_err(|error| format!("crosscheck: read name: {error}"))?;
+        let name = String::from_utf8(name).map_err(|_| "crosscheck: non-utf8 name".to_string())?;
+        let mut payload = vec![0u8; payload_len];
+        input
+            .read_exact(&mut payload)
+            .map_err(|error| format!("crosscheck: read payload: {error}"))?;
+
+        let response = crosscheck_respond(&name, &payload)?;
+
+        output
+            .write_all(&XL_MAGIC)
+            .and_then(|_| output.write_all(&(name_len as u32).to_le_bytes()))
+            .and_then(|_| output.write_all(&(response.len() as u32).to_le_bytes()))
+            .and_then(|_| output.write_all(name.as_bytes()))
+            .and_then(|_| output.write_all(&response))
+            .and_then(|_| output.flush())
+            .map_err(|error| format!("crosscheck: write response: {error}"))?;
+    }
+    Ok(())
+}
+
+fn crosscheck_respond(name: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    match name {
+        "block" => {
+            let view = Block::decode(payload).map_err(|error| error.to_string())?;
+            let block = Block::from_payload(view.radix(), view.trit_count(), view.payload())
+                .map_err(|error| error.to_string())?;
+            Ok(block.into_bytes())
+        }
+        "page" => {
+            let view = Page::parse_slice(payload).map_err(|error| error.to_string())?;
+            let page = Page::new(view.kind(), view.payload()).map_err(|error| error.to_string())?;
+            Ok(page.into_bytes().to_vec())
+        }
+        "txn" => crosscheck_txn(payload),
+        "pstore" => crosscheck_pstore(payload),
+        other => Err(format!("crosscheck: unknown request kind: {other}")),
+    }
+}
+
+fn crosscheck_txn(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let entries = decode_kv_pairs(payload)?;
+    let dir = crosscheck_dir("txn");
+    let wal = dir.join("store.wal");
+    let result = (|| -> Result<Vec<u8>, String> {
+        let store = TxnStore::open(&wal).map_err(|error| error.to_string())?;
+        for (key, value) in &entries {
+            let mut txn = store.begin().map_err(|error| error.to_string())?;
+            txn.put(key, value).map_err(|error| error.to_string())?;
+            txn.commit().map_err(|error| error.to_string())?;
+        }
+        store.checkpoint().map_err(|error| error.to_string())?;
+        drop(store);
+        let store = TxnStore::open(&wal).map_err(|error| error.to_string())?;
+        let mut encoded = Vec::new();
+        let entries = store.iter().map_err(|error| error.to_string())?;
+        encode_kv_pairs(
+            entries.iter().map(|entry| (&entry.0, &entry.1)),
+            &mut encoded,
+        );
+        Ok(encoded)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn crosscheck_pstore(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let request = Page::parse_slice(payload).map_err(|error| error.to_string())?;
+    let dir = crosscheck_dir("pstore");
+    let data = dir.join("pages.dat");
+    let wal = dir.join("pages.wal");
+    let result = (|| -> Result<Vec<u8>, String> {
+        let store = PageStore::open(&data, &wal).map_err(|error| error.to_string())?;
+        let mut txn = store.begin().map_err(|error| error.to_string())?;
+        txn.allocate(request.kind(), request.payload())
+            .map_err(|error| error.to_string())?;
+        txn.commit().map_err(|error| error.to_string())?;
+        store.checkpoint().map_err(|error| error.to_string())?;
+        drop(store);
+        let store = PageStore::open(&data, &wal).map_err(|error| error.to_string())?;
+        let page = store
+            .read_page(PageId::new(0))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "crosscheck: page 0 missing after reopen".to_string())?;
+        Ok(page.into_bytes().to_vec())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn decode_kv_pairs(payload: &[u8]) -> Result<Vec<KvPair>, String> {
+    let mut offset = 0;
+    let count = read_u32(payload, &mut offset)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_len = read_u32(payload, &mut offset)? as usize;
+        let key = read_bytes(payload, &mut offset, key_len)?;
+        let value_len = read_u32(payload, &mut offset)? as usize;
+        let value = read_bytes(payload, &mut offset, value_len)?;
+        entries.push((key, value));
+    }
+    if offset != payload.len() {
+        return Err("crosscheck: trailing kv request bytes".to_string());
+    }
+    Ok(entries)
+}
+
+fn encode_kv_pairs<'a>(
+    entries: impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+    out: &mut Vec<u8>,
+) {
+    let count = entries.size_hint().0;
+    let mut pairs = Vec::with_capacity(count);
+    for (key, value) in entries {
+        pairs.push((key, value));
+    }
+    out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+    for (key, value) in pairs {
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value);
+    }
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+    let value = read_bytes(bytes, offset, 4)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_bytes(bytes: &[u8], offset: &mut usize, len: usize) -> Result<Vec<u8>, String> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "crosscheck: length overflow".to_string())?;
+    if end > bytes.len() {
+        return Err("crosscheck: short kv request".to_string());
+    }
+    let value = bytes[*offset..end].to_vec();
+    *offset = end;
+    Ok(value)
+}
+
+fn crosscheck_dir(prefix: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "tritdb-crosscheck-{prefix}-{}-{id}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create crosscheck temp dir");
+    dir
 }

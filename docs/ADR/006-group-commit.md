@@ -99,5 +99,5 @@ Windows 上 `sleep` 粒度可能是 1 ms 级，顺序提交会被固定延迟拖
 
 - `cargo test -p tritdb-txn`：14 个测试；新增 `checkpoint_rejects_active_transactions`、`concurrent_commits_share_fsyncs_and_recover`、`commit_group_applies_in_wal_order`。
 - 并发测试连续 20 次：16 线程、16 个事务，`syncs < 16`，重开 `committed_txns == 16`、`discarded_txns == 0`。
-- `cargo test --workspace`：85 个测试通过。
+- `cargo test --workspace`：158 个测试通过（测试扩展后的当前计数）。
 - `cargo run -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --keys-per-txn 4 --rounds 3`。

@@ -11,5 +11,8 @@ description = "TRBL 块格式：20 字节头 + CRC32 + 规范 padding"
 tritdb-page.workspace = true
 tritdb-radix.workspace = true
 
+[dev-dependencies]
+tritdb-testkit.workspace = true
+
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 # trit-db
 
-多进制列存 + 多值语义数据库的 **M0 骨架**。当前只做七件事：
+多进制列存 + 多值语义数据库的 **M0 骨架**。当前九个 crate 只做这些事：
 
 1. `tritdb-radix`：三值序列的 3/4/16 进制打包与解包；r3 走 10-bit 查表；逐位往返、非法输入结构化报错。
 2. `tritdb-page`：8 KiB 页 + 头 + CRC32；坏 magic/版本/长度/校验和/半写检测。
@@ -9,6 +9,8 @@
 5. `tritdb-txn`：单 WAL 写者 + 多个并发逻辑事务；`Begin/Put/Delete/Commit/Abort`；提交组让一批 `Commit` 共享一次 fsync；恢复只应用已提交事务；checkpoint 把已提交键值写进 `<wal>.snap` 后重置 WAL。
 6. `tritdb-store`：8 KiB 页文件 + 页缓存（M0 无淘汰、无上限）+ WAL 页镜像 redo；提交先 fsync WAL 再写页文件；只重放已提交页；崩溃留下的半页尾会被截断；checkpoint 把已落盘页写入 `<data>.ckpt` 后重置单段 WAL。
 7. `tritdb` / `tritdb-bench`：CLI 与微基准；6 轮交错、min/median/max；带 `bin-u8` / `bin-u2` 二进制基线。
+8. `tritdb-testkit`：零依赖测试工具；唯一临时目录、确定性 xorshift64*、hex 编解码。
+9. `tools/crosscheck/` + `testdata/vectors/`：独立 Python 字节级参考实现、确定性向量、Rust→Python 反向校验和二进制 framed bridge。
 
 **还没有做**：SQL、parser、binder、MVCC、pgwire、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、跨进程文件锁。不要把这个骨架当成数据库。
 
@@ -16,6 +18,11 @@
 
 ```bash
 cargo test --workspace
+cargo test --workspace --release
+python tools/crosscheck/gen_vectors.py --check
+python tools/crosscheck/check_cli.py
+cargo test -p tritdb-txn --test stress -- --ignored --nocapture
+cargo test -p tritdb-store --test stress -- --ignored --nocapture
 cargo run -p tritdb -- radix --radix r3 --trits 1000000
 cargo run -p tritdb -- block make --out block.trbl --radix r3 --trits 1000000
 cargo run -p tritdb -- block check --in block.trbl
@@ -47,7 +54,17 @@ cargo run -p tritdb-bench --release -- txn-group --txns 256 --threads 16 --keys-
 cargo run -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --keys-per-txn 4 --rounds 3
 ```
 
-## 设计边界
+## 测试与 CI
+
+当前 **158 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
+
+- `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / 三平台 Python 交叉校验 / coverage / docs。
+- `stress.yml`：每天 04:00 UTC 跑 release 模式压力测试与 crash matrix。
+- `release.yml`：`v*` tag 构建 Linux x86_64、Windows x86_64、macOS arm64 的 `tritdb`/`tritdb-bench`，创建 GitHub Release。
+
+公开仓：[`bfxh/trit-db`](https://github.com/bfxh/trit-db)
+
+
 
 - 不是“三进制数据库”，是“多进制列存 + 多值语义数据库”。
 - 不是 PostgreSQL 替代品；v1 目标是“单写者 + 快照隔离 + 只读副本”，M0 只到“单 WAL 写者 + 并发逻辑事务 + 已提交读”。
@@ -72,6 +89,10 @@ crates/tritdb-txn/     并发逻辑事务 + 提交组 + TRSN 快照
 crates/tritdb-store/   8 KiB 页文件 + 缓存 + WAL 页 redo
 crates/tritdb-bench/   微基准
 crates/tritdb/         CLI
+crates/tritdb-testkit/ 测试工具（TempDir / 确定性 RNG / hex）
+tools/crosscheck/      Python 独立参考实现、向量生成、反向 CLI 校验
+testdata/vectors/      由 Python 参考实现生成的跨语言向量
+docs/testing/          测试矩阵、CI/CD、故障注入与压力测试说明
 docs/ADR/              架构决策
 docs/specs/            TRBL 块格式、TRWL 日志、页存储、键值快照、提交组（草案）
 docs/results/          M0 读数与负结果

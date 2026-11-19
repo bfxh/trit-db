@@ -9,6 +9,7 @@ members = [
     "crates/tritdb-store",
     "crates/tritdb-bench",
     "crates/tritdb",
+    "crates/tritdb-testkit",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ tritdb-format = { path = "crates/tritdb-format" }
 tritdb-wal = { path = "crates/tritdb-wal" }
 tritdb-txn = { path = "crates/tritdb-txn" }
 tritdb-store = { path = "crates/tritdb-store" }
+tritdb-testkit = { path = "crates/tritdb-testkit" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
