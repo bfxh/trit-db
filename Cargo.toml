@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tritdb-radix",
+    "crates/tritdb-page",
+    "crates/tritdb-format",
+    "crates/tritdb-wal",
+    "crates/tritdb-txn",
+    "crates/tritdb-store",
+    "crates/tritdb-bench",
+    "crates/tritdb",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bfxh/trit-db"
+
+[workspace.dependencies]
+tritdb-radix = { path = "crates/tritdb-radix" }
+tritdb-page = { path = "crates/tritdb-page" }
+tritdb-format = { path = "crates/tritdb-format" }
+tritdb-wal = { path = "crates/tritdb-wal" }
+tritdb-txn = { path = "crates/tritdb-txn" }
+tritdb-store = { path = "crates/tritdb-store" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

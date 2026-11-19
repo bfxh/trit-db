@@ -1,0 +1,12 @@
+/target
+**/*.bin
+**/*.trbl
+**/*.wal
+**/*.pages
+**/*.snap
+**/*.snap.tmp
+**/*.ckpt
+**/*.ckpt.tmp
+benchmarks/results/
+.DS_Store
+Thumbs.db

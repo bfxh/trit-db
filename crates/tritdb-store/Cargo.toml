@@ -1,0 +1,15 @@
+[package]
+name = "tritdb-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "8 KiB 页文件 + 缓存 + 单写事务 + WAL 页 redo"
+
+[dependencies]
+tritdb-page.workspace = true
+tritdb-wal.workspace = true
+
+[lints]
+workspace = true
