@@ -150,6 +150,8 @@ pub struct OrderBy {
 pub enum JoinKind {
     /// Inner join: only matching row pairs survive.
     Inner,
+    /// Cross join: every left row pairs with every right row.
+    Cross,
     /// Left outer join: unmatched left rows survive with `NULL` right columns.
     Left,
     /// Right outer join: unmatched right rows survive with `NULL` left columns.
@@ -168,8 +170,8 @@ pub struct Join {
     pub table: String,
     /// Optional alias.
     pub alias: Option<String>,
-    /// Join predicate.
-    pub on: Expr,
+    /// Join predicate; absent for `CROSS JOIN` and comma-separated sources.
+    pub on: Option<Expr>,
 }
 
 /// Parsed `SELECT`.
@@ -181,7 +183,7 @@ pub struct Select {
     pub table: String,
     /// Source table alias.
     pub table_alias: Option<String>,
-    /// Inner joins.
+    /// Join clauses, applied left to right.
     pub joins: Vec<Join>,
     /// Optional filter.
     pub filter: Option<Expr>,

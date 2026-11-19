@@ -349,7 +349,7 @@ impl SqlEngine {
         let mut joined = qualify_table(table, left_qualifier);
         for (join, (right, qualifier)) in select.joins.iter().zip(sources.into_iter().skip(1)) {
             let right = qualify_table(right, qualifier);
-            joined = join_tables(&joined, &right, &join.on, join.kind)?;
+            joined = join_tables(&joined, &right, join.on.as_ref(), join.kind)?;
         }
         Ok(joined)
     }
@@ -386,7 +386,7 @@ fn qualify_table(table: &Table, qualifier: &str) -> Table {
 fn join_tables(
     left: &Table,
     right: &Table,
-    on: &crate::ast::Expr,
+    on: Option<&crate::ast::Expr>,
     kind: JoinKind,
 ) -> Result<Table, SqlError> {
     let mut columns = left.schema.columns.clone();
@@ -403,7 +403,7 @@ fn join_tables(
     }
     columns.extend(right_columns);
     let schema = Schema::new(columns);
-    let predicate = bind_expr(on, &schema)?;
+    let predicate = on.map(|expr| bind_expr(expr, &schema)).transpose()?;
     let mut rows = Vec::new();
     let mut right_matched = vec![false; right.rows.len()];
     for left_row in &left.rows {
@@ -411,7 +411,7 @@ fn join_tables(
         for (index, right_row) in right.rows.iter().enumerate() {
             let mut row = left_row.clone();
             row.extend(right_row.iter().cloned());
-            if passes_filter(Some(&predicate), &schema, &row)? {
+            if passes_filter(predicate.as_ref(), &schema, &row)? {
                 matched = true;
                 right_matched[index] = true;
                 rows.push(row);

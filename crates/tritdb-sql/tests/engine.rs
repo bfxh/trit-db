@@ -1,5 +1,5 @@
 use tritdb_exec::Value;
-use tritdb_sql::{QueryResult, SqlEngine};
+use tritdb_sql::{QueryResult, SqlEngine, SqlError};
 use tritdb_testkit::TempDir;
 
 fn as_rows(result: &QueryResult) -> (&[String], &[Vec<Value>]) {
@@ -1476,6 +1476,141 @@ fn right_and_full_join_work_with_where_and_group_by() {
             vec![Value::Text("ops".to_string()), Value::Int(1)],
             vec![Value::Text("sales".to_string()), Value::Int(1)],
         ]
+    );
+}
+
+#[test]
+fn cross_join_and_comma_from_produce_cartesian_product() {
+    let dir = TempDir::new("sql-cross-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, tag TEXT); \
+             INSERT INTO a VALUES (1, 'x'), (2, 'y'); \
+             CREATE TABLE b (id INT, label TEXT); \
+             INSERT INTO b VALUES (10, 'p'), (20, 'q'), (30, 'r');",
+        )
+        .expect("seed");
+
+    let crossed = engine
+        .execute_script("SELECT a.id, b.id FROM a CROSS JOIN b ORDER BY a.id, b.id;")
+        .expect("cross join");
+    assert_eq!(
+        as_rows(&crossed[0]).1,
+        [
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(1), Value::Int(20)],
+            vec![Value::Int(1), Value::Int(30)],
+            vec![Value::Int(2), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(2), Value::Int(30)],
+        ]
+    );
+
+    let comma = engine
+        .execute_script("SELECT COUNT(*) FROM a, b;")
+        .expect("comma from");
+    assert_eq!(as_rows(&comma[0]).1, [vec![Value::Int(6)]]);
+
+    let filtered = engine
+        .execute_script(
+            "SELECT x.id, y.label FROM a AS x CROSS JOIN b AS y \
+             WHERE y.id = 20 ORDER BY x.id;",
+        )
+        .expect("aliased cross join");
+    assert_eq!(
+        as_rows(&filtered[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("q".to_string())],
+            vec![Value::Int(2), Value::Text("q".to_string())],
+        ]
+    );
+}
+
+#[test]
+fn cross_join_composes_with_other_joins_and_group_by() {
+    let dir = TempDir::new("sql-cross-compose");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, tag TEXT); \
+             INSERT INTO a VALUES (1, 'x'), (2, 'y'); \
+             CREATE TABLE b (id INT, aid INT); \
+             INSERT INTO b VALUES (10, 1), (20, 2), (30, 2); \
+             CREATE TABLE c (id INT, bid INT, name TEXT); \
+             INSERT INTO c VALUES (100, 10, 'p'), (200, 20, 'q'), (300, 20, 'r');",
+        )
+        .expect("seed");
+
+    let mixed = engine
+        .execute_script("SELECT a.id, c.name FROM a, b JOIN c ON b.id = c.bid ORDER BY a.id, c.id;")
+        .expect("comma then inner join");
+    assert_eq!(
+        as_rows(&mixed[0]).1,
+        [
+            vec![Value::Int(1), Value::Text("p".to_string())],
+            vec![Value::Int(1), Value::Text("q".to_string())],
+            vec![Value::Int(1), Value::Text("r".to_string())],
+            vec![Value::Int(2), Value::Text("p".to_string())],
+            vec![Value::Int(2), Value::Text("q".to_string())],
+            vec![Value::Int(2), Value::Text("r".to_string())],
+        ]
+    );
+
+    let grouped = engine
+        .execute_script(
+            "SELECT a.tag, COUNT(*) FROM a CROSS JOIN b WHERE b.aid = a.id \
+             GROUP BY a.tag ORDER BY a.tag;",
+        )
+        .expect("cross join group");
+    assert_eq!(
+        as_rows(&grouped[0]).1,
+        [
+            vec![Value::Text("x".to_string()), Value::Int(1)],
+            vec![Value::Text("y".to_string()), Value::Int(2)],
+        ]
+    );
+}
+
+#[test]
+fn cross_join_handles_empty_inputs_and_validation() {
+    let dir = TempDir::new("sql-cross-empty");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT); \
+             INSERT INTO a VALUES (1), (2); \
+             CREATE TABLE b (id INT); \
+             INSERT INTO b VALUES (10), (20); \
+             CREATE TABLE e (id INT);",
+        )
+        .expect("seed");
+
+    let empty_right = engine
+        .execute_script("SELECT COUNT(*) FROM a CROSS JOIN e;")
+        .expect("empty right");
+    assert_eq!(as_rows(&empty_right[0]).1, [vec![Value::Int(0)]]);
+    let empty_left = engine
+        .execute_script("SELECT COUNT(*) FROM e, a, b;")
+        .expect("empty first source");
+    assert_eq!(as_rows(&empty_left[0]).1, [vec![Value::Int(0)]]);
+
+    let duplicate = engine
+        .execute_script("SELECT * FROM a AS x, b AS x;")
+        .expect_err("duplicate alias");
+    assert!(
+        matches!(&duplicate, SqlError::DuplicateTableAlias(name) if name == "x"),
+        "unexpected {duplicate:?}"
+    );
+    let unknown = engine
+        .execute_script("SELECT * FROM a, missing;")
+        .expect_err("unknown table");
+    assert!(
+        matches!(&unknown, SqlError::UnknownTable(name) if name == "missing"),
+        "unexpected {unknown:?}"
     );
 }
 

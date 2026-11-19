@@ -253,22 +253,35 @@ impl Parser {
 
         self.expect_keyword(Keyword::From)?;
         let (table, table_alias) = self.parse_table_ref()?;
-        if matches!(
-            self.peek().map(|token| &token.kind),
-            Some(TokenKind::Keyword(
-                Keyword::Cross | Keyword::Natural | Keyword::Outer
-            ))
-        ) {
-            return Err(SqlError::Unsupported(
-                "only INNER, LEFT, RIGHT, and FULL JOIN are supported".to_string(),
-            ));
-        }
 
         let mut joins = Vec::new();
         loop {
+            if matches!(
+                self.peek().map(|token| &token.kind),
+                Some(TokenKind::Keyword(Keyword::Natural | Keyword::Outer))
+            ) {
+                return Err(SqlError::Unsupported(
+                    "only INNER, LEFT, RIGHT, FULL, and CROSS JOIN are supported".to_string(),
+                ));
+            }
+
+            if self.eat_symbol(Symbol::Comma) {
+                let (join_table, alias) = self.parse_table_ref()?;
+                joins.push(Join {
+                    kind: JoinKind::Cross,
+                    table: join_table,
+                    alias,
+                    on: None,
+                });
+                continue;
+            }
+
             let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Inner
+            } else if self.eat_keyword(Keyword::Cross) {
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Cross
             } else if self.eat_keyword(Keyword::Left) {
                 self.eat_keyword(Keyword::Outer);
                 self.expect_keyword(Keyword::Join)?;
@@ -287,8 +300,17 @@ impl Parser {
                 break;
             };
             let (join_table, alias) = self.parse_table_ref()?;
-            self.expect_keyword(Keyword::On)?;
-            let on = self.parse_expr()?;
+            let on = if kind == JoinKind::Cross {
+                if self.eat_keyword(Keyword::On) {
+                    return Err(SqlError::Unsupported(
+                        "CROSS JOIN does not take an ON clause".to_string(),
+                    ));
+                }
+                None
+            } else {
+                self.expect_keyword(Keyword::On)?;
+                Some(self.parse_expr()?)
+            };
             joins.push(Join {
                 kind,
                 table: join_table,
@@ -891,11 +913,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_cross_join_and_comma_from() {
+        for (sql, expected_joins) in [
+            ("SELECT * FROM a CROSS JOIN b;", 1),
+            ("SELECT * FROM a CROSS JOIN b AS bb;", 1),
+            ("SELECT * FROM a, b;", 1),
+            ("SELECT * FROM a AS x, b AS y, c;", 2),
+            ("SELECT * FROM a, b CROSS JOIN c;", 2),
+            ("SELECT * FROM a CROSS JOIN b, c;", 2),
+        ] {
+            let statements = parse_script(sql).expect("parse cross join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), expected_joins, "{sql}");
+                    for join in &select.joins {
+                        assert_eq!(join.kind, JoinKind::Cross, "{sql}");
+                        assert!(join.on.is_none(), "{sql}");
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_on_clause_for_cross_join() {
+        let error = parse_script("SELECT * FROM a CROSS JOIN b ON a.id = b.id;")
+            .expect_err("cross join with ON");
+        assert!(
+            matches!(error, SqlError::Unsupported(_)),
+            "unexpected {error:?}"
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_join() {
         for sql in [
-            "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",
             "SELECT * FROM a NATURAL JOIN b;",
             "SELECT * FROM a OUTER JOIN b ON a.id = b.id;",
+            "SELECT * FROM a, b NATURAL JOIN c;",
+            "SELECT * FROM a, b OUTER JOIN c ON b.id = c.id;",
         ] {
             let error = parse_script(sql).expect_err("unsupported join");
             assert!(
