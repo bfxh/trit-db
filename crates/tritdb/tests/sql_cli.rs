@@ -137,3 +137,55 @@ fn sql_count_models_returns_exact_model_count() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains('6'));
 }
+
+#[test]
+fn under_repair_returns_only_certain_rows() {
+    let dir = TempDir::new("sql-under-repair");
+    let db = dir.join("ur.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, x INT);          INSERT INTO t VALUES (1,10),(1,20),(2,30),(2,30);          SELECT * FROM t UNDER REPAIR ON (id);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("2\t30"), "out: {text}");
+    assert!(!text.contains("1\t10"), "out: {text}");
+    assert!(!text.contains("1\t20"), "out: {text}");
+}
+
+#[test]
+fn under_repair_keeps_a_consistent_table() {
+    let dir = TempDir::new("sql-under-repair-ok");
+    let db = dir.join("ur.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, x INT);          INSERT INTO t VALUES (1,10),(2,20);          SELECT * FROM t UNDER REPAIR ON (id);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t10"), "out: {text}");
+    assert!(text.contains("2\t20"), "out: {text}");
+}
+
+#[test]
+fn under_repair_unknown_key_is_an_error() {
+    let dir = TempDir::new("sql-under-repair-bad-key");
+    let db = dir.join("ur.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, x INT);          INSERT INTO t VALUES (1,10);          SELECT * FROM t UNDER REPAIR ON (missing);",
+    ]);
+    assert!(!output.status.success(), "unknown key must fail");
+}

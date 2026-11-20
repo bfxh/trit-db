@@ -554,7 +554,11 @@ impl SqlEngine {
         let table = self.build_from(&folded, &pushdown, &projection)?;
         let filtered_select = select_with_filter(&folded, pushdown.residual.clone());
         let plan = bind_select(&filtered_select, &table)?;
-        execute_select(&table, &plan)
+        let result = execute_select(&table, &plan)?;
+        match &select.under_repair {
+            Some(key) => filter_under_repair(result, key),
+            None => Ok(result),
+        }
     }
 
     fn analyze(&mut self, table_name: Option<&str>) -> Result<QueryResult, SqlError> {
@@ -1628,6 +1632,47 @@ fn collect_expr_columns(
 /// terms. `x AND TRUE`, `TRUE AND x`, `x OR FALSE`, and `FALSE OR x` are exact
 /// in SQL three-valued logic. Expressions with columns or aggregates are left
 /// for the binder; evaluation errors are preserved by the fallback.
+/// Certain rows under the functional dependency `key -> other columns`.
+///
+/// A group with conflicting non-key values is discarded entirely: every row in
+/// it can be deleted by some minimal repair. A group whose rows agree on the
+/// non-key values is kept.
+fn filter_under_repair(result: QueryResult, key: &str) -> Result<QueryResult, SqlError> {
+    let QueryResult::Rows { columns, rows } = result else {
+        return Ok(result);
+    };
+    let Some(key_index) = columns.iter().position(|column| column == key) else {
+        return Err(SqlError::UnknownColumn(key.to_string()));
+    };
+    let mut groups: std::collections::HashMap<Value, Vec<usize>> = std::collections::HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        groups
+            .entry(row[key_index].clone())
+            .or_default()
+            .push(index);
+    }
+    let mut conflict = std::collections::HashSet::new();
+    for (key_value, indices) in groups {
+        let mut signatures = indices.iter().map(|&index| {
+            let mut rest = rows[index].clone();
+            rest.remove(key_index);
+            rest
+        });
+        let first = signatures.next().expect("non-empty group");
+        if !signatures.all(|signature| signature == first) {
+            conflict.insert(key_value);
+        }
+    }
+    let kept = rows
+        .into_iter()
+        .filter(|row| !conflict.contains(&row[key_index]))
+        .collect();
+    Ok(QueryResult::Rows {
+        columns,
+        rows: kept,
+    })
+}
+
 fn fold_select(select: &Select) -> Select {
     let mut folded = select.clone();
     if let Some(filter) = folded.filter.take() {
