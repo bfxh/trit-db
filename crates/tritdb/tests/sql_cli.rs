@@ -627,3 +627,110 @@ fn with_recursive_reports_column_and_fixpoint_errors() {
     assert!(!output.status.success(), "no fixpoint must fail");
     assert!(stderr(&output).contains("did not reach a fixed point"));
 }
+
+#[test]
+fn with_recursive_supports_no_from_seed_and_nested_with() {
+    let dir = TempDir::new("sql-recursive-gaps");
+    let db = dir.join("gaps.db");
+    let db = db.to_str().expect("path");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3)          SELECT n FROM nums ORDER BY n;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1", "2", "3"] {
+        assert!(
+            text.lines().any(|line| line == expected),
+            "missing {expected}: {text}"
+        );
+    }
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b)          SELECT id FROM a ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "1"), "out: {text}");
+    assert!(text.lines().any(|line| line == "2"), "out: {text}");
+}
+
+#[test]
+fn with_dml_bodies_and_insert_select() {
+    let dir = TempDir::new("sql-recursive-dml");
+    let db = dir.join("dml.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE u (id INT NOT NULL);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH c AS (SELECT id FROM t WHERE id > 1) INSERT INTO u SELECT id FROM c;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("inserted 1 row(s) into u"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH c AS (SELECT 1 AS x) UPDATE t SET id = id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("updated 2 row(s)"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH c AS (SELECT 1 AS x) DELETE FROM t WHERE id = 1;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("deleted 1 row(s)"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH c AS (SELECT 1 AS x) CREATE TABLE z (id INT);",
+    ]);
+    assert!(!output.status.success(), "WITH + DDL must fail");
+    assert!(stderr(&output).contains("WITH must be followed by"));
+}

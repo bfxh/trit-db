@@ -11,7 +11,7 @@ use tritdb_exec::{
 use tritdb_txn::TxnStore;
 
 use crate::ast::{
-    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Select, SelectItem,
+    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Query, Select, SelectItem,
     Statement, With,
 };
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
@@ -296,7 +296,8 @@ impl SqlEngine {
                 table,
                 columns,
                 rows,
-            } => self.insert(table, columns.as_deref(), rows),
+                select,
+            } => self.insert(table, columns.as_deref(), rows, select.as_deref()),
             Statement::CountModels { expr, vars } => self.count_models(expr, *vars),
             Statement::Select(select) => self.select(select),
             Statement::With(with) => self.with_query(with),
@@ -444,6 +445,7 @@ impl SqlEngine {
         name: &str,
         target_columns: Option<&[String]>,
         rows: &[Vec<crate::ast::Expr>],
+        select: Option<&Query>,
     ) -> Result<QueryResult, SqlError> {
         let mut table = self
             .tables
@@ -469,36 +471,78 @@ impl SqlEngine {
             None => (0..schema.len()).collect(),
         };
 
-        let mut new_rows = Vec::with_capacity(rows.len());
-        for expressions in rows {
-            if expressions.len() != indices.len() {
+        let mut new_rows = Vec::new();
+        if let Some(query) = select {
+            let result = self.execute_query(query)?;
+            let QueryResult::Rows {
+                columns,
+                rows: value_rows,
+            } = result
+            else {
+                return Err(SqlError::Unsupported(
+                    "INSERT source must return rows".to_string(),
+                ));
+            };
+            if columns.len() != indices.len() {
                 return Err(SqlError::ColumnCount {
                     table: name.to_string(),
                     expected: indices.len(),
-                    actual: expressions.len(),
+                    actual: columns.len(),
                 });
             }
-            let mut row = vec![Value::Null; schema.len()];
-            for (expression, &index) in expressions.iter().zip(&indices) {
-                let value = eval_constant(expression)?;
-                let value = schema.columns[index].data_type.coerce(value)?;
-                if schema.columns[index].not_null && value.is_null() {
-                    return Err(SqlError::NotNull {
+            for values in value_rows {
+                if values.len() != indices.len() {
+                    return Err(SqlError::ColumnCount {
                         table: name.to_string(),
-                        column: schema.columns[index].name.clone(),
+                        expected: indices.len(),
+                        actual: values.len(),
                     });
                 }
-                row[index] = value;
+                let mut row = vec![Value::Null; table.schema.len()];
+                for (value, &index) in values.into_iter().zip(&indices) {
+                    let value = table.schema.columns[index].data_type.coerce(value)?;
+                    if table.schema.columns[index].not_null && value.is_null() {
+                        return Err(SqlError::NotNull {
+                            table: name.to_string(),
+                            column: table.schema.columns[index].name.clone(),
+                        });
+                    }
+                    row[index] = value;
+                }
+                new_rows.push(row);
             }
-            for (index, value) in row.iter().enumerate() {
-                if value.is_null() && schema.columns[index].not_null {
-                    return Err(SqlError::NotNull {
+        } else {
+            new_rows.reserve(rows.len());
+            for expressions in rows {
+                if expressions.len() != indices.len() {
+                    return Err(SqlError::ColumnCount {
                         table: name.to_string(),
-                        column: schema.columns[index].name.clone(),
+                        expected: indices.len(),
+                        actual: expressions.len(),
                     });
                 }
+                let mut row = vec![Value::Null; schema.len()];
+                for (expression, &index) in expressions.iter().zip(&indices) {
+                    let value = eval_constant(expression)?;
+                    let value = schema.columns[index].data_type.coerce(value)?;
+                    if schema.columns[index].not_null && value.is_null() {
+                        return Err(SqlError::NotNull {
+                            table: name.to_string(),
+                            column: schema.columns[index].name.clone(),
+                        });
+                    }
+                    row[index] = value;
+                }
+                for (index, value) in row.iter().enumerate() {
+                    if value.is_null() && schema.columns[index].not_null {
+                        return Err(SqlError::NotNull {
+                            table: name.to_string(),
+                            column: schema.columns[index].name.clone(),
+                        });
+                    }
+                }
+                new_rows.push(row);
             }
-            new_rows.push(row);
         }
 
         for row in &new_rows {
@@ -622,6 +666,13 @@ impl SqlEngine {
         })
     }
 
+    fn execute_query(&mut self, query: &Query) -> Result<QueryResult, SqlError> {
+        match query {
+            Query::Select(select) => self.select(select),
+            Query::With(with) => self.with_query(with),
+        }
+    }
+
     fn with_query(&mut self, with: &With) -> Result<QueryResult, SqlError> {
         let mut saved: Vec<(String, Option<Table>)> = Vec::new();
         for cte in &with.ctes {
@@ -637,7 +688,7 @@ impl SqlEngine {
                 self.tables.insert(cte.name.clone(), table),
             ));
         }
-        let result = self.select(&with.query);
+        let result = self.execute_statement(&with.body);
         self.restore_tables(saved);
         result
     }
@@ -660,7 +711,7 @@ impl SqlEngine {
     /// The recursive step re-reads the CTE table from the catalog, so the
     /// current accumulated rows are visible under `cte.name`.
     fn materialize_cte(&mut self, cte: &Cte, recursive: bool) -> Result<Table, SqlError> {
-        let seed = self.select(&cte.seed)?;
+        let seed = self.execute_query(&cte.seed)?;
         let (seed_columns, seed_rows) = rows_of(seed)?;
         if !cte.columns.is_empty() && cte.columns.len() != seed_columns.len() {
             return Err(SqlError::Unsupported(format!(
@@ -683,23 +734,31 @@ impl SqlEngine {
         };
 
         if !recursive {
-            let step = self.select(&cte.step)?;
-            let (step_columns, step_rows) = rows_of(step)?;
-            if step_columns.len() != names.len() {
-                return Err(SqlError::Unsupported(format!(
-                    "CTE {} step returns {} column(s), expected {}",
-                    cte.name,
-                    step_columns.len(),
-                    names.len()
-                )));
-            }
-            for row in step_rows {
-                if cte.union_all || !table.rows.contains(&row) {
-                    table.rows.push(row);
+            if let Some(step_query) = &cte.step {
+                let step = self.execute_query(step_query)?;
+                let (step_columns, step_rows) = rows_of(step)?;
+                if step_columns.len() != names.len() {
+                    return Err(SqlError::Unsupported(format!(
+                        "CTE {} step returns {} column(s), expected {}",
+                        cte.name,
+                        step_columns.len(),
+                        names.len()
+                    )));
+                }
+                for row in step_rows {
+                    if cte.union_all || !table.rows.contains(&row) {
+                        table.rows.push(row);
+                    }
                 }
             }
             return Ok(table);
         }
+        let Some(step_query) = &cte.step else {
+            return Err(SqlError::Unsupported(format!(
+                "WITH RECURSIVE {} requires `UNION [ALL]`",
+                cte.name
+            )));
+        };
 
         let step_schema = table.schema.clone();
         let mut working = table.rows.clone();
@@ -721,7 +780,7 @@ impl SqlEngine {
                 rows: working,
             };
             let previous = self.tables.insert(cte.name.clone(), step_table);
-            let step = self.select(&cte.step);
+            let step = self.execute_query(step_query);
             match previous {
                 Some(previous) => {
                     self.tables.insert(cte.name.clone(), previous);
@@ -883,9 +942,9 @@ impl SqlEngine {
         let Some(left_stats) = self.stats.get(&left.name) else {
             return Ok(None);
         };
-        let mut left_table = qualify_table_schema(left, &left_qualifier);
+        let mut left_table = qualify_table_schema(&left, &left_qualifier);
         let left_filter = pushdown_filter(pushdown, 0);
-        let mut left_rows = estimate_scan_rows(left, left_stats, &left_qualifier, left_filter)?;
+        let mut left_rows = estimate_scan_rows(&left, left_stats, &left_qualifier, left_filter)?;
         let mut left_ndvs = left_stats
             .columns
             .iter()
@@ -901,9 +960,9 @@ impl SqlEngine {
             let Some(right_stats) = self.stats.get(&right.name) else {
                 return Ok(None);
             };
-            let right_table = qualify_table_schema(right, &qualifier);
+            let right_table = qualify_table_schema(&right, &qualifier);
             let right_filter = pushdown_filter(pushdown, join_index + 1);
-            let right_rows = estimate_scan_rows(right, right_stats, &qualifier, right_filter)?;
+            let right_rows = estimate_scan_rows(&right, right_stats, &qualifier, right_filter)?;
             let pairs = match &join.condition {
                 JoinCondition::Using(names) => using_pairs(&left_table, &right_table, names)?,
                 JoinCondition::Natural => natural_pairs(&left_table, &right_table)?,
@@ -1003,10 +1062,27 @@ impl SqlEngine {
         Ok(Some(estimate))
     }
 
-    fn source_tables<'a>(&'a self, select: &Select) -> Result<Vec<(&'a Table, String)>, SqlError> {
+    fn source_tables(&self, select: &Select) -> Result<Vec<(Table, String)>, SqlError> {
+        if select.table.is_empty() {
+            if !select.joins.is_empty() {
+                return Err(SqlError::Unsupported(
+                    "JOIN requires a FROM clause".to_string(),
+                ));
+            }
+            // `SELECT <exprs>` without a table: one empty row, zero columns.
+            return Ok(vec![(
+                Table {
+                    name: String::new(),
+                    schema: Schema::new(Vec::new()),
+                    rows: vec![Vec::new()],
+                },
+                String::new(),
+            )]);
+        }
         let table = self
             .tables
             .get(&select.table)
+            .cloned()
             .ok_or_else(|| SqlError::UnknownTable(select.table.clone()))?;
         let mut qualifiers = BTreeSet::new();
         let mut sources = Vec::with_capacity(select.joins.len() + 1);
@@ -1019,6 +1095,7 @@ impl SqlEngine {
             let right = self
                 .tables
                 .get(&join.table)
+                .cloned()
                 .ok_or_else(|| SqlError::UnknownTable(join.table.clone()))?;
             let qualifier = join.alias.as_deref().unwrap_or(&join.table);
             if !qualifiers.insert(qualifier.to_string()) {
@@ -1140,7 +1217,7 @@ impl SqlEngine {
     ) -> Result<Table, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
-        let mut joined = qualify_table_projected(left, &left_qualifier, projection.columns(0));
+        let mut joined = qualify_table_projected(&left, &left_qualifier, projection.columns(0));
         let left_filtered = pushdown_filter(pushdown, 0).is_some();
         if let Some(filter) = pushdown_filter(pushdown, 0) {
             joined = filter_table(joined, filter)?;
@@ -1164,7 +1241,7 @@ impl SqlEngine {
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
         {
             let mut right =
-                qualify_table_projected(right, &qualifier, projection.columns(join_index + 1));
+                qualify_table_projected(&right, &qualifier, projection.columns(join_index + 1));
             let right_filtered = pushdown_filter(pushdown, join_index + 1).is_some();
             if let Some(filter) = pushdown_filter(pushdown, join_index + 1) {
                 right = filter_table(right, filter)?;
@@ -1220,7 +1297,7 @@ impl SqlEngine {
     ) -> Result<PlanNode, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
-        let mut left_table = qualify_table_schema(left, &left_qualifier);
+        let mut left_table = qualify_table_schema(&left, &left_qualifier);
         let mut scan_index = 0;
         let left_filtered = stats
             .and_then(|stats| stats.scan_filters.get(scan_index).copied())
@@ -1242,7 +1319,7 @@ impl SqlEngine {
         scan_index += 1;
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
         {
-            let right_table = qualify_table_schema(right, &qualifier);
+            let right_table = qualify_table_schema(&right, &qualifier);
             let pairs = match &join.condition {
                 JoinCondition::Using(names) => using_pairs(&left_table, &right_table, names)?,
                 JoinCondition::Natural => natural_pairs(&left_table, &right_table)?,

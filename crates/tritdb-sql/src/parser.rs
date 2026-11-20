@@ -1,7 +1,7 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
-    AggregateKind, Assignment, ColumnDef, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy,
+    AggregateKind, Assignment, ColumnDef, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy, Query,
     Select, SelectItem, Statement, With,
 };
 use crate::error::SqlError;
@@ -258,15 +258,18 @@ impl Parser {
             }
             self.expect_keyword(Keyword::As)?;
             self.expect_symbol(Symbol::LParen)?;
-            let seed = self.parse_select_body()?;
-            self.expect_keyword(Keyword::Union)?;
-            let union_all = self.eat_keyword(Keyword::All);
-            let step = self.parse_select_body()?;
+            let seed = self.parse_query()?;
+            let (union_all, step) = if self.eat_keyword(Keyword::Union) {
+                let union_all = self.eat_keyword(Keyword::All);
+                (union_all, Some(Box::new(self.parse_query()?)))
+            } else {
+                (false, None)
+            };
             self.expect_symbol(Symbol::RParen)?;
             ctes.push(Cte {
                 name,
                 columns,
-                seed,
+                seed: Box::new(seed),
                 step,
                 union_all,
             });
@@ -275,12 +278,35 @@ impl Parser {
             }
             break;
         }
-        let query = self.parse_select_body()?;
+        let body = self.parse_statement()?;
+        if !matches!(
+            body,
+            Statement::Select(_)
+                | Statement::With(_)
+                | Statement::Insert { .. }
+                | Statement::Update { .. }
+                | Statement::Delete { .. }
+        ) {
+            return Err(self.error("WITH must be followed by SELECT, INSERT, UPDATE, or DELETE"));
+        }
         Ok(Statement::With(Box::new(With {
             recursive,
             ctes,
-            query: Box::new(query),
+            body: Box::new(body),
         })))
+    }
+
+    fn parse_query(&mut self) -> Result<Query, SqlError> {
+        match self.peek().map(|token| &token.kind) {
+            Some(TokenKind::Keyword(Keyword::With)) => match self.parse_with()? {
+                Statement::With(with) => Ok(Query::With(with)),
+                _ => Err(self.error("expected WITH")),
+            },
+            Some(TokenKind::Keyword(Keyword::Select)) => {
+                Ok(Query::Select(Box::new(self.parse_select_body()?)))
+            }
+            _ => Err(self.error("expected SELECT or WITH")),
+        }
     }
 
     fn parse_select_body(&mut self) -> Result<Select, SqlError> {
@@ -433,29 +459,40 @@ impl Parser {
             self.expect_symbol(Symbol::RParen)?;
             columns = Some(names);
         }
-        self.expect_keyword(Keyword::Values)?;
+        let select = if matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::Keyword(Keyword::Select)) | Some(TokenKind::Keyword(Keyword::With))
+        ) {
+            Some(Box::new(self.parse_query()?))
+        } else {
+            None
+        };
         let mut rows = Vec::new();
-        loop {
-            self.expect_symbol(Symbol::LParen)?;
-            let mut values = Vec::new();
+        if select.is_none() {
+            self.expect_keyword(Keyword::Values)?;
             loop {
-                values.push(self.parse_expr()?);
+                self.expect_symbol(Symbol::LParen)?;
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.parse_expr()?);
+                    if self.eat_symbol(Symbol::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_symbol(Symbol::RParen)?;
+                rows.push(values);
                 if self.eat_symbol(Symbol::Comma) {
                     continue;
                 }
                 break;
             }
-            self.expect_symbol(Symbol::RParen)?;
-            rows.push(values);
-            if self.eat_symbol(Symbol::Comma) {
-                continue;
-            }
-            break;
         }
         Ok(Statement::Insert {
             table,
             columns,
             rows,
+            select,
         })
     }
 
@@ -532,8 +569,11 @@ impl Parser {
             }
         }
 
-        self.expect_keyword(Keyword::From)?;
-        let (table, table_alias) = self.parse_table_ref()?;
+        let (table, table_alias) = if self.eat_keyword(Keyword::From) {
+            self.parse_table_ref()?
+        } else {
+            (String::new(), None)
+        };
 
         let mut joins = Vec::new();
         loop {
@@ -1649,9 +1689,18 @@ mod tests {
         assert_eq!(with.ctes[0].name, "reach");
         assert_eq!(with.ctes[0].columns, vec!["node".to_string()]);
         assert!(!with.ctes[0].union_all);
-        assert_eq!(with.ctes[0].seed.table, "edges");
-        assert_eq!(with.ctes[0].step.table, "edges");
-        assert_eq!(with.query.table, "reach");
+        let Query::Select(seed) = &*with.ctes[0].seed else {
+            panic!("expected SELECT seed");
+        };
+        assert_eq!(seed.table, "edges");
+        let Query::Select(step) = &**with.ctes[0].step.as_ref().expect("step") else {
+            panic!("expected SELECT step");
+        };
+        assert_eq!(step.table, "edges");
+        let Statement::Select(outer) = &*with.body else {
+            panic!("expected SELECT body");
+        };
+        assert_eq!(outer.table, "reach");
     }
 
     #[test]
@@ -1667,7 +1716,13 @@ mod tests {
         assert_eq!(with.ctes.len(), 2);
         assert!(with.ctes[0].union_all);
         assert!(!with.ctes[1].union_all);
-        assert_eq!(with.ctes[1].seed.table, "a");
-        assert_eq!(with.query.table, "b");
+        let Query::Select(seed) = &*with.ctes[1].seed else {
+            panic!("expected SELECT seed");
+        };
+        assert_eq!(seed.table, "a");
+        let Statement::Select(outer) = &*with.body else {
+            panic!("expected SELECT body");
+        };
+        assert_eq!(outer.table, "b");
     }
 }
