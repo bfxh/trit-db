@@ -380,3 +380,118 @@ fn manifest_replicate_subset_and_anchor_roundtrip() {
     ]);
     assert!(!output.status.success(), "tampered anchor must fail");
 }
+
+#[test]
+fn manifest_page_snapshot_and_restore_roundtrip() {
+    let dir = TempDir::new("cas-pages");
+    let pages = dir.join("pstore.pages");
+    let wal = dir.join("pstore.wal");
+    let pages_text = pages.to_str().expect("pages path");
+    let wal_text = wal.to_str().expect("wal path");
+
+    for text in ["alpha", "beta"] {
+        let output = run([
+            "pstore", "alloc", "--data", pages_text, "--wal", wal_text, "--text", text,
+        ]);
+        assert!(output.status.success(), "stderr: {:?}", output);
+    }
+    let original = std::fs::read(&pages).expect("read page file");
+    assert_eq!(original.len(), 2 * 8192);
+
+    let store = dir.join("cas");
+    let store_text = store.to_str().expect("store path");
+    let output = run([
+        "manifest",
+        "snapshot-pages",
+        "--store",
+        store_text,
+        "--data",
+        pages_text,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("pages=2"), "out: {text}");
+    assert!(text.contains("bytes=16384"), "out: {text}");
+    let head = field(&text, "manifest").to_string();
+
+    // A second snapshot links to the first.
+    let output = run([
+        "manifest",
+        "snapshot-pages",
+        "--store",
+        store_text,
+        "--data",
+        pages_text,
+        "--parent",
+        &head,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let head2 = field(&stdout(&output), "manifest").to_string();
+    let output = run([
+        "manifest", "verify", "--store", store_text, "--head", &head2,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("length=2"));
+
+    // Restore rebuilds the page file byte for byte and pstore can read it.
+    let restored = dir.join("restored.pages");
+    let restored_text = restored.to_str().expect("restored path");
+    let output = run([
+        "manifest",
+        "restore-pages",
+        "--store",
+        store_text,
+        "--head",
+        &head,
+        "--out",
+        restored_text,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("pages=2"));
+    assert_eq!(std::fs::read(&restored).expect("read restored"), original);
+
+    let restored_wal = dir.join("restored.wal");
+    let output = run([
+        "pstore",
+        "get",
+        "--data",
+        restored_text,
+        "--wal",
+        restored_wal.to_str().expect("restored wal path"),
+        "--id",
+        "0",
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("payload=\"alpha\""));
+
+    // A missing page chunk fails the restore instead of writing a short file.
+    let output = run(["manifest", "show", "--store", store_text, "--hash", &head]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let text = stdout(&output);
+    let page_hash = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("entry=page/0000000000000001 hash=")
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("missing page entry in {text}"));
+    let chunk_path = store
+        .join("chunks")
+        .join(&page_hash[..2])
+        .join(&page_hash[2..]);
+    std::fs::remove_file(&chunk_path).expect("remove chunk");
+
+    let broken = dir.join("broken.pages");
+    let output = run([
+        "manifest",
+        "restore-pages",
+        "--store",
+        store_text,
+        "--head",
+        &head,
+        "--out",
+        broken.to_str().expect("broken path"),
+    ]);
+    assert!(!output.status.success(), "missing chunk must fail");
+    assert!(!broken.exists(), "failed restore must not leave a file");
+}

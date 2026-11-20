@@ -12,7 +12,7 @@
 8. `tritdb-testkit`：零依赖测试工具；唯一临时目录、确定性 xorshift64*、hex 编解码。
 9. `tools/crosscheck/` + `testdata/vectors/`：独立 Python 字节级参考实现、确定性向量、Rust→Python 反向校验和二进制 framed bridge。
 10. `tritdb-exec`：SQL 值、schema、三值逻辑真值表、比较/算术表达式求值；`ann` 模块提供 K3/Belnap/Łukasiewicz/ℕ 注解、精确 `COUNT MODELS`、最小修复 CQA（`UNDER REPAIR`）；SQL 层支持列级 `UNIQUE`、表级 `UNIQUE (a, b)`、列级/表级 `CHECK (expr)`（`INSERT` / `UPDATE` 拒绝 `FALSE`，`UNKNOWN` 通过；TRSQ v3 持久化）与多列 `UNDER REPAIR ON (a, b)`；`SUM/AVG/MIN/MAX` 支持 Łukasiewicz 与 ℕ 注解列，`PROB_SUM` 计算 `1 - Π(1-p)`；`count_models` 默认走 BDD 并按变量连通分量分解；`LOGIC K3` / `LOGIC BELNAP` / `LOGIC LUKASIEWICZ` / `LOGIC NAT` 注解列（K3 为 `TRUE/FALSE/NULL`，Belnap 为 `TRUE/FALSE/BOTH/NEITHER`，Ł 为 0.000–1.000，ℕ 为非负整数）、`truth(expr)` 三值投影、`SELECT count_models('<expr>'[, vars])` 与 `SELECT ... FROM t UNDER REPAIR ON (key)`（按单列 FD 返回必然行）。
-11. `tritdb-cas`：内容寻址 chunk（SHA-256）、版本化 manifest（`TRMF`）与 parent 哈希链验证；CLI `cas put/get/gc`、`manifest commit/verify/show/replicate/snapshot/restore`、`anchor write/verify`；`snapshot` 把 `TxnStore` 的 key/value 写进 CAS，`restore` 从 manifest 重建数据库；GC 按 manifest 链回收无引用 chunk，`replicate` 把链复制到另一个目录并重新校验（`--entry` 只拉指定 entry）；`anchor` 把链头写到 CAS 目录之外，可用 HMAC-SHA256 签名。
+11. `tritdb-cas`：内容寻址 chunk（SHA-256）、版本化 manifest（`TRMF`）与 parent 哈希链验证；CLI `cas put/get/gc`、`manifest commit/verify/show/replicate/snapshot/restore/snapshot-pages/restore-pages`、`anchor write/verify`；`snapshot` 把 `TxnStore` 的 key/value 写进 CAS，`restore` 从 manifest 重建数据库；GC 按 manifest 链回收无引用 chunk，`replicate` 把链复制到另一个目录并重新校验（`--entry` 只拉指定 entry）；`anchor` 把链头写到 CAS 目录之外，可用 HMAC-SHA256 签名；`snapshot-pages` 把 `pstore` 页文件按 8 KiB 页切成 chunk 写进 manifest（`layout` entry 记录页大小与页数），`restore-pages` 重建页文件。
 12. `tritdb-sql`：最小 lexer/parser/binder/executor；`CREATE/INSERT/SELECT/UPDATE/DELETE/DROP`、加法 schema 迁移 `ALTER TABLE ... ADD [COLUMN]`、`WHERE/ORDER BY/LIMIT`、`IN/BETWEEN/LIKE` 谓词、`CASE` 表达式、`GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN`、`JOIN ... USING (col, ...)`、等值 JOIN 的 hash join 执行（非等值条件回退 nested loop）、基于 `ANALYZE` 统计的 `Auto` join 代价选择、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、无 `*` / `USING` / `NATURAL` 且列引用可唯一归属时的源表列裁剪（含无歧义未限定列与零列源表投影）、计划入口的常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`（含 join 键/残余标志/非键合取项/过滤谓词/完整 join 谓词/HAVING 谓词/Scan 表名、别名与下推谓词）、只读 `EXPLAIN SEXPR` 与带执行汇总的 `EXPLAIN ANALYZE SEXPR`、逗号分隔 `FROM`（表别名 + 限定列）、分组聚合与聚合结果排序、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 静态计划与统计估算；表以 `TRSQ` 整表 value 存进 `TxnStore`，统计以 `TRSS` value 存在 `sql/stats/` 下。`ALTER TABLE ADD COLUMN` 只允许追加可空列，旧行回填 `NULL`，整表在单事务中重写并在成功后使统计失效；不支持 `DROP` / `RENAME` / `ALTER TYPE`。
 
 **还没有做**：子查询、窗口函数、全局优化器、pgwire、MVCC、Parquet/Iceberg、主从复制、增量同步、带默认值的非空列迁移、`DROP/RENAME/ALTER COLUMN` 等破坏性 schema 变更、schema 迁移版本历史。不要把这个骨架当成数据库。
@@ -71,6 +71,8 @@ cargo run -p tritdb -- cas gc --store cas-dir --root <manifest>
 cargo run -p tritdb -- manifest replicate --from cas-dir --to replica-dir --head <manifest> --entry blob
 cargo run -p tritdb -- anchor write --out head.anchor --head <manifest> --key-file secret
 cargo run -p tritdb -- anchor verify --file head.anchor --store cas-dir --key-file secret
+cargo run -p tritdb -- manifest snapshot-pages --store cas-dir --data pstore.pages
+cargo run -p tritdb -- manifest restore-pages --store cas-dir --head <manifest> --out restored.pages
 cargo run -p tritdb -- manifest snapshot --store cas-dir --db sql.db
 cargo run -p tritdb -- manifest restore --store cas-dir --head <manifest> --db restored.db
 cargo run -p tritdb-bench --release -- radix --trits 1000000 --rounds 6
