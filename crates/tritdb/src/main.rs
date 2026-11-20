@@ -60,7 +60,9 @@ fn print_help() {
     println!("  txn put --wal test.wal --key k --value v");
     println!("  txn get --wal test.wal --key k");
     println!("  txn dump --wal test.wal");
-    println!("  txn checkpoint --wal test.wal");
+    println!("  txn checkpoint --wal test.wal [--archive]");
+    println!("  txn history --wal test.wal");
+    println!("  txn recover --wal test.wal --to-lsn 42");
     println!("  txn writer --wal test.wal --txns 1000 --keys-per-txn 4 --sleep-ms 1");
     println!("  pstore alloc --data pstore.pages --wal pstore.wal --kind data --text \"hello\"");
     println!("  pstore put --data pstore.pages --wal pstore.wal --id 0 --text \"hello\"");
@@ -278,9 +280,14 @@ fn run_txn(args: &[String]) -> Result<(), String> {
         Some("get") => txn_get(args),
         Some("dump") => txn_dump(args),
         Some("checkpoint") => txn_checkpoint(args),
+        Some("history") => txn_history(args),
+        Some("recover") => txn_recover(args),
         Some("writer") => txn_writer(args),
         Some(other) => Err(format!("unknown txn subcommand: {other}")),
-        None => Err("txn requires `put`, `get`, `dump`, `checkpoint`, or `writer`".to_string()),
+        None => Err(
+            "txn requires `put`, `get`, `dump`, `checkpoint`, `history`, `recover`, or `writer`"
+                .to_string(),
+        ),
     }
 }
 
@@ -357,17 +364,79 @@ fn txn_dump(args: &[String]) -> Result<(), String> {
 
 fn txn_checkpoint(args: &[String]) -> Result<(), String> {
     let wal = required_arg(args, "--wal")?;
+    let archive = args.iter().any(|arg| arg == "--archive");
     let store = open_store(&wal)?;
-    let info = store.checkpoint().map_err(|error| error.to_string())?;
+    let info = if archive {
+        store.checkpoint_archive()
+    } else {
+        store.checkpoint()
+    }
+    .map_err(|error| error.to_string())?;
     println!(
-        "checkpoint_lsn={} entries={} wal_bytes_before={} wal_bytes_after={} snapshot={} snapshot_bytes={}",
+        "checkpoint_lsn={} entries={} wal_bytes_before={} wal_bytes_after={} snapshot={} snapshot_bytes={} archived_wal={} archived_snapshot={}",
         info.checkpoint_lsn,
         info.entries,
         info.wal_bytes_before,
         info.wal_bytes_after,
         store.snapshot_path().display(),
-        info.snapshot_bytes
+        info.snapshot_bytes,
+        info.archived_wal_bytes.map_or("-".to_string(), |n| n.to_string()),
+        info.archived_snapshot_bytes
+            .map_or("-".to_string(), |n| n.to_string())
     );
+    Ok(())
+}
+
+fn txn_history(args: &[String]) -> Result<(), String> {
+    let wal = required_arg(args, "--wal")?;
+    let mut dir = std::ffi::OsString::from(&wal);
+    dir.push(".history");
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.is_dir() {
+        println!("history={} entries=0", dir.display());
+        return Ok(());
+    }
+    let mut items: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|error| format!("read {}: {error}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wal"))
+        .collect();
+    items.sort();
+    println!("history={} entries={}", dir.display(), items.len());
+    for path in items {
+        let lsn = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("?");
+        let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let has_snapshot = path.with_extension("snap").is_file();
+        println!("lsn={lsn} wal_bytes={bytes} snapshot={has_snapshot}");
+    }
+    Ok(())
+}
+
+fn txn_recover(args: &[String]) -> Result<(), String> {
+    let wal = required_arg(args, "--wal")?;
+    let target_lsn = arg_u64(args, "--to-lsn")?;
+    let limit = arg_usize(args, "--limit", 32).max(1);
+    let view = TxnStore::recover_at(Path::new(&wal), target_lsn)
+        .map_err(|error| format!("recover {wal} to lsn {target_lsn}: {error}"))?;
+    println!(
+        "target_lsn={} checkpoint_lsn={} applied_lsn={} committed_txns={} discarded_txns={} keys={}",
+        view.target_lsn,
+        view.checkpoint_lsn,
+        view.applied_lsn,
+        view.committed_txns,
+        view.discarded_txns,
+        view.entries.len()
+    );
+    for (key, value) in view.entries.iter().take(limit) {
+        println!("key={} value={}", preview_bytes(key), preview_bytes(value));
+    }
+    if view.entries.len() > limit {
+        println!("... {} more keys", view.entries.len() - limit);
+    }
     Ok(())
 }
 

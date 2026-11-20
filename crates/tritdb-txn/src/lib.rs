@@ -115,6 +115,20 @@ pub enum TxnError {
         /// Transaction id.
         txn_id: u64,
     },
+    /// PITR target is older than the oldest archived checkpoint.
+    PitrBeforeHistory {
+        /// Requested LSN.
+        target_lsn: u64,
+        /// Oldest checkpoint LSN available in the archive.
+        oldest_lsn: u64,
+    },
+    /// A PITR archive is missing its snapshot or WAL half.
+    PitrIncompleteArchive {
+        /// Checkpoint LSN of the damaged archive.
+        checkpoint_lsn: u64,
+        /// Human-readable reason.
+        reason: &'static str,
+    },
     /// A lock was poisoned by a panicking thread.
     Poisoned,
 }
@@ -148,6 +162,20 @@ impl fmt::Display for TxnError {
             TxnError::MissingBegin { txn_id } => {
                 write!(f, "commit/abort for txn {txn_id} without begin")
             }
+            TxnError::PitrBeforeHistory {
+                target_lsn,
+                oldest_lsn,
+            } => write!(
+                f,
+                "point-in-time target lsn {target_lsn} predates oldest archived checkpoint {oldest_lsn}"
+            ),
+            TxnError::PitrIncompleteArchive {
+                checkpoint_lsn,
+                reason,
+            } => write!(
+                f,
+                "pitr archive at lsn {checkpoint_lsn} is incomplete: {reason}"
+            ),
             TxnError::Poisoned => write!(f, "transaction lock poisoned"),
         }
     }
@@ -220,6 +248,27 @@ pub struct CheckpointInfo {
     pub wal_bytes_after: u64,
     /// Snapshot file size in bytes.
     pub snapshot_bytes: u64,
+    /// Bytes copied into `<wal>.history/<lsn>.wal`; `None` for a plain checkpoint.
+    pub archived_wal_bytes: Option<u64>,
+    /// Bytes copied into `<wal>.history/<lsn>.snap`; `None` for a plain checkpoint.
+    pub archived_snapshot_bytes: Option<u64>,
+}
+
+/// State reconstructed at a requested historical LSN.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PitrView {
+    /// LSN the caller asked for.
+    pub target_lsn: u64,
+    /// Checkpoint LSN of the snapshot used as the replay base.
+    pub checkpoint_lsn: u64,
+    /// Highest WAL LSN actually replayed (at most `target_lsn`).
+    pub applied_lsn: u64,
+    /// Committed key/value pairs at the target LSN, sorted by key.
+    pub entries: Vec<Entry>,
+    /// Transactions applied because their `Commit` was at or before the target.
+    pub committed_txns: usize,
+    /// Transactions started but not committed at the target.
+    pub discarded_txns: usize,
 }
 
 /// A store with one WAL writer and concurrent logical transactions.
@@ -360,6 +409,20 @@ impl TxnStore {
     /// happens between those two steps, recovery loads the snapshot and skips
     /// the old WAL records it already covers.
     pub fn checkpoint(&self) -> Result<CheckpointInfo, TxnError> {
+        self.checkpoint_impl(false)
+    }
+
+    /// Like [`TxnStore::checkpoint`], but first copies the snapshot and the
+    /// pre-reset WAL into `<wal>.history/<lsn>.{snap,wal}`.
+    ///
+    /// The archive is what [`TxnStore::recover_at`] replays. A plain
+    /// checkpoint discards the WAL it reset and therefore cannot be used as a
+    /// point-in-time base.
+    pub fn checkpoint_archive(&self) -> Result<CheckpointInfo, TxnError> {
+        self.checkpoint_impl(true)
+    }
+
+    fn checkpoint_impl(&self, archive: bool) -> Result<CheckpointInfo, TxnError> {
         let mut wal = self.wal.lock().map_err(|_| TxnError::Poisoned)?;
         // Check under the WAL lock. A `begin` increments `active_txns` before
         // appending its `Begin`; if it increments after this check it cannot
@@ -379,6 +442,18 @@ impl TxnStore {
         let wal_bytes_before = fs::metadata(&self.path)?.len();
         let entries = state.len() as u64;
         let snapshot_bytes = write_snapshot(&self.snapshot_path, checkpoint_lsn, &state)?;
+
+        let (archived_wal_bytes, archived_snapshot_bytes) = if archive {
+            let history = history_dir_for(&self.path);
+            fs::create_dir_all(&history)?;
+            let (snap_path, wal_path) = archive_paths(&history, checkpoint_lsn);
+            let snap_bytes = archive_file(&self.snapshot_path, &snap_path)?;
+            let wal_bytes = archive_file(&self.path, &wal_path)?;
+            (Some(wal_bytes), Some(snap_bytes))
+        } else {
+            (None, None)
+        };
+
         wal.reset(checkpoint_lsn.saturating_add(1).max(1))?;
         let wal_bytes_after = fs::metadata(&self.path)?.len();
 
@@ -388,6 +463,102 @@ impl TxnStore {
             wal_bytes_before,
             wal_bytes_after,
             snapshot_bytes,
+            archived_wal_bytes,
+            archived_snapshot_bytes,
+        })
+    }
+
+    /// Reconstructs the committed state at `target_lsn` from archived
+    /// checkpoints and the live WAL.
+    ///
+    /// The base is the newest archived checkpoint whose LSN is at or before
+    /// `target_lsn`; if none exists, the live snapshot is used when it is old
+    /// enough. Records after `target_lsn` are not applied, so a transaction
+    /// whose `Commit` lands after the target is discarded.
+    ///
+    /// This does not open or modify the store. The caller can keep the live
+    /// store open while inspecting history.
+    pub fn recover_at(path: &Path, target_lsn: u64) -> Result<PitrView, TxnError> {
+        let history = history_dir_for(path);
+        let archives = list_archives(&history)?;
+        let usable = archives
+            .iter()
+            .copied()
+            .filter(|lsn| *lsn <= target_lsn)
+            .max();
+
+        // The base is a snapshot; every WAL record after its LSN is replayed
+        // on top, up to `target_lsn`.
+        let (checkpoint_lsn, state) = match usable {
+            Some(lsn) => {
+                let (snap_path, _) = archive_paths(&history, lsn);
+                if !snap_path.is_file() {
+                    return Err(TxnError::PitrIncompleteArchive {
+                        checkpoint_lsn: lsn,
+                        reason: "snapshot file is missing",
+                    });
+                }
+                let snapshot =
+                    read_snapshot(&snap_path)?.ok_or(TxnError::PitrIncompleteArchive {
+                        checkpoint_lsn: lsn,
+                        reason: "snapshot disappeared while reading",
+                    })?;
+                (snapshot.checkpoint_lsn, snapshot.entries)
+            }
+            None => {
+                let live_snapshot_path = snapshot_path_for(path);
+                let snapshot = read_snapshot(&live_snapshot_path)?;
+                match snapshot {
+                    Some(snapshot) if snapshot.checkpoint_lsn <= target_lsn => {
+                        (snapshot.checkpoint_lsn, snapshot.entries)
+                    }
+                    Some(snapshot) => {
+                        let oldest = archives.first().copied().unwrap_or(snapshot.checkpoint_lsn);
+                        return Err(TxnError::PitrBeforeHistory {
+                            target_lsn,
+                            oldest_lsn: oldest,
+                        });
+                    }
+                    None => (0, BTreeMap::new()),
+                }
+            }
+        };
+
+        // Archived WALs after the base, plus the live WAL. Archived WALs at or
+        // before the base are covered by its snapshot.
+        let mut wal_paths: Vec<PathBuf> = archives
+            .iter()
+            .copied()
+            .filter(|lsn| *lsn > checkpoint_lsn)
+            .map(|lsn| archive_paths(&history, lsn).1)
+            .collect();
+        wal_paths.push(path.to_path_buf());
+
+        let mut records = Vec::new();
+        let mut torn_tail_bytes = 0;
+        for wal_path in &wal_paths {
+            let scan = match tritdb_wal::WalReader::open(wal_path) {
+                Ok(scan) => scan,
+                Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue
+                }
+                Err(error) => return Err(error.into()),
+            };
+            torn_tail_bytes = torn_tail_bytes.max(torn_bytes(&scan));
+            records.extend(scan.records);
+        }
+        records.sort_by_key(|record| record.lsn);
+        records.dedup_by_key(|record| record.lsn);
+
+        let recovered =
+            replay_records(&records, state, checkpoint_lsn, target_lsn, torn_tail_bytes)?;
+        Ok(PitrView {
+            target_lsn,
+            checkpoint_lsn: recovered.info.checkpoint_lsn,
+            applied_lsn: recovered.info.last_lsn,
+            entries: recovered.state.into_iter().collect(),
+            committed_txns: recovered.info.committed_txns,
+            discarded_txns: recovered.info.discarded_txns,
         })
     }
 
@@ -631,6 +802,59 @@ fn snapshot_tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+fn history_dir_for(wal_path: &Path) -> PathBuf {
+    let mut name = wal_path.as_os_str().to_os_string();
+    name.push(".history");
+    PathBuf::from(name)
+}
+
+fn archive_paths(dir: &Path, lsn: u64) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{lsn}.snap")),
+        dir.join(format!("{lsn}.wal")),
+    )
+}
+
+/// Copies `src` to `dst` through a temporary file, so a crash never leaves a
+/// half-written archive under the final name.
+fn archive_file(src: &Path, dst: &Path) -> Result<u64, TxnError> {
+    let tmp = {
+        let mut name = dst.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let bytes = fs::copy(src, &tmp)?;
+    // `rename` does not overwrite on Windows; re-checkpointing the same LSN
+    // should replace the old archive, not fail.
+    let _ = fs::remove_file(dst);
+    fs::rename(&tmp, dst)?;
+    Ok(bytes)
+}
+
+/// Lists archived checkpoint LSNs that have a `.wal` file.
+fn list_archives(dir: &Path) -> Result<Vec<u64>, TxnError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut lsns = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if let Ok(lsn) = stem.parse::<u64>() {
+            lsns.push(lsn);
+        }
+    }
+    lsns.sort_unstable();
+    Ok(lsns)
+}
+
 fn read_snapshot(path: &Path) -> Result<Option<Snapshot>, TxnError> {
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -841,23 +1065,52 @@ fn write_snapshot(
 
 fn recover(
     scan: &WalScan,
-    mut state: BTreeMap<Vec<u8>, Vec<u8>>,
+    state: BTreeMap<Vec<u8>, Vec<u8>>,
     checkpoint_lsn: u64,
 ) -> Result<Recovered, TxnError> {
+    let torn_tail_bytes = match scan.tail {
+        tritdb_wal::TailState::Clean => 0,
+        tritdb_wal::TailState::Torn { bytes, .. } => bytes,
+    };
+    replay_records(
+        &scan.records,
+        state,
+        checkpoint_lsn,
+        u64::MAX,
+        torn_tail_bytes,
+    )
+}
+
+fn torn_bytes(scan: &WalScan) -> u64 {
+    match scan.tail {
+        tritdb_wal::TailState::Clean => 0,
+        tritdb_wal::TailState::Torn { bytes, .. } => bytes,
+    }
+}
+
+fn replay_records(
+    wal_records: &[tritdb_wal::Record],
+    mut state: BTreeMap<Vec<u8>, Vec<u8>>,
+    checkpoint_lsn: u64,
+    max_lsn: u64,
+    torn_tail_bytes: u64,
+) -> Result<Recovered, TxnError> {
     let mut pending: BTreeMap<u64, Vec<Op>> = BTreeMap::new();
+    let mut applied_lsn = checkpoint_lsn;
     let mut committed_txns = 0usize;
     let mut aborted_txns = 0usize;
     let mut max_txn_id = 0u64;
     let mut records = 0usize;
     let mut records_skipped = 0usize;
 
-    for record in &scan.records {
+    for record in wal_records {
         max_txn_id = max_txn_id.max(record.txn_id);
-        if record.lsn <= checkpoint_lsn {
+        if record.lsn <= checkpoint_lsn || record.lsn > max_lsn {
             records_skipped += 1;
             continue;
         }
         records += 1;
+        applied_lsn = applied_lsn.max(record.lsn);
         match record.kind {
             RecordKind::Begin => {
                 if pending.contains_key(&record.txn_id) {
@@ -912,11 +1165,6 @@ fn recover(
         }
     }
 
-    let torn_tail_bytes = match scan.tail {
-        tritdb_wal::TailState::Clean => 0,
-        tritdb_wal::TailState::Torn { bytes, .. } => bytes,
-    };
-
     Ok(Recovered {
         state,
         info: RecoveryInfo {
@@ -927,7 +1175,7 @@ fn recover(
             aborted_txns,
             discarded_txns: pending.len(),
             torn_tail_bytes,
-            last_lsn: scan.last_lsn().max(checkpoint_lsn),
+            last_lsn: applied_lsn,
         },
         max_txn_id,
     })
