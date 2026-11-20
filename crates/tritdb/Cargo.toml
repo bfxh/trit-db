@@ -8,6 +8,7 @@ publish = false
 description = "trit-db CLI"
 
 [dependencies]
+tritdb-exec.workspace = true
 tritdb-format.workspace = true
 tritdb-page.workspace = true
 tritdb-radix.workspace = true

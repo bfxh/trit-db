@@ -6,6 +6,7 @@ version = 4
 name = "tritdb"
 version = "0.0.1"
 dependencies = [
+ "tritdb-exec",
  "tritdb-format",
  "tritdb-page",
  "tritdb-radix",

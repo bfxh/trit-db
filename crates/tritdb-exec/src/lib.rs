@@ -5,6 +5,8 @@
 //! [`TruthValue`] internally and are materialized as `TRUE`/`FALSE`/`NULL`
 //! when they appear as scalar values.
 
+pub mod ann;
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
