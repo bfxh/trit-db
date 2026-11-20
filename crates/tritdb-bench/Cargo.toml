@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "trit-db M0/M1 微基准：radix、页、TRBL 块、WAL、SQL JOIN"
+description = "trit-db M0/M1 微基准：radix、页、TRBL 块、WAL、SQL JOIN / 计划 / 执行"
 
 [dependencies]
 tritdb-exec.workspace = true

@@ -74,13 +74,14 @@ cargo run -p tritdb-bench --release -- sql-join --rows 1024 --rounds 3 --strateg
 cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strategy auto
 cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strategy nested
 cargo run -p tritdb-bench --release -- sql-plan --rows 1024 --rounds 5
+cargo run -p tritdb-bench --release -- sql-exec --rows 1024 --rounds 5
 ```
 
 ## 测试与 CI
 
-当前 **257 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 join 非键合取项/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/结构化 Scan 下推谓词/解析嵌套上限/执行汇总/加法 schema 迁移分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
+当前 **258 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 join 非键合取项/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/结构化 Scan 下推谓词/解析嵌套上限/恶意输入 fuzz/执行汇总/加法 schema 迁移分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
 
-- `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / 三平台 Python 交叉校验（向量 + CLI + SQLite SQL 对拍）/ coverage / docs。
+- `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / `sql-plan`+`sql-join`+`sql-exec` bench smoke / 三平台 Python 交叉校验（向量 + CLI + SQLite SQL 对拍）/ coverage / docs。
 - `stress.yml`：每天 04:00 UTC 跑 release 模式压力测试与 crash matrix。
 - `release.yml`：`v*` tag 构建 Linux x86_64、Windows x86_64、macOS arm64 的 `tritdb`/`tritdb-bench`，创建 GitHub Release。
 

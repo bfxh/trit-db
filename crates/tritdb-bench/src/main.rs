@@ -36,6 +36,7 @@ fn main() {
         Some("txn-group") => run_txn_group(&args),
         Some("sql-join") => run_sql_join(&args),
         Some("sql-plan") => run_sql_plan(&args),
+        Some("sql-exec") => run_sql_exec(&args),
         Some("help") | Some("--help") => print_help(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
@@ -58,6 +59,7 @@ fn print_help() {
     println!("  txn-group --txns 256 --threads 16 --keys-per-txn 4 --rounds 3");
     println!("  sql-join --rows 1024 --rounds 3 [--strategy auto|hash|nested]");
     println!("  sql-plan --rows 1024 --rounds 3 [--query join|filter|aggregate|all]");
+    println!("  sql-exec --rows 1024 --rounds 3 [--query filter|aggregate|all]");
 }
 
 fn run_radix(args: &[String]) {
@@ -1089,6 +1091,82 @@ fn run_sql_plan(args: &[String]) {
             bench.sexpr.max,
             bench.text_chars,
             bench.sexpr_chars
+        );
+    }
+}
+
+fn query_result_rows(result: &QueryResult) -> usize {
+    let QueryResult::Rows { rows, .. } = result else {
+        panic!("query did not return rows");
+    };
+    rows.len()
+}
+
+fn run_sql_exec(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 1024);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+    let selected = arg_value(args, "--query").unwrap_or_else(|| "all".to_string());
+    let all_queries: &[(&str, &str)] = &[
+        (
+            "filter",
+            "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id \
+             WHERE a.payload < 512 AND b.payload < 512",
+        ),
+        (
+            "aggregate",
+            "SELECT a.id, SUM(b.payload) AS total FROM a JOIN b ON a.id = b.id \
+             WHERE a.payload < 512 GROUP BY a.id ORDER BY a.id",
+        ),
+    ];
+    let queries: Vec<_> = all_queries
+        .iter()
+        .copied()
+        .filter(|(name, _)| selected == "all" || selected == *name)
+        .collect();
+    if queries.is_empty() {
+        eprintln!("unknown --query: {selected}; expected filter, aggregate, or all");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-exec.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_join_tables(&mut engine, rows);
+    engine.set_join_strategy(JoinStrategy::Auto);
+
+    let mut results = Vec::with_capacity(queries.len());
+    for (name, sql) in queries {
+        let statement = parse_script(sql).expect("parse exec query");
+        engine
+            .execute_statement(&statement[0])
+            .expect("warm exec query");
+        let mut samples = Vec::with_capacity(rounds);
+        let mut result_rows = 0;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            let result = engine
+                .execute_statement(&statement[0])
+                .expect("execute query");
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            result_rows = query_result_rows(&result);
+        }
+        assert!(result_rows > 0, "{name} returned no rows");
+        results.push((name, Stats::new(samples), result_rows));
+    }
+
+    println!("rows\tquery\trounds\texec_ms(min/med/max)\tresult_rows");
+    for (name, stats, result_rows) in &results {
+        println!(
+            "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+            rows, name, rounds, stats.min, stats.median, stats.max, result_rows
+        );
+        println!(
+            "{{\"bench_id\":\"sql_exec\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"exec_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
+            rows, name, rounds, stats.min, stats.median, stats.max, result_rows
         );
     }
 }
