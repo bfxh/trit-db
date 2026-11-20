@@ -250,6 +250,9 @@ impl SqlEngine {
             Statement::Explain(select) => self.explain(select, false, ExplainFormat::Text),
             Statement::ExplainSexpr(select) => self.explain(select, false, ExplainFormat::Sexpr),
             Statement::ExplainAnalyze(select) => self.explain(select, true, ExplainFormat::Text),
+            Statement::ExplainAnalyzeSexpr(select) => {
+                self.explain(select, true, ExplainFormat::Sexpr)
+            }
             Statement::Analyze { table } => self.analyze(table.as_deref()),
             Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
             Statement::Update {
@@ -605,15 +608,20 @@ impl SqlEngine {
                 None,
             )
         };
-        let mut plan = match format {
-            ExplainFormat::Text => plan.to_text(),
-            ExplainFormat::Sexpr => plan.to_sexpr(),
+        let mut plan = match (&format, &stats) {
+            (ExplainFormat::Text, _) => plan.to_text(),
+            (ExplainFormat::Sexpr, None) => plan.to_sexpr(),
+            (ExplainFormat::Sexpr, Some(stats)) => {
+                plan.to_sexpr_with_execution(stats.output_rows, stats.total_ms)
+            }
         };
-        if let Some(stats) = stats {
-            plan.push_str(&format!(
-                "\nExecution: rows={} time={:.3}ms",
-                stats.output_rows, stats.total_ms
-            ));
+        if matches!(format, ExplainFormat::Text) {
+            if let Some(stats) = stats {
+                plan.push_str(&format!(
+                    "\nExecution: rows={} time={:.3}ms",
+                    stats.output_rows, stats.total_ms
+                ));
+            }
         }
         Ok(QueryResult::Rows {
             columns: vec!["plan".to_string()],

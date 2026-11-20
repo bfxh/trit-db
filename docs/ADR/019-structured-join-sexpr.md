@@ -22,7 +22,7 @@ ADR-018 把 `JoinPlan` 从渲染好的 `details: Vec<String>` 改成 `JoinKeys`�
    - `:on-expr #t`：nested-loop `ON` join 显示整体谓词。
 2. 字段只在存在/为真时输出；缺省即表示无键、无残余或不是 `on=expr`。这与现有 `:filtered`、`:cols`、`:est-rows` 的按需字段风格一致。
 3. `EXPLAIN` 文本继续由 `detail_fragments()` 生成，保持 `keys=(...)` / `residual=yes` / `on=expr` 的历史格式；`EXPLAIN SEXPR` 与文本共享同一个 `JoinPlan`，不复制规划逻辑。
-4. 解析器、执行路径、join 选择、统计估算和错误语义不变；`EXPLAIN ANALYZE SEXPR` 仍明确拒绝。
+4. 解析器、执行路径、join 选择、统计估算和错误语义不变；本 ADR 当时仍拒绝 `EXPLAIN ANALYZE SEXPR`，该限制已由 ADR-020 撤销；`EXPLAIN ANALYZE SEXPR` 的 join 字段继续沿用本 ADR 的 `:keys` / `:residual` / `:on-expr` 形状。
 5. `:keys` 的两种列表形状是有意的：共享列名和显式等值对在语义上不同，不能强行压成同一种形状。消费者可以用“字符串 vs 二元列表”区分。
 
 ## 后果

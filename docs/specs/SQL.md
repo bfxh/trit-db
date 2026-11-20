@@ -174,7 +174,7 @@ EXPLAIN SEXPR SELECT ...;
 ```
 
 - `EXPLAIN SEXPR` 走与 `EXPLAIN` 相同的折叠、下推、列裁剪、绑定和估算路径，但不执行查询；它只把同一棵 `PlanNode` 树用只读括号化形式输出。
-- `SEXPR` 只在 `EXPLAIN` 后按普通单词识别，不是全局关键字；`EXPLAIN ANALYZE SEXPR SELECT ...` 明确拒绝。
+- `SEXPR` 只在 `EXPLAIN` 后按普通单词识别，不是全局关键字；静态 `EXPLAIN SEXPR` 与 `EXPLAIN ANALYZE SEXPR` 共用同一条解析分支，后者额外执行一次查询。
 - 返回单列 `plan`、单行文本；文本内部保留换行和缩进，便于直接作为机器可读的计划值保存。
 - join 节点形如：
   - `ON` hash join：`(join hash inner :keys (("a.id" "b.id")) :est-rows 2 child child)`；每个键是 `("左列" "右列")` 二元列表；
@@ -184,7 +184,7 @@ EXPLAIN SEXPR SELECT ...;
 - 算法为 `hash` 或 `nested-loop`；键、残余标志和 `on-expr` 直接来自 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 字段，输出格式见 ADR-019。
 - `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :est-groups N child)`；
   - `(project ("v" "n") :est-rows N child)`、`(sort :keys 1 :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
-- 只有静态计划，因此不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。
+- 静态模式只输出估算，不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。`EXPLAIN ANALYZE SEXPR` 在同一个树外增加 `(execution ...)` 汇总，节点改用 actual 字段，见下节。
 - 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md) 与 [`ADR-019`](../ADR/019-structured-join-sexpr.md)。
 
 ### EXPLAIN ANALYZE SELECT
@@ -203,6 +203,20 @@ EXPLAIN ANALYZE SELECT ...;
 - 末行 `Execution: rows=N time=Xms`：`rows` 是最终输出行数，`time` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间，不含计划文本渲染。
 - 节点耗时是单次运行测量：Join 只计 `join_tables`，Filter/Aggregate/Having/Project/Sort 分别计对应阶段；`Scan` 不单独计时。
 - 这不是全局代价模型；耗时受机器负载影响，只用于观察当前执行路径。`EXPLAIN SELECT` 的 `est` 是统计估算和 `Auto` 选择结果，`EXPLAIN ANALYZE` 的 `actual` 是本次执行实测，并显示执行时实际选中的 `HashJoin` / `NestedLoop`；下推后的过滤行数会同时影响两侧的静态估算和实测成本选择。
+
+### EXPLAIN ANALYZE SEXPR SELECT
+
+```sql
+EXPLAIN ANALYZE SEXPR SELECT ...;
+```
+
+- 与 `EXPLAIN ANALYZE` 走同一次真实执行、同一套节点统计和同一棵 `PlanNode` 树，但不返回查询结果行，只返回单列 `plan`、单行文本。
+- 顶层增加执行汇总：`(execution :rows N :time-ms X`，其中 `N` 是最终输出行数，`X` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间；汇总字段与文本格式末行 `Execution:` 同源。
+- 节点只输出实际字段：`Scan` 为 `:actual-rows`，`HashJoin` / `NestedLoop` 为 `:actual-rows` 和 `:time-ms`，`Filter` / `Project` / `Sort` 为 `:actual-rows` 和 `:time-ms`，`Aggregate` / `Having` 为 `:actual-groups` 和 `:time-ms`，`Limit` 只有 `:actual-rows`；`Scan` 不单独计时。
+- 不再输出 `:est-rows` / `:est-groups`，避免估算与实际混在同一棵树；join 的 `:keys` / `:residual` / `:on-expr` 仍按 ADR-019 输出。
+- 格式和边界见 [`ADR-020`](../ADR/020-explain-analyze-sexpr.md)。
+
+### 查询语义
 
 - `WHERE` 只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。计划入口先折叠不含列/聚合的常量，恒真 `WHERE` 直接移除；内连接/交叉连接会把顶层（含括号嵌套）的 `AND` 拆成合取项，单个显式限定的单源条件在 join 前下推到该源表扫描；外连接、`OR` 分支、`NOT` 内部条件、多源单条件和未限定列仍在 join 后求值。源表列裁剪按 ADR-011/ADR-015 执行：显式限定列直接归属，未限定列只在全源唯一时归属，歧义或未知列回退完整 schema。
 - `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。

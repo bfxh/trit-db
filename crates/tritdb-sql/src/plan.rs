@@ -133,6 +133,22 @@ impl PlanNode {
         out
     }
 
+    /// Render a plan tree with a leading execution envelope. The envelope is
+    /// only used by `EXPLAIN ANALYZE SEXPR`; it carries the same totals as the
+    /// text format's final `Execution:` line.
+    pub(crate) fn to_sexpr_with_execution(&self, rows: usize, total_ms: f64) -> String {
+        let body = self.to_sexpr();
+        let mut out = format!("(execution :rows {rows} :time-ms {total_ms:.3}\n");
+        for line in body.lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.pop();
+        out.push(')');
+        out
+    }
+
     fn write_text(&self, out: &mut String, indent: usize) {
         out.push_str(&"  ".repeat(indent));
         out.push_str(&self.label());

@@ -1949,6 +1949,73 @@ fn explain_sexpr_reports_structured_plan() {
 }
 
 #[test]
+fn explain_analyze_sexpr_reports_actual_metrics() {
+    let dir = TempDir::new("sql-explain-analyze-sexpr");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (2, 'b2x'), (4, 'b4');",
+        )
+        .expect("seed");
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SEXPR SELECT a.v FROM a JOIN b \
+             ON a.id = b.id AND b.w <> 'b2x' \
+             WHERE a.id >= 1 OR b.w <> 'b2x' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain analyze sexpr");
+    let (columns, rows) = as_rows(&analyzed[0]);
+    assert_eq!(columns, ["plan"]);
+    assert_eq!(rows.len(), 1);
+    let plan = match &rows[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        plan.starts_with("(execution :rows 1 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(limit :limit 1 :actual-rows 1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(sort :keys 1 :actual-rows 2 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(project (\"v\") :actual-rows 2 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(filter :actual-rows 2 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains(
+            "(join hash inner :keys ((\"a.id\" \"b.id\")) :residual #t \
+             :actual-rows 2 :time-ms "
+        ),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(scan \"a\" :actual-rows 3)"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(scan \"b\" :actual-rows 4)"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains(":est-rows"), "unexpected plan: {plan}");
+    assert!(!plan.contains("Execution:"), "unexpected plan: {plan}");
+}
+
+#[test]
 fn explain_sexpr_reports_structured_join_keys() {
     fn plan_text(engine: &mut SqlEngine, sql: &str) -> String {
         let result = engine.execute_script(sql).expect("explain sexpr");

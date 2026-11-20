@@ -264,6 +264,8 @@ pub enum Statement {
     ExplainSexpr(Select),
     /// `EXPLAIN ANALYZE SELECT`.
     ExplainAnalyze(Select),
+    /// `EXPLAIN ANALYZE SEXPR SELECT`: parenthesized plan plus execution totals.
+    ExplainAnalyzeSexpr(Select),
     /// `ANALYZE [table]`: recompute exact table statistics.
     Analyze {
         /// Optional table name; `None` analyzes every table.
