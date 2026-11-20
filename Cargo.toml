@@ -12,6 +12,7 @@ members = [
     "crates/tritdb-bench",
     "crates/tritdb",
     "crates/tritdb-testkit",
+    "crates/tritdb-cas",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ tritdb-store = { path = "crates/tritdb-store" }
 tritdb-exec = { path = "crates/tritdb-exec" }
 tritdb-sql = { path = "crates/tritdb-sql" }
 tritdb-testkit = { path = "crates/tritdb-testkit" }
+tritdb-cas = { path = "crates/tritdb-cas" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

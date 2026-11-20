@@ -9,6 +9,7 @@ description = "trit-db CLI"
 
 [dependencies]
 tritdb-exec.workspace = true
+tritdb-cas.workspace = true
 tritdb-format.workspace = true
 tritdb-page.workspace = true
 tritdb-radix.workspace = true
