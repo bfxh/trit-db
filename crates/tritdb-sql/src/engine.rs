@@ -99,10 +99,11 @@ struct PushdownPlan {
 
 /// Columns retained for each source before joining.
 ///
-/// `None` means the source cannot be pruned safely; `Some(columns)` is a strict
-/// subset in schema order. This is a conservative physical optimization: every
-/// column reference must be static, an unqualified name must match exactly one
-/// source, and no wildcard, `USING`, or `NATURAL` join may depend on the original
+/// `None` means the source cannot be pruned safely; `Some(columns)` is a subset
+/// in schema order, and an empty vector means the source only contributes row
+/// multiplicity. This is a conservative physical optimization: every column
+/// reference must be static, an unqualified name must match exactly one source,
+/// and no wildcard, `USING`, or `NATURAL` join may depend on the original
 /// schema.
 #[derive(Clone, Debug, Default)]
 struct ScanProjection {
@@ -847,7 +848,7 @@ impl SqlEngine {
                 .filter(|name| keep[index].contains(*name))
                 .cloned()
                 .collect::<Vec<_>>();
-            if kept.is_empty() || kept.len() == available.len() {
+            if kept.len() == available.len() {
                 columns.push(None);
             } else {
                 columns.push(Some(kept));
@@ -1182,7 +1183,7 @@ fn qualify_table_projected(table: &Table, qualifier: &str, keep: Option<&[String
                 .then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.is_empty() || indices.len() == table.schema.len() {
+    if indices.len() == table.schema.len() {
         return qualify_table(table, qualifier);
     }
 
@@ -2286,7 +2287,11 @@ fn scan_plan(
         node.push_str(&format!(" est rows={rows}"));
     }
     if let Some(columns) = columns {
-        node.push_str(&format!(" cols={}", columns.join(",")));
+        if columns.is_empty() {
+            node.push_str(" cols=()");
+        } else {
+            node.push_str(&format!(" cols={}", columns.join(",")));
+        }
     }
     node
 }

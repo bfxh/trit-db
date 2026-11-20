@@ -2986,6 +2986,79 @@ fn join_projection_prunes_unused_source_columns() {
 }
 
 #[test]
+fn zero_column_source_projection_preserves_row_multiplicity() {
+    let dir = TempDir::new("sql-zero-column");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, v TEXT, spare TEXT); \
+             CREATE TABLE b (id INT NOT NULL, w TEXT, spare TEXT); \
+             INSERT INTO a VALUES (1, 'a1', 'sa1'), (2, 'a2', 'sa2'), (3, 'a3', 'sa3'); \
+             INSERT INTO b VALUES (1, 'b1', 'sb1'), (2, 'b2', 'sb2'), (3, 'b3', 'sb3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let constants = engine
+        .execute_script("SELECT 1 AS one FROM a;")
+        .expect("constant projection");
+    let (columns, rows) = as_rows(&constants[0]);
+    assert_eq!(columns, ["one"]);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row == &[Value::Int(1)]));
+
+    let counted = engine
+        .execute_script("SELECT COUNT(*) AS n FROM a;")
+        .expect("count over zero-column source");
+    assert_eq!(as_rows(&counted[0]).1, [vec![Value::Int(3)]]);
+
+    let crossed = engine
+        .execute_script("SELECT 1 AS one FROM a CROSS JOIN b;")
+        .expect("cross join over zero-column sources");
+    assert_eq!(as_rows(&crossed[0]).1.len(), 9);
+
+    let full = engine
+        .execute_script("SELECT 1 AS one FROM a FULL JOIN b ON FALSE;")
+        .expect("outer join over zero-column sources");
+    assert_eq!(as_rows(&full[0]).1.len(), 6);
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT 1 AS one FROM a;")
+        .expect("zero-column explain");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a est rows=3 cols=()"),
+        "zero-column scan should be visible: {plan}"
+    );
+
+    let analyzed = engine
+        .execute_script("EXPLAIN ANALYZE SELECT COUNT(*) AS n FROM a;")
+        .expect("zero-column analyze");
+    let plan = as_rows(&analyzed[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a actual rows=3 cols=()"),
+        "zero-column analyzed scan should be visible: {plan}"
+    );
+}
+
+#[test]
 fn constant_folding_removes_trivial_filters_and_keeps_errors() {
     let dir = TempDir::new("sql-constant-fold");
     let db = dir.join("sql.db");

@@ -1,6 +1,6 @@
 # ADR-015：无歧义未限定列的源表裁剪
 
-状态：已实现（Accepted）；扩展 ADR-011 的列裁剪边界
+状态：已实现（Accepted）；扩展 ADR-011 的列裁剪边界；后续 ADR-016 补上零列源表投影
 日期：2026-11-20
 
 ## 背景
@@ -16,7 +16,7 @@ binder 的 `resolve_column`（`bind.rs`；join 布局里的 `find_join_column` �
 3. 未限定列匹配零个或多个源表时，整条查询退回完整 schema，不在优化阶段报错；后续仍由 binder 按原规则报 `unknown column` 或 `ambiguous column`。
 4. `SELECT *`、`USING` / `NATURAL` join 仍整条回退。每个源表仍只在保留列构成严格子集时裁剪；空集合或全列不裁剪。
 5. 裁剪仍只作用于 join 前的源表副本和中间结果宽度。源表加载、统计、join 选择、输出列顺序、输出标签和值都不变。
-6. 明确不做：零列源表、表达式级投影下推、跨 join 的列需求传播、`SELECT *` / `USING` / `NATURAL` 的按列裁剪、join 重排或逻辑计划。
+6. 本切片明确不做：零列源表（后续 ADR-016 补上）、表达式级投影下推、跨 join 的列需求传播、`SELECT *` / `USING` / `NATURAL` 的按列裁剪、join 重排或逻辑计划。
 
 ## 后果
 
@@ -26,7 +26,7 @@ binder 的 `resolve_column`（`bind.rs`；join 布局里的 `find_join_column` �
 - 正结果：查询结果、列标签、`ORDER BY` / `GROUP BY` 的别名解析保持不变；变化只在 `EXPLAIN` / `EXPLAIN ANALYZE` 的 `Scan ... cols=...` 和中间行宽度上可观测。
 - 负结果：只有当未限定列在源表 schema 中唯一时才会被归属；多源同名或未知名字仍整条回退。
 - 负结果：如果 `ORDER BY` / `GROUP BY` 的名字是投影别名而不是真实源列，收集阶段可能保留一个多余的源列；这是保守的，不改变结果。
-- 负结果：源表仍完整加载到内存，扫描 I/O 不减少；零列源表和表达式级列需求仍不做。
+- 负结果：源表仍完整加载到内存，扫描 I/O 不减少；本切片不做零列源表（ADR-016 补上）和表达式级列需求。
 
 ## 被否掉的替代
 
