@@ -75,6 +75,21 @@ fn sql_cli_creates_rows_and_reopens() {
 }
 
 #[test]
+fn sql_cli_rejects_deeply_nested_expression() {
+    let dir = TempDir::new("sql-cli-depth");
+    let db = dir.join("sql.db");
+    let db = db.to_str().expect("path");
+    let sql = format!("SELECT {}1{};", "(".repeat(512), ")".repeat(512));
+    let output = run(["sql", "--db", db, "--sql", &sql]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("nesting too deep"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn sql_cli_reads_file_and_reports_errors() {
     let dir = TempDir::new("sql-cli-file");
     let db = dir.join("sql.db");

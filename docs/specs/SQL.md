@@ -54,6 +54,7 @@ DROP TABLE t;
 - 字符串用单引号，支持 `''` 转义。
 - 支持 `--` 行注释和 `/* ... */` 块注释。
 - 整数只接受十进制 `i64`。
+- 表达式递归嵌套上限为 64 层（括号、连续 `NOT`、连续一元负号都计入）；超过时返回 `expression nesting too deep` 的 parse error，避免恶意/异常 SQL 打穿进程栈。见 [`ADR-031`](../ADR/031-parser-expression-depth-limit.md)。该上限不限制 token 总数、脚本长度或结果行数。
 
 ## 3. 语句
 
