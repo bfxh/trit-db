@@ -115,6 +115,15 @@ pub enum TxnError {
         /// Transaction id.
         txn_id: u64,
     },
+    /// A concurrent transaction committed a key this transaction also wrote.
+    Conflict {
+        /// Key that conflicted (lossy UTF-8 for display).
+        key: String,
+        /// LSN at which this transaction started.
+        begin_lsn: u64,
+        /// LSN of the last committed write to the key.
+        last_lsn: u64,
+    },
     /// PITR target is older than the oldest archived checkpoint.
     PitrBeforeHistory {
         /// Requested LSN.
@@ -165,6 +174,14 @@ impl fmt::Display for TxnError {
             TxnError::MissingBegin { txn_id } => {
                 write!(f, "commit/abort for txn {txn_id} without begin")
             }
+            TxnError::Conflict {
+                key,
+                begin_lsn,
+                last_lsn,
+            } => write!(
+                f,
+                "write conflict on {key:?}: txn began at lsn {begin_lsn}, last write at {last_lsn}"
+            ),
             TxnError::PitrBeforeHistory {
                 target_lsn,
                 oldest_lsn,
@@ -297,6 +314,7 @@ pub struct TxnStore {
     snapshot_path: PathBuf,
     wal: Mutex<WalWriter>,
     state: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
+    write_lsn: RwLock<BTreeMap<Vec<u8>, u64>>,
     commit_queue: Mutex<CommitQueue>,
     commit_ready: Condvar,
     next_txn_id: AtomicU64,
@@ -342,6 +360,7 @@ impl TxnStore {
             snapshot_path,
             wal: Mutex::new(wal),
             state: RwLock::new(recovered.state),
+            write_lsn: RwLock::new(BTreeMap::new()),
             commit_queue: Mutex::new(CommitQueue {
                 next_seq: 0,
                 synced_seq: 0,
@@ -390,6 +409,8 @@ impl TxnStore {
     pub fn begin(&self) -> Result<Txn<'_>, TxnError> {
         let mut wal = self.wal.lock().map_err(|_| TxnError::Poisoned)?;
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
+        let begin_lsn = wal.next_lsn();
+        let snapshot = Arc::new(self.state.read().map_err(|_| TxnError::Poisoned)?.clone());
         self.active_txns.fetch_add(1, Ordering::SeqCst);
         if let Err(error) = wal.append(RecordKind::Begin, txn_id, &[], false) {
             self.active_txns.fetch_sub(1, Ordering::SeqCst);
@@ -400,6 +421,8 @@ impl TxnStore {
             txn_id,
             ops: Vec::new(),
             active: true,
+            snapshot,
+            begin_lsn,
         })
     }
 
@@ -736,6 +759,14 @@ impl TxnStore {
         };
         let mut works = works;
         works.sort_by_key(|work| work.commit_lsn);
+        {
+            let mut write_lsn = self.write_lsn.write().map_err(|_| TxnError::Poisoned)?;
+            for work in &works {
+                for op in &work.ops {
+                    write_lsn.insert(op.key().to_vec(), work.commit_lsn);
+                }
+            }
+        }
         for work in works {
             for op in work.ops {
                 apply_op(&mut state, op);
@@ -773,12 +804,35 @@ pub struct Txn<'a> {
     txn_id: u64,
     ops: Vec<Op>,
     active: bool,
+    snapshot: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
+    begin_lsn: u64,
 }
 
 impl<'a> Txn<'a> {
     /// Transaction id.
     pub const fn id(&self) -> u64 {
         self.txn_id
+    }
+
+    /// Reads a key inside this transaction's snapshot (read-your-writes).
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
+        for op in self.ops.iter().rev() {
+            match op {
+                Op::Put { key: op_key, value } if op_key == key => return Ok(Some(value.clone())),
+                Op::Delete { key: op_key } if op_key == key => return Ok(None),
+                _ => {}
+            }
+        }
+        Ok(self.snapshot.get(key).cloned())
+    }
+
+    /// Returns the snapshot plus this transaction's buffered operations.
+    pub fn iter(&self) -> Result<Vec<Entry>, TxnError> {
+        let mut state = (*self.snapshot).clone();
+        for op in &self.ops {
+            apply_op(&mut state, op.clone());
+        }
+        Ok(state.into_iter().collect())
     }
 
     /// Logs a put and buffers it for commit.
@@ -817,6 +871,26 @@ impl<'a> Txn<'a> {
     fn commit_inner(&mut self) -> Result<CommitInfo, TxnError> {
         let (commit_lsn, op_count, seq, is_leader) = {
             let mut wal = self.store.wal.lock().map_err(|_| TxnError::Poisoned)?;
+            // First-committer-wins: any key written after this transaction
+            // began has a newer commit LSN and aborts this commit.
+            {
+                let write_lsn = self
+                    .store
+                    .write_lsn
+                    .read()
+                    .map_err(|_| TxnError::Poisoned)?;
+                for op in &self.ops {
+                    if let Some(last_lsn) = write_lsn.get(op.key()) {
+                        if *last_lsn >= self.begin_lsn {
+                            return Err(TxnError::Conflict {
+                                key: String::from_utf8_lossy(op.key()).into_owned(),
+                                begin_lsn: self.begin_lsn,
+                                last_lsn: *last_lsn,
+                            });
+                        }
+                    }
+                }
+            }
             // Enqueue the work while still holding the WAL lock. A leader
             // cannot fsync and apply this commit before it enters the queue.
             let commit_lsn = wal.append(RecordKind::Commit, self.txn_id, &[], false)?;
@@ -890,9 +964,18 @@ impl Drop for Txn<'_> {
     }
 }
 
+#[derive(Clone)]
 enum Op {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
+}
+
+impl Op {
+    fn key(&self) -> &[u8] {
+        match self {
+            Op::Put { key, .. } | Op::Delete { key } => key,
+        }
+    }
 }
 
 fn apply_op(state: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: Op) {
@@ -1801,21 +1884,19 @@ mod tests {
     }
 
     #[test]
-    fn commit_group_applies_in_wal_order() {
+    fn commit_group_applies_disjoint_keys() {
         let dir = TempDir::new();
         let path = dir.wal();
         let store = TxnStore::open(&path).expect("open");
 
         let mut first = store.begin().expect("begin first");
-        first.put(b"same", b"first").expect("put first");
+        first.put(b"a", b"1").expect("put first");
         let mut second = store.begin().expect("begin second");
-        second.put(b"same", b"second").expect("put second");
+        second.put(b"b", b"2").expect("put second");
         first.commit().expect("commit first");
         second.commit().expect("commit second");
 
-        assert_eq!(
-            store.get(b"same").expect("get same"),
-            Some(b"second".to_vec())
-        );
+        assert_eq!(store.get(b"a").expect("get a"), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"b").expect("get b"), Some(b"2".to_vec()));
     }
 }
