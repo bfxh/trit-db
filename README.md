@@ -5,7 +5,7 @@
 1. `tritdb-radix`：三值序列的 3/4/16 进制打包与解包；r3 走 10-bit 查表；逐位往返、非法输入结构化报错。
 2. `tritdb-page`：8 KiB 页 + 头 + CRC32；坏 magic/版本/长度/校验和/半写检测。
 3. `tritdb-format`：TRBL 块格式；20 字节头 + CRC32 + canonical padding 校验。
-4. `tritdb-wal`：TRWL 日志；32 字节段头/记录头 + CRC32；torn tail 检测与截断；LSN 单调性；段达到大小上限时在同一文件内追加新段头（归档仍是单文件）。
+4. `tritdb-wal`：TRWL 日志；32 字节段头/记录头 + CRC32；torn tail 检测与截断；LSN 单调性；段达到大小上限时轮转为 `<wal>.<lsn>.seg`，归档把各段拼成单文件。
 5. `tritdb-txn`：单 WAL 写者 + 多个并发逻辑事务；`Begin/Put/Delete/Commit/Abort`；提交组让一批 `Commit` 共享一次 fsync；恢复只应用已提交事务；checkpoint 把已提交键值写进 `<wal>.snap` 后重置 WAL；`checkpoint --archive` 把 snapshot/WAL 归档到 `<wal>.history/<lsn>.{snap,wal}`（默认保留最新 8 个，`--keep` 可改），`txn recover --to-lsn` 可只读地回到历史 LSN；`<wal>.timeidx` 记录 LSN→墙钟毫秒，`txn recover --to-time-ms` 可按时间点恢复。
 6. `tritdb-store`：8 KiB 页文件 + 页缓存（M0 无淘汰、无上限）+ WAL 页镜像 redo；提交先 fsync WAL 再写页文件；只重放已提交页；崩溃留下的半页尾会被截断；checkpoint 把已落盘页写入 `<data>.ckpt` 后重置单段 WAL。
 7. `tritdb` / `tritdb-bench`：CLI 与微基准；6 轮交错、min/median/max；带 `bin-u8` / `bin-u2` 二进制基线。

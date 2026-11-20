@@ -228,3 +228,41 @@ fn checkpoint_archive_keep_zero_disables_pruning() {
         .count();
     assert_eq!(wals, 3);
 }
+
+#[test]
+fn multi_file_segments_are_archived_and_recoverable() {
+    let dir = TempDir::new("txn-pitr-multifile");
+    let wal = dir.join("pitr.wal");
+    let store = TxnStore::open_with_wal_limit(&wal, 2048).expect("open");
+    let payload = vec![7u8; 200];
+
+    for i in 0..40 {
+        let mut txn = store.begin().expect("begin");
+        txn.put(format!("k{i}").as_bytes(), &payload).expect("put");
+        txn.commit().expect("commit");
+    }
+    let segs = std::fs::read_dir(std::path::Path::new(&wal).parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".seg"))
+        .count();
+    assert!(segs > 0, "expected rotated segments before checkpoint");
+    let info = store.checkpoint_archive().expect("archive multi-file wal");
+    drop(store);
+
+    let mut history = wal.as_os_str().to_os_string();
+    history.push(".history");
+    let archive = std::path::PathBuf::from(history).join(format!("{}.wal", info.checkpoint_lsn));
+    let raw = std::fs::read(&archive).expect("read archive");
+    let trws = raw
+        .windows(4)
+        .filter(|window| *window == tritdb_wal::SEGMENT_MAGIC)
+        .count();
+    assert!(trws > 1, "archive should contain several segment headers");
+    let scan = tritdb_wal::WalReader::open(&archive).expect("scan archive");
+    assert_eq!(scan.records.len(), 40 * 3, "begin+put+commit per txn");
+    assert!(scan.segments > 1, "archive should contain several segments");
+
+    let view = TxnStore::recover_at(&wal, u64::MAX).expect("recover");
+    assert_eq!(view.entries.len(), 40);
+}

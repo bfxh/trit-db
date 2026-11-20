@@ -322,12 +322,18 @@ struct CommitWork {
 impl TxnStore {
     /// Opens or creates a store and replays committed transactions.
     pub fn open(path: &Path) -> Result<Self, TxnError> {
+        Self::open_with_wal_limit(path, tritdb_wal::DEFAULT_SEGMENT_LIMIT)
+    }
+
+    /// Opens a store with an explicit WAL segment size (used by tests to
+    /// force multi-file rotation).
+    pub fn open_with_wal_limit(path: &Path, segment_limit: u64) -> Result<Self, TxnError> {
         let snapshot_path = snapshot_path_for(path);
         let snapshot = read_snapshot(&snapshot_path)?;
         let checkpoint_lsn = snapshot.as_ref().map_or(0, |snap| snap.checkpoint_lsn);
         let state = snapshot.map_or_else(BTreeMap::new, |snap| snap.entries);
 
-        let (wal, scan) = WalWriter::open_with_time_index(path, tritdb_wal::DEFAULT_SEGMENT_LIMIT)?;
+        let (wal, scan) = WalWriter::open_with_time_index(path, segment_limit)?;
         let recovered = recover(&scan, state, checkpoint_lsn)?;
         let next_txn_id = recovered.max_txn_id.saturating_add(1).max(1);
 
@@ -477,7 +483,7 @@ impl TxnStore {
             fs::create_dir_all(&history)?;
             let (snap_path, wal_path) = archive_paths(&history, checkpoint_lsn);
             let snap_bytes = archive_file(&self.snapshot_path, &snap_path)?;
-            let wal_bytes = archive_file(&self.path, &wal_path)?;
+            let wal_bytes = archive_segments(&wal.segment_paths()?, &wal_path)?;
             let pruned = if keep > 0 {
                 Self::prune_history(&self.path, keep)?.removed.len()
             } else {
@@ -908,6 +914,33 @@ fn archive_file(src: &Path, dst: &Path) -> Result<u64, TxnError> {
     let _ = fs::remove_file(dst);
     fs::rename(&tmp, dst)?;
     Ok(bytes)
+}
+
+/// Concatenates every WAL segment into one archive file.
+///
+/// Each source starts with its own `TRWS` header; `parse_wal` accepts a
+/// sequence of segment headers, so the archive stays a single file.
+fn archive_segments(sources: &[std::path::PathBuf], dst: &Path) -> Result<u64, TxnError> {
+    let tmp = {
+        let mut name = dst.as_os_str().to_os_string();
+        name.push(".tmp");
+        std::path::PathBuf::from(name)
+    };
+    let mut out = File::create(&tmp)?;
+    let mut total = 0u64;
+    for source in sources {
+        if !source.is_file() {
+            continue;
+        }
+        let bytes = fs::read(source)?;
+        out.write_all(&bytes)?;
+        total += bytes.len() as u64;
+    }
+    out.sync_all()?;
+    drop(out);
+    let _ = fs::remove_file(dst);
+    fs::rename(&tmp, dst)?;
+    Ok(total)
 }
 
 /// Lists archived checkpoint LSNs that have a `.wal` file.

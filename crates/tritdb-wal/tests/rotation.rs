@@ -13,6 +13,15 @@ fn headers(bytes: &[u8]) -> usize {
         .count()
 }
 
+fn rotated_segments(path: &std::path::Path) -> usize {
+    let parent = path.parent().expect("parent");
+    std::fs::read_dir(parent)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".seg"))
+        .count()
+}
+
 #[test]
 fn rotation_adds_segment_headers_and_keeps_records_readable() {
     let dir = TempDir::new("wal-rotation");
@@ -29,10 +38,10 @@ fn rotation_adds_segment_headers_and_keeps_records_readable() {
     drop(writer);
 
     let bytes = fs::read(&path).expect("read");
+    assert_eq!(headers(&bytes), 1, "active segment has one header");
     assert!(
-        headers(&bytes) > 1,
-        "expected rotation, saw {} headers",
-        headers(&bytes)
+        rotated_segments(&path) > 0,
+        "expected rotated .seg files, saw none"
     );
 
     let scan = WalReader::open(&path).expect("scan");
@@ -68,6 +77,7 @@ fn reset_drops_all_segments() {
 
     let bytes = fs::read(&path).expect("read");
     assert_eq!(headers(&bytes), 1);
+    assert_eq!(rotated_segments(&path), 0);
     let scan = WalReader::open(&path).expect("scan");
     assert_eq!(scan.first_lsn, 100);
     assert!(scan.records.is_empty());
