@@ -23,6 +23,8 @@ fn background_checkpoint_keeps_data_and_bounds_the_wal() {
         }
     }
 
+    // Give the background thread at least one tick on fast machines.
+    thread::sleep(Duration::from_millis(30));
     drop(background);
     drop(store);
 
