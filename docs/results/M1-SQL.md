@@ -1,6 +1,6 @@
 # M1 SQL 3VL：最小纵向切片读数
 
-状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / 等值 JOIN 的 hash join / `ANALYZE` 表/列统计 / 基于统计的 `Auto` join 代价选择 / 内连接/交叉连接的 `WHERE` 合取项拆分与单源下推 / 源表列裁剪（含无歧义未限定列与零列源表投影）/ 常量折叠与恒真条件简化 / 投影常量折叠 / 结构化计划树与只读 `EXPLAIN SEXPR` / `EXPLAIN ANALYZE SEXPR` 执行汇总 / 结构化 join 键与残余标志 / 结构化过滤谓词 / 结构化 join 谓词 / 结构化 join 残余谓词 / 结构化 join 非键合取项 / 结构化 HAVING 谓词 / 结构化 Aggregate 分组键与聚合项 / 结构化 Sort 键与方向 / 结构化 Project 项与表达式 / 结构化 Scan 表名与别名 / 结构化 Scan 下推谓词 / 加法 schema 迁移 `ALTER TABLE ADD COLUMN` / `EXPLAIN SELECT` 统计估算 / `EXPLAIN ANALYZE` / JOIN 策略开关 / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
+状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / 等值 JOIN 的 hash join / `ANALYZE` 表/列统计 / 基于统计的 `Auto` join 代价选择 / 内连接/交叉连接的 `WHERE` 合取项拆分与单源下推 / 源表列裁剪（含无歧义未限定列与零列源表投影）/ 常量折叠与恒真条件简化 / 投影常量折叠 / 结构化计划树与只读 `EXPLAIN SEXPR` / `EXPLAIN ANALYZE SEXPR` 执行汇总 / 结构化 join 键与残余标志 / 结构化过滤谓词 / 结构化 join 谓词 / 结构化 join 残余谓词 / 结构化 join 非键合取项 / 结构化 HAVING 谓词 / 结构化 Aggregate 分组键与聚合项 / 结构化 Sort 键与方向 / 结构化 Project 项与表达式 / 结构化 Scan 表名与别名 / 结构化 Scan 下推谓词 / parser 表达式嵌套深度上限 / 加法 schema 迁移 `ALTER TABLE ADD COLUMN` / `EXPLAIN SELECT` 统计估算 / `EXPLAIN ANALYZE` / JOIN 策略开关 / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
 日期：2026-11-20
 
 ## 1. 交付
@@ -35,6 +35,7 @@ docs/specs/SQL.md
 - `EXPLAIN ANALYZE SEXPR SELECT`：执行一次查询并返回一列 `plan`、一行文本；顶层是 `(execution :rows N :time-ms X ...)` 执行汇总，节点只携带 `:actual-rows` / `:actual-groups` 和实际耗时，不混入 `:est-rows` / `:est-groups`；join 的 `:keys` / `:residual` / `:on-expr` / `:pred` 与静态模式同形，`having` 的 `:pred`、`scan` 的 `:filter` 也保留；扫描不单独计时，limit 只有实际行数；不返回查询结果行
 - `ANALYZE [table]`：扫描表并持久化精确行数、每列 `NULL` 数和 NDV；DML 在同一事务删除旧统计，重开后可继续供 `EXPLAIN` 和 `Auto` join 选择使用
 - `EXPLAIN ANALYZE SELECT`：执行一次查询，在计划节点上追加 `actual rows`（聚合节点为 `actual groups`）和墙钟耗时；谓词下推的扫描显示过滤后的 `actual rows`，列裁剪的扫描显示 `cols=...`；末行给出 `Execution: rows=N time=Xms`，不返回查询结果行；join 节点显示本次实际选择的算法
+- 解析安全边界：表达式递归嵌套上限 64 层，括号、连续 `NOT`、连续一元负号都计入；超限返回 `expression nesting too deep` 的 parse error，不触发进程栈溢出。CLI 子进程也覆盖 512 层嵌套输入。见 [`ADR-031`](../ADR/031-parser-expression-depth-limit.md)
 - JOIN 策略开关：`JoinStrategy::{Auto, Hash, NestedLoop}`，`Auto` 有统计时比较成本，`Hash` / `NestedLoop` 强制指定执行路径，供基准和差分测试使用
 - `UPDATE ... SET column = expr [, ...] [WHERE ...]`：旧行求值、多列赋值、类型/NOT NULL 校验
 - `IN` / `NOT IN`、`BETWEEN` / `NOT BETWEEN`、`LIKE` / `NOT LIKE`：三值逻辑、NULL 传播、ASCII 大小写不敏感
@@ -66,22 +67,55 @@ sql oracle: 138/138 passed (132 SELECT, 6 UPDATE row counts)
 
 ```bash
 cargo run -p tritdb-bench --release -- sql-join --rows 1024 --rounds 3 --strategy auto
+cargo run -p tritdb-bench --release -- sql-join --rows 1024 --rounds 3 --strategy hash
 cargo run -p tritdb-bench --release -- sql-join --rows 1024 --rounds 3 --strategy nested
-cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strategy auto
-cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strategy nested
+cargo run -p tritdb-bench --release -- sql-join --rows 4096 --rounds 3 --strategy auto
+cargo run -p tritdb-bench --release -- sql-join --rows 4096 --rounds 3 --strategy hash
+cargo run -p tritdb-bench --release -- sql-join --rows 4096 --rounds 3 --strategy nested
 ```
 
 本机 Windows x86_64、release 构建：
 
 | rows | strategy | join_ms(min/med/max) | matches |
 |---:|---|---:|---:|
-| 1024 | auto | 0.667 / 0.688 / 0.951 | 1024 |
-| 1024 | nested | 67.153 / 67.560 / 67.909 | 1024 |
-| 2048 | auto | 1.048 / 1.176 / 1.187 | 2048 |
-| 2048 | nested | 269.805 / 270.439 / 270.572 | 2048 |
-| 4096 | auto | 2.147 / 2.148 / 2.327 | 4096 |
+| 1024 | auto | 0.464 / 0.472 / 0.591 | 1024 |
+| 1024 | hash | 0.461 / 0.495 / 0.653 | 1024 |
+| 1024 | nested | 66.049 / 66.075 / 66.646 | 1024 |
+| 4096 | auto | 1.859 / 1.941 / 2.327 | 4096 |
+| 4096 | hash | 1.948 / 2.018 / 2.452 | 4096 |
+| 4096 | nested | 1059.313 / 1061.002 / 1063.252 | 4096 |
 
-1024 行时 hash 比 nested 快约 98 倍；2048 行时约 230 倍。行数翻倍，nested 约 4 倍增长，hash 约 1.7 到 1.8 倍增长。读数只用于本机回归对比，不作为跨机器绝对性能承诺。
+1024 行时 hash 比 nested 快约两个数量级；4096 行时差距扩大到约 500 倍。行数翻四倍，nested 从约 66ms 增至约 1.06s，hash 从约 0.5ms 增至约 2ms。读数只用于本机回归对比，不作为跨机器绝对性能承诺。
+
+### sql-plan 计划生成基准
+
+`tritdb-bench sql-plan` 在同一份两张 `rows` 行的表上分别对三种查询生成文本计划与结构化计划：
+
+- `join`：`SELECT a.id FROM a JOIN b ON a.id = b.id`
+- `filter`：join 加两侧 `WHERE payload < 512` 下推
+- `aggregate`：join + 下推过滤 + `GROUP BY` + `ORDER BY` + `LIMIT`
+
+每个查询先预热一次，再交替测量 `EXPLAIN` 与 `EXPLAIN SEXPR`，共 5 轮，取 min/median/max。`text_chars` / `sexpr_chars` 是最后一条计划输出的字符数，不代表解析或执行结果。
+
+```bash
+cargo run -p tritdb-bench --release -- sql-plan --rows 256 --rounds 5
+cargo run -p tritdb-bench --release -- sql-plan --rows 1024 --rounds 5
+cargo run -p tritdb-bench --release -- sql-plan --rows 4096 --rounds 5
+```
+
+| rows | query | text_ms(min/med/max) | sexpr_ms(min/med/max) | text_chars | sexpr_chars |
+|---:|---|---:|---:|---:|---:|
+| 256 | join | 0.006 / 0.007 / 0.008 | 0.005 / 0.006 / 0.007 | 85 | 167 |
+| 256 | filter | 0.008 / 0.009 / 0.009 | 0.007 / 0.008 / 0.008 | 87 | 235 |
+| 256 | aggregate | 0.009 / 0.009 / 0.010 | 0.008 / 0.008 / 0.009 | 147 | 387 |
+| 1024 | join | 0.007 / 0.007 / 0.009 | 0.006 / 0.006 / 0.008 | 85 | 167 |
+| 1024 | filter | 0.009 / 0.009 / 0.009 | 0.008 / 0.008 / 0.010 | 87 | 235 |
+| 1024 | aggregate | 0.009 / 0.009 / 0.010 | 0.008 / 0.008 / 0.011 | 147 | 387 |
+| 4096 | join | 0.006 / 0.007 / 0.009 | 0.006 / 0.006 / 0.007 | 85 | 167 |
+| 4096 | filter | 0.008 / 0.008 / 0.009 | 0.008 / 0.008 / 0.010 | 87 | 235 |
+| 4096 | aggregate | 0.009 / 0.009 / 0.010 | 0.008 / 0.008 / 0.009 | 147 | 387 |
+
+`EXPLAIN` 只绑定、不扫描表，所以计划生成耗时基本不随 `rows` 增长；它衡量的是计划构造和序列化，不是查询执行。结构化输出更长（167 / 235 / 387 字符，对文本 85 / 87 / 147），但同档耗时与文本计划接近，说明当前计划规模下 S-expression 序列化没有形成数量级开销。
 
 对拍口径：
 
@@ -95,12 +129,12 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 | 层 | 新增 |
 |---|---:|
 | `tritdb-exec` 单元测试 | 12 |
-| `tritdb-sql` 单元测试 | 29 |
+| `tritdb-sql` 单元测试 | 30 |
 | `tritdb-sql` 引擎集成测试 | 54 |
-| `tritdb` SQL CLI 集成测试 | 2 |
-| **合计** | **97** |
+| `tritdb` SQL CLI 集成测试 | 3 |
+| **合计** | **99** |
 
-其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4），1 个来自 hash join 切片（复合键/NULL 键/残余谓词/非等值回退），2 个来自 EXPLAIN 切片（1 个 parser + 1 个 engine），1 个来自 EXPLAIN ANALYZE 切片（计划实际行数/分组数/耗时），3 个来自 ANALYZE 统计切片（1 个 parser + 1 个 stats 单元 + 1 个 storage 编解码），2 个来自 EXPLAIN 估算切片（统计持久化/重开与 DML 失效），1 个来自 Auto join 代价切片（小表选 nested loop、静态与实测计划一致），2 个来自谓词下推切片（单表整体下推、跨源合取项拆分与残余条件），1 个来自源表列裁剪切片（宽表 join 裁剪、`EXPLAIN`/`EXPLAIN ANALYZE` 的 `cols=`、`*`/`USING` 回退；后续无歧义未限定列扩展只改既有断言，不新增计数），1 个来自常量折叠切片（恒真 `WHERE`/`HAVING` 移除、字面 `FALSE` 估算为 0、`AND TRUE`/`OR FALSE` 后继续下推、除零错误保留），2 个来自加法 schema 迁移切片（1 个 parser + 1 个 engine：旧行 `NULL` 回填、列顺序、重开持久化、统计失效、`IF NOT EXISTS` 幂等、`NOT NULL`/重复列/未知表拒绝、空表迁移），1 个来自投影常量折叠切片（`fold_select` 内部单测；集成测试扩展既有常量折叠用例，验证 `col1`/alias 标签和投影除零错误保留，不新增 engine 测试），1 个来自零列源表投影切片（常量投影/`COUNT(*)`/`CROSS JOIN`/`FULL JOIN` 行数保持与 `cols=()`），3 个来自结构化计划切片（1 个 parser：`EXPLAIN SEXPR` 语法；2 个 engine：连接树/估算/零列的括号化输出与单值返回），1 个来自结构化 join 键切片（USING/NATURAL 列名、ON 等值对、residual/on-expr 的 `EXPLAIN SEXPR` 渲染），2 个来自 `EXPLAIN ANALYZE SEXPR` 切片（1 个 parser：`EXPLAIN ANALYZE SEXPR` 语法；1 个 engine：执行汇总、节点 actual 字段、无 est 混入、单值返回），1 个来自结构化过滤谓词切片（`Filter` 绑定表达式转 `PlanExpr`，`OR`/`<>`/`LIKE` 嵌套渲染，列索引还原为 schema 名）；结构化 join 谓词切片扩展现有 `EXPLAIN SEXPR` 断言（`ON`/`USING`/nested-loop 的完整 `:pred`），不新增测试计数；结构化 HAVING 谓词切片继续扩展同一测试（`COUNT(*)`、`SUM`、标量列谓词的 `:pred`），也不新增计数；结构化 Aggregate 分组键与聚合项切片再扩展同一测试（全局聚合空键、仅分组空聚合、`COUNT(*)` / `SUM` 去重清单），仍不新增计数；结构化 Sort 键切片继续扩展同一测试（升降序、复合键、聚合排序键与 ANALYZE 模式），也不新增计数；结构化 Project 项切片再扩展同一测试（别名聚合输出、常量投影与 ANALYZE 模式），仍不新增计数；结构化 join 残余谓词切片继续扩展 join 断言（单键/复合键拆分、`OR` 子树保留、纯等值/USING/nested-loop 不出字段），仍不新增计数；结构化 Scan 表名与别名切片再扩展同一测试（无别名表名保持原形、显式别名输出 `:alias`、文本仍为 `Scan a AS x`），仍不新增计数；结构化 Scan 下推谓词切片继续扩展同一测试（单侧与双侧 `:filter`、文本 `Scan a filtered` 保持不变），仍不新增计数；结构化 join 非键合取项切片再扩展 join 断言（同源列等值输出 `:residual-pred` 但不改历史 `:residual` 标志，文本仍无 `residual=yes`），仍不新增计数。工作区测试从 158 增至 **255 个正常测试 + 4 个 ignored 压力测试**。
+其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4），1 个来自 hash join 切片（复合键/NULL 键/残余谓词/非等值回退），2 个来自 EXPLAIN 切片（1 个 parser + 1 个 engine），1 个来自 EXPLAIN ANALYZE 切片（计划实际行数/分组数/耗时），3 个来自 ANALYZE 统计切片（1 个 parser + 1 个 stats 单元 + 1 个 storage 编解码），2 个来自 EXPLAIN 估算切片（统计持久化/重开与 DML 失效），1 个来自 Auto join 代价切片（小表选 nested loop、静态与实测计划一致），2 个来自谓词下推切片（单表整体下推、跨源合取项拆分与残余条件），1 个来自源表列裁剪切片（宽表 join 裁剪、`EXPLAIN`/`EXPLAIN ANALYZE` 的 `cols=`、`*`/`USING` 回退；后续无歧义未限定列扩展只改既有断言，不新增计数），1 个来自常量折叠切片（恒真 `WHERE`/`HAVING` 移除、字面 `FALSE` 估算为 0、`AND TRUE`/`OR FALSE` 后继续下推、除零错误保留），2 个来自加法 schema 迁移切片（1 个 parser + 1 个 engine：旧行 `NULL` 回填、列顺序、重开持久化、统计失效、`IF NOT EXISTS` 幂等、`NOT NULL`/重复列/未知表拒绝、空表迁移），1 个来自投影常量折叠切片（`fold_select` 内部单测；集成测试扩展既有常量折叠用例，验证 `col1`/alias 标签和投影除零错误保留，不新增 engine 测试），1 个来自零列源表投影切片（常量投影/`COUNT(*)`/`CROSS JOIN`/`FULL JOIN` 行数保持与 `cols=()`），3 个来自结构化计划切片（1 个 parser：`EXPLAIN SEXPR` 语法；2 个 engine：连接树/估算/零列的括号化输出与单值返回），1 个来自结构化 join 键切片（USING/NATURAL 列名、ON 等值对、residual/on-expr 的 `EXPLAIN SEXPR` 渲染），2 个来自 `EXPLAIN ANALYZE SEXPR` 切片（1 个 parser：`EXPLAIN ANALYZE SEXPR` 语法；1 个 engine：执行汇总、节点 actual 字段、无 est 混入、单值返回），1 个来自结构化过滤谓词切片（`Filter` 绑定表达式转 `PlanExpr`，`OR`/`<>`/`LIKE` 嵌套渲染，列索引还原为 schema 名）；结构化 join 谓词切片扩展现有 `EXPLAIN SEXPR` 断言（`ON`/`USING`/nested-loop 的完整 `:pred`），不新增测试计数；结构化 HAVING 谓词切片继续扩展同一测试（`COUNT(*)`、`SUM`、标量列谓词的 `:pred`），也不新增计数；结构化 Aggregate 分组键与聚合项切片再扩展同一测试（全局聚合空键、仅分组空聚合、`COUNT(*)` / `SUM` 去重清单），仍不新增计数；结构化 Sort 键切片继续扩展同一测试（升降序、复合键、聚合排序键与 ANALYZE 模式），也不新增计数；结构化 Project 项切片再扩展同一测试（别名聚合输出、常量投影与 ANALYZE 模式），仍不新增计数；结构化 join 残余谓词切片继续扩展 join 断言（单键/复合键拆分、`OR` 子树保留、纯等值/USING/nested-loop 不出字段），仍不新增计数；结构化 Scan 表名与别名切片再扩展同一测试（无别名表名保持原形、显式别名输出 `:alias`、文本仍为 `Scan a AS x`），仍不新增计数；结构化 Scan 下推谓词切片继续扩展同一测试（单侧与双侧 `:filter`、文本 `Scan a filtered` 保持不变），仍不新增计数；结构化 join 非键合取项切片再扩展 join 断言（同源列等值输出 `:residual-pred` 但不改历史 `:residual` 标志，文本仍无 `residual=yes`），仍不新增计数；解析深度安全切片新增 2 个测试（1 个 parser 单元：括号/`NOT`/一元负号超限与 32 层正常解析，1 个 SQL CLI：512 层嵌套子进程返回 parse error 而不栈溢出）。M1 相关测试从 97 增至 **99**，工作区从 255 增至 **257 个正常测试 + 4 个 ignored 压力测试**。
 
 ## 4. 负结果 / 边界
 
@@ -118,6 +152,7 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 12. **CASE 只做标量分支**：不支持子查询条件/结果；简单式 `CASE operand WHEN` 用本引擎的类型严格等值比较，探针与候选类型不同会报 `type mismatch`，而 SQLite 会落到 `ELSE`。未选中分支不求值，因此其中的除零/类型错误不会触发。
 13. **EXPLAIN 不是全局优化器**：`EXPLAIN SELECT` 只绑定不执行，计划入口会折叠不含列/聚合的常量（含 `SELECT` 项）并移除恒真 `WHERE`/`HAVING`，有 `ANALYZE` 统计时显示启发式 `est rows` / `est groups`，并按局部成本规则选择要显示的 `HashJoin` / `NestedLoop`；内连接/交叉连接的顶层 `AND` 会拆成单源合取项并在扫描节点显示 `Scan ... filtered`，`EXPLAIN SEXPR` 另以 `:filter` 输出该下推谓词，同时改变扫描估算和 join 选择；源表列裁剪会在扫描节点显示 `cols=...`，可唯一归属的未限定列也参与裁剪；零列源表显示 `cols=()`，只保留行数；歧义/未知未限定列退回完整 schema，让 binder 报原错误。`EXPLAIN ANALYZE` 会真实执行一次，显示本次 `actual`、实际选中的算法和墙钟耗时，不返回查询结果。两者都不枚举候选计划、不重排 join 顺序、不做表达式级列下推或跨 join 列需求传播；`OR` 分支与外连接谓词不拆分；常量折叠只覆盖无列/聚合表达式和四个安全布尔恒等，不做 `FALSE AND x`、`TRUE OR x`、`NOT NOT x`、常量传播或投影下推。`JoinStrategy` 是进程内 API 开关，不是 SQL hint。
 14. **迁移只做加法**：`ALTER TABLE ... ADD [COLUMN]` 只允许追加可空列；`NOT NULL`、`DEFAULT`、多列一次迁移、`DROP/RENAME/ALTER COLUMN` 均不支持。迁移在内存中复制整表、给旧行追加 `NULL`，再走 `put_table` 的单事务整表重写；大表会阻塞写者并放大 WAL/内存，失败只会停在旧表或完整新表之一。提交成功后统计立即失效，但已提交迁移没有自动回滚/降级，回退只能依赖迁移前备份或未来显式 DDL。
+15. **解析嵌套上限只保护栈深度**：括号、连续 `NOT`、连续一元负号超过 64 层会返回 `expression nesting too deep`；这不限制脚本总长度、token 总数、`IN` 列表长度或结果行数。超长但平坦的 SQL 仍可能消耗大量内存，输入配额需在执行层/调用方另做。
 
 ## 5. CI 与覆盖
 

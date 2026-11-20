@@ -35,6 +35,7 @@ fn main() {
         Some("txn-checkpoint") => run_txn_checkpoint(&args),
         Some("txn-group") => run_txn_group(&args),
         Some("sql-join") => run_sql_join(&args),
+        Some("sql-plan") => run_sql_plan(&args),
         Some("help") | Some("--help") => print_help(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
@@ -56,6 +57,7 @@ fn print_help() {
     println!("  txn-checkpoint --txns 64 --keys-per-txn 4 --rounds 3");
     println!("  txn-group --txns 256 --threads 16 --keys-per-txn 4 --rounds 3");
     println!("  sql-join --rows 1024 --rounds 3 [--strategy auto|hash|nested]");
+    println!("  sql-plan --rows 1024 --rounds 3 [--query join|filter|aggregate|all]");
 }
 
 fn run_radix(args: &[String]) {
@@ -892,27 +894,7 @@ fn run_sql_join(args: &[String]) {
     let dir = TempDir::new();
     let db = dir.0.join("sql-join.db");
     let mut engine = SqlEngine::open(&db).expect("open SQL engine");
-    let mut setup = String::new();
-    setup.push_str(
-        "CREATE TABLE a (id INT NOT NULL, payload INT); \
-                    CREATE TABLE b (id INT NOT NULL, payload INT); \
-                    INSERT INTO a VALUES ",
-    );
-    for row in 0..rows {
-        write!(&mut setup, "({row}, {row})").expect("write seed");
-        if row + 1 < rows {
-            setup.push(',');
-        }
-    }
-    setup.push_str("; INSERT INTO b VALUES ");
-    for row in 0..rows {
-        write!(&mut setup, "({row}, {row})").expect("write seed");
-        if row + 1 < rows {
-            setup.push(',');
-        }
-    }
-    setup.push(';');
-    engine.execute_script(&setup).expect("seed tables");
+    seed_join_tables(&mut engine, rows);
     engine.set_join_strategy(strategy);
 
     let query = parse_script("SELECT COUNT(*) FROM a JOIN b ON a.id = b.id;").expect("parse query");
@@ -947,6 +929,183 @@ fn run_sql_join(args: &[String]) {
         "{{\"bench_id\":\"sql_join\",\"rows\":{},\"strategy\":\"{}\",\"rounds\":{},\"join_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
         rows, name, rounds, stats.min, stats.median, stats.max, matches
     );
+}
+
+fn seed_join_tables(engine: &mut SqlEngine, rows: usize) {
+    let mut setup = String::new();
+    setup.push_str(
+        "CREATE TABLE a (id INT NOT NULL, payload INT); \
+                    CREATE TABLE b (id INT NOT NULL, payload INT); \
+                    INSERT INTO a VALUES ",
+    );
+    for row in 0..rows {
+        write!(&mut setup, "({row}, {row})").expect("write seed");
+        if row + 1 < rows {
+            setup.push(',');
+        }
+    }
+    setup.push_str("; INSERT INTO b VALUES ");
+    for row in 0..rows {
+        write!(&mut setup, "({row}, {row})").expect("write seed");
+        if row + 1 < rows {
+            setup.push(',');
+        }
+    }
+    setup.push(';');
+    engine.execute_script(&setup).expect("seed tables");
+}
+
+struct PlanBench {
+    name: &'static str,
+    text: Stats,
+    sexpr: Stats,
+    text_chars: usize,
+    sexpr_chars: usize,
+}
+
+fn run_sql_plan(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 1024);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+    let selected = arg_value(args, "--query").unwrap_or_else(|| "all".to_string());
+    let all_queries: &[(&str, &str)] = &[
+        ("join", "SELECT a.id FROM a JOIN b ON a.id = b.id"),
+        (
+            "filter",
+            "SELECT a.id FROM a JOIN b ON a.id = b.id \
+             WHERE a.payload < 512 AND b.payload < 512",
+        ),
+        (
+            "aggregate",
+            "SELECT a.id, SUM(b.payload) AS total FROM a JOIN b ON a.id = b.id \
+             WHERE a.payload < 512 GROUP BY a.id ORDER BY total DESC LIMIT 10",
+        ),
+    ];
+    let queries: Vec<_> = all_queries
+        .iter()
+        .copied()
+        .filter(|(name, _)| selected == "all" || selected == *name)
+        .collect();
+    if queries.is_empty() {
+        eprintln!("unknown --query: {selected}; expected join, filter, aggregate, or all");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-plan.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_join_tables(&mut engine, rows);
+
+    let mut results = Vec::with_capacity(queries.len());
+    for (name, sql) in queries {
+        let text_plan = parse_script(&format!("EXPLAIN {sql};")).expect("parse text explain");
+        let sexpr_plan =
+            parse_script(&format!("EXPLAIN SEXPR {sql};")).expect("parse sexpr explain");
+        let mut text_samples = Vec::with_capacity(rounds);
+        let mut sexpr_samples = Vec::with_capacity(rounds);
+        let mut text_chars = 0;
+        let mut sexpr_chars = 0;
+        engine
+            .execute_statement(&text_plan[0])
+            .expect("warm text explain");
+        engine
+            .execute_statement(&sexpr_plan[0])
+            .expect("warm sexpr explain");
+        for round in 0..rounds {
+            if round % 2 == 0 {
+                let start = Instant::now();
+                let result = engine
+                    .execute_statement(&text_plan[0])
+                    .expect("execute text explain");
+                text_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                let (_, chars) = plan_output_chars(&result);
+                text_chars = chars;
+
+                let start = Instant::now();
+                let result = engine
+                    .execute_statement(&sexpr_plan[0])
+                    .expect("execute sexpr explain");
+                sexpr_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                let (_, chars) = plan_output_chars(&result);
+                sexpr_chars = chars;
+            } else {
+                let start = Instant::now();
+                let result = engine
+                    .execute_statement(&sexpr_plan[0])
+                    .expect("execute sexpr explain");
+                sexpr_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                let (_, chars) = plan_output_chars(&result);
+                sexpr_chars = chars;
+
+                let start = Instant::now();
+                let result = engine
+                    .execute_statement(&text_plan[0])
+                    .expect("execute text explain");
+                text_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                let (_, chars) = plan_output_chars(&result);
+                text_chars = chars;
+            }
+        }
+        results.push(PlanBench {
+            name,
+            text: Stats::new(text_samples),
+            sexpr: Stats::new(sexpr_samples),
+            text_chars,
+            sexpr_chars,
+        });
+    }
+
+    println!(
+        "rows\tquery\trounds\ttext_ms(min/med/max)\tsexpr_ms(min/med/max)\ttext_chars\tsexpr_chars"
+    );
+    for bench in &results {
+        println!(
+            "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.3}/{:.3}/{:.3}\t{}\t{}",
+            rows,
+            bench.name,
+            rounds,
+            bench.text.min,
+            bench.text.median,
+            bench.text.max,
+            bench.sexpr.min,
+            bench.sexpr.median,
+            bench.sexpr.max,
+            bench.text_chars,
+            bench.sexpr_chars
+        );
+        println!(
+            "{{\"bench_id\":\"sql_plan\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"text_ms\":[{:.3},{:.3},{:.3}],\"sexpr_ms\":[{:.3},{:.3},{:.3}],\"text_chars\":{},\"sexpr_chars\":{}}}",
+            rows,
+            bench.name,
+            rounds,
+            bench.text.min,
+            bench.text.median,
+            bench.text.max,
+            bench.sexpr.min,
+            bench.sexpr.median,
+            bench.sexpr.max,
+            bench.text_chars,
+            bench.sexpr_chars
+        );
+    }
+}
+
+fn plan_output_chars(result: &QueryResult) -> (usize, usize) {
+    let QueryResult::Rows { rows, .. } = result else {
+        panic!("EXPLAIN did not return rows");
+    };
+    let mut chars = 0;
+    for row in rows {
+        for value in row {
+            if let Value::Text(text) = value {
+                chars += text.len();
+            }
+        }
+    }
+    (rows.len(), chars)
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
