@@ -223,6 +223,15 @@ pub struct Select {
     pub under_repair: Option<Vec<String>>,
 }
 
+/// A query expression: a plain `SELECT` or a nested `WITH`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Query {
+    /// Plain select.
+    Select(Box<Select>),
+    /// Nested `WITH ...`.
+    With(Box<With>),
+}
+
 /// One common table expression.
 ///
 /// `seed UNION [ALL] step`; the recursive `step` may reference `name`.
@@ -233,22 +242,23 @@ pub struct Cte {
     /// Optional explicit column names.
     pub columns: Vec<String>,
     /// Anchor query.
-    pub seed: Select,
-    /// Recursive step.
-    pub step: Select,
+    pub seed: Box<Query>,
+    /// Recursive step (`UNION [ALL] step`); `None` for a plain CTE.
+    pub step: Option<Box<Query>>,
     /// `UNION ALL` keeps duplicates; plain `UNION` removes them.
     pub union_all: bool,
 }
 
-/// `WITH [RECURSIVE] cte, ... SELECT ...`.
+/// `WITH [RECURSIVE] cte, ... <body>`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct With {
     /// `RECURSIVE` was present.
     pub recursive: bool,
     /// Common table expressions, evaluated left to right.
     pub ctes: Vec<Cte>,
-    /// Outer query.
-    pub query: Box<Select>,
+    /// Statement that consumes the CTEs: `SELECT`, `WITH`, `INSERT`, `UPDATE`,
+    /// or `DELETE`.
+    pub body: Box<Statement>,
 }
 
 /// One `SET` assignment in an `UPDATE`.
@@ -292,14 +302,16 @@ pub enum Statement {
         /// Appended column definition.
         column: ColumnDef,
     },
-    /// `INSERT INTO ... VALUES`.
+    /// `INSERT INTO ... VALUES` or `INSERT INTO ... SELECT`.
     Insert {
         /// Table name.
         table: String,
         /// Optional column list.
         columns: Option<Vec<String>>,
-        /// Rows of expressions.
+        /// Rows of expressions (`VALUES`).
         rows: Vec<Vec<Expr>>,
+        /// Row source (`INSERT ... SELECT` / `WITH ...`).
+        select: Option<Box<Query>>,
     },
     /// `SELECT count_models('<expr>'[, vars])`: exact model count over a
     /// boolean expression. This is rule-level, not `COUNT(*)`.
