@@ -3262,32 +3262,88 @@ fn eval_aggregate(
                 Ok(Value::Int(count))
             }
         },
-        AggregateKind::Sum => {
+        AggregateKind::Sum | AggregateKind::Avg => {
             let Some(expr) = input else {
-                return Err(SqlError::Unsupported(
-                    "SUM requires an argument".to_string(),
-                ));
+                return Err(SqlError::Unsupported(format!(
+                    "{} requires an argument",
+                    kind.name()
+                )));
             };
-            let mut sum: Option<i64> = None;
+            let average = kind == AggregateKind::Avg;
+            let mut mode: Option<&'static str> = None;
+            let mut sum_int = 0i64;
+            let mut sum_luk = 0u64;
+            let mut sum_nat = 0u128;
+            let mut count = 0u64;
             for row in rows {
                 match eval(expr, schema, row)? {
                     Value::Null => {}
                     Value::Int(value) => {
-                        sum = Some(
-                            sum.unwrap_or(0)
-                                .checked_add(value)
-                                .ok_or(ExecError::IntegerOverflow)?,
-                        );
+                        if mode.is_some_and(|mode| mode != "INT") {
+                            return Err(SqlError::Exec(ExecError::TypeMismatch {
+                                expected: mode.unwrap_or("INT"),
+                                actual: "INT",
+                            }));
+                        }
+                        mode = Some("INT");
+                        sum_int = sum_int
+                            .checked_add(value)
+                            .ok_or(ExecError::IntegerOverflow)?;
+                        count += 1;
+                    }
+                    Value::Lukasiewicz(value) => {
+                        if mode.is_some_and(|mode| mode != "LUKASIEWICZ") {
+                            return Err(SqlError::Exec(ExecError::TypeMismatch {
+                                expected: mode.unwrap_or("LUKASIEWICZ"),
+                                actual: "LUKASIEWICZ",
+                            }));
+                        }
+                        mode = Some("LUKASIEWICZ");
+                        sum_luk = sum_luk.saturating_add(u64::from(value));
+                        count += 1;
+                    }
+                    Value::Nat(value) => {
+                        if mode.is_some_and(|mode| mode != "NAT") {
+                            return Err(SqlError::Exec(ExecError::TypeMismatch {
+                                expected: mode.unwrap_or("NAT"),
+                                actual: "NAT",
+                            }));
+                        }
+                        mode = Some("NAT");
+                        sum_nat = sum_nat.saturating_add(u128::from(value));
+                        count += 1;
                     }
                     other => {
                         return Err(SqlError::Exec(ExecError::TypeMismatch {
-                            expected: "INT",
+                            expected: "INT/LUKASIEWICZ/NAT",
                             actual: other.type_name(),
                         }));
                     }
                 }
             }
-            Ok(sum.map_or(Value::Null, Value::Int))
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+            match mode.expect("non-empty aggregate") {
+                "INT" => Ok(Value::Int(if average {
+                    sum_int / i64::try_from(count).map_err(|_| ExecError::IntegerOverflow)?
+                } else {
+                    sum_int
+                })),
+                "LUKASIEWICZ" => {
+                    let raw = if average { sum_luk / count } else { sum_luk };
+                    Ok(Value::Lukasiewicz(raw.min(1000) as u16))
+                }
+                "NAT" => {
+                    let raw = if average {
+                        sum_nat / u128::from(count)
+                    } else {
+                        sum_nat
+                    };
+                    Ok(Value::Nat(raw.min(u128::from(u64::MAX)) as u64))
+                }
+                _ => unreachable!("mode is one of INT/LUKASIEWICZ/NAT"),
+            }
         }
         AggregateKind::Min | AggregateKind::Max => {
             let Some(expr) = input else {

@@ -7,6 +7,8 @@ pub enum AggregateKind {
     Count,
     /// `SUM(expr)`.
     Sum,
+    /// `AVG(expr)`.
+    Avg,
     /// `MIN(expr)`.
     Min,
     /// `MAX(expr)`.
@@ -19,6 +21,7 @@ impl AggregateKind {
         match self {
             AggregateKind::Count => "COUNT",
             AggregateKind::Sum => "SUM",
+            AggregateKind::Avg => "AVG",
             AggregateKind::Min => "MIN",
             AggregateKind::Max => "MAX",
         }
