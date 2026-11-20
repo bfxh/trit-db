@@ -45,6 +45,19 @@ fn sql_cli_creates_rows_and_reopens() {
         "--db",
         db,
         "--sql",
+        "ANALYZE; EXPLAIN SELECT id FROM t WHERE flag IS NULL;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("analyzed 1 table(s)"), "stdout: {text}");
+    assert!(text.contains("Scan t est rows=3"), "stdout: {text}");
+    assert!(text.contains("Filter est rows=1"), "stdout: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
         "SELECT id, flag FROM t WHERE flag IS NULL ORDER BY id;",
     ]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));

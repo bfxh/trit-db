@@ -57,6 +57,13 @@ pub enum SqlError {
         /// Human-readable reason.
         reason: String,
     },
+    /// Persisted table statistics are corrupt or do not match the table.
+    CorruptStats {
+        /// Table name.
+        table: String,
+        /// Human-readable reason.
+        reason: String,
+    },
     /// Expression evaluation error.
     Exec(ExecError),
     /// Transaction/WAL error.
@@ -109,6 +116,9 @@ impl fmt::Display for SqlError {
             SqlError::Unsupported(feature) => write!(f, "unsupported SQL: {feature}"),
             SqlError::CorruptTable { table, reason } => {
                 write!(f, "corrupt table {table}: {reason}")
+            }
+            SqlError::CorruptStats { table, reason } => {
+                write!(f, "corrupt statistics for table {table}: {reason}")
             }
             SqlError::Exec(error) => write!(f, "SQL evaluation error: {error}"),
             SqlError::Txn(error) => write!(f, "SQL transaction error: {error}"),

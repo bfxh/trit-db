@@ -1,8 +1,8 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
-    AggregateKind, Assignment, ColumnDef, Expr, Join, JoinKind, OrderBy, Select, SelectItem,
-    Statement,
+    AggregateKind, Assignment, ColumnDef, Expr, Join, JoinCondition, JoinKind, OrderBy, Select,
+    SelectItem, Statement,
 };
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -57,6 +57,18 @@ impl Parser {
         if self
             .peek()
             .is_some_and(|token| token.kind == TokenKind::Keyword(keyword))
+        {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        if self
+            .peek()
+            .is_some_and(|token| matches!(&token.kind, TokenKind::Word(value) if value == word))
         {
             self.pos += 1;
             true
@@ -121,12 +133,17 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, SqlError> {
         match self.peek().map(|token| &token.kind) {
             Some(TokenKind::Keyword(Keyword::Create)) => self.parse_create(),
+            Some(TokenKind::Keyword(Keyword::Alter)) => self.parse_alter(),
             Some(TokenKind::Keyword(Keyword::Drop)) => self.parse_drop(),
             Some(TokenKind::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(TokenKind::Keyword(Keyword::Select)) => self.parse_select(),
+            Some(TokenKind::Keyword(Keyword::Explain)) => self.parse_explain(),
+            Some(TokenKind::Keyword(Keyword::Analyze)) => self.parse_analyze(),
             Some(TokenKind::Keyword(Keyword::Update)) => self.parse_update(),
             Some(TokenKind::Keyword(Keyword::Delete)) => self.parse_delete(),
-            Some(_) => Err(self.error("expected CREATE, DROP, INSERT, SELECT, UPDATE, or DELETE")),
+            Some(_) => Err(self.error(
+                "expected CREATE, ALTER, DROP, INSERT, SELECT, EXPLAIN, ANALYZE, UPDATE, or DELETE",
+            )),
             None => Err(self.error("empty statement")),
         }
     }
@@ -182,6 +199,37 @@ impl Parser {
         Ok(Statement::DropTable { name, if_exists })
     }
 
+    fn parse_alter(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Add)?;
+        self.eat_word("column");
+        let mut if_not_exists = false;
+        if self.eat_keyword(Keyword::If) {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            if_not_exists = true;
+        }
+        let column_name = self.parse_ident()?;
+        let data_type = self.parse_type()?;
+        let not_null = if self.eat_keyword(Keyword::Not) {
+            self.expect_keyword(Keyword::Null)?;
+            true
+        } else {
+            false
+        };
+        Ok(Statement::AlterTableAddColumn {
+            name,
+            if_not_exists,
+            column: ColumnDef {
+                name: column_name,
+                data_type,
+                not_null,
+            },
+        })
+    }
+
     fn parse_insert(&mut self) -> Result<Statement, SqlError> {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
@@ -225,6 +273,34 @@ impl Parser {
         })
     }
 
+    fn parse_explain(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Explain)?;
+        let analyze = self.eat_keyword(Keyword::Analyze);
+        let sexpr = self.eat_word("sexpr");
+        let select = match self.parse_select()? {
+            Statement::Select(select) => select,
+            _ => unreachable!("parse_select always returns SELECT"),
+        };
+        Ok(if analyze && sexpr {
+            Statement::ExplainAnalyzeSexpr(select)
+        } else if analyze {
+            Statement::ExplainAnalyze(select)
+        } else if sexpr {
+            Statement::ExplainSexpr(select)
+        } else {
+            Statement::Explain(select)
+        })
+    }
+
+    fn parse_analyze(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Analyze)?;
+        let table = match self.peek().map(|token| &token.kind) {
+            Some(TokenKind::Word(_)) | Some(TokenKind::QuotedIdent(_)) => Some(self.parse_ident()?),
+            _ => None,
+        };
+        Ok(Statement::Analyze { table })
+    }
+
     fn parse_select(&mut self) -> Result<Statement, SqlError> {
         self.expect_keyword(Keyword::Select)?;
         let mut items = Vec::new();
@@ -258,10 +334,10 @@ impl Parser {
         loop {
             if matches!(
                 self.peek().map(|token| &token.kind),
-                Some(TokenKind::Keyword(Keyword::Natural | Keyword::Outer))
+                Some(TokenKind::Keyword(Keyword::Outer))
             ) {
                 return Err(SqlError::Unsupported(
-                    "only INNER, LEFT, RIGHT, FULL, and CROSS JOIN are supported".to_string(),
+                    "OUTER must follow LEFT, RIGHT, or FULL".to_string(),
                 ));
             }
 
@@ -271,11 +347,12 @@ impl Parser {
                     kind: JoinKind::Cross,
                     table: join_table,
                     alias,
-                    on: None,
+                    condition: JoinCondition::None,
                 });
                 continue;
             }
 
+            let natural = self.eat_keyword(Keyword::Natural);
             let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Inner
@@ -296,26 +373,55 @@ impl Parser {
                 JoinKind::Full
             } else if self.eat_keyword(Keyword::Join) {
                 JoinKind::Inner
+            } else if natural {
+                return Err(self.error("expected JOIN after NATURAL"));
             } else {
                 break;
             };
+
+            if natural && kind == JoinKind::Cross {
+                return Err(SqlError::Unsupported(
+                    "NATURAL CROSS JOIN is not supported".to_string(),
+                ));
+            }
+
             let (join_table, alias) = self.parse_table_ref()?;
-            let on = if kind == JoinKind::Cross {
-                if self.eat_keyword(Keyword::On) {
+            let condition = if natural {
+                if self.eat_keyword(Keyword::On) || self.eat_keyword(Keyword::Using) {
+                    return Err(self.error("NATURAL JOIN cannot take ON or USING"));
+                }
+                JoinCondition::Natural
+            } else if kind == JoinKind::Cross {
+                if self.eat_keyword(Keyword::On) || self.eat_keyword(Keyword::Using) {
                     return Err(SqlError::Unsupported(
-                        "CROSS JOIN does not take an ON clause".to_string(),
+                        "CROSS JOIN does not take ON or USING".to_string(),
                     ));
                 }
-                None
+                JoinCondition::None
+            } else if self.eat_keyword(Keyword::Using) {
+                self.expect_symbol(Symbol::LParen)?;
+                let mut columns = Vec::new();
+                loop {
+                    columns.push(self.parse_ident()?);
+                    if self.eat_symbol(Symbol::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_symbol(Symbol::RParen)?;
+                if self.eat_keyword(Keyword::On) {
+                    return Err(self.error("JOIN USING cannot take ON"));
+                }
+                JoinCondition::Using(columns)
             } else {
                 self.expect_keyword(Keyword::On)?;
-                Some(self.parse_expr()?)
+                JoinCondition::On(self.parse_expr()?)
             };
             joins.push(Join {
                 kind,
                 table: join_table,
                 alias,
-                on,
+                condition,
             });
         }
 
@@ -737,6 +843,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_alter_table_add_column() {
+        let statements = parse_script(
+            "ALTER TABLE t ADD COLUMN score INT; \
+             ALTER TABLE t ADD IF NOT EXISTS flag BOOL NOT NULL;",
+        )
+        .expect("parse alter");
+        match &statements[0] {
+            Statement::AlterTableAddColumn {
+                name,
+                if_not_exists,
+                column,
+            } => {
+                assert_eq!(name, "t");
+                assert!(!if_not_exists);
+                assert_eq!(column.name, "score");
+                assert_eq!(column.data_type, DataType::Int);
+                assert!(!column.not_null);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &statements[1] {
+            Statement::AlterTableAddColumn {
+                name,
+                if_not_exists,
+                column,
+            } => {
+                assert_eq!(name, "t");
+                assert!(if_not_exists);
+                assert_eq!(column.name, "flag");
+                assert_eq!(column.data_type, DataType::Bool);
+                assert!(column.not_null);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_update_assignments_and_where() {
         let statements = parse_script("UPDATE t SET score = score + 1, name = NULL WHERE id >= 2;")
             .expect("parse");
@@ -751,6 +894,79 @@ mod tests {
                 assert_eq!(assignments[0].column, "score");
                 assert_eq!(assignments[1].column, "name");
                 assert!(filter.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_analyze_table_or_all() {
+        let statements = parse_script("ANALYZE; ANALYZE t;").expect("parse analyze");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0], Statement::Analyze { table: None });
+        assert_eq!(
+            statements[1],
+            Statement::Analyze {
+                table: Some("t".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_explain_select() {
+        for (sql, analyze) in [
+            ("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id;", false),
+            (
+                "EXPLAIN ANALYZE SELECT a.id FROM a JOIN b ON a.id = b.id;",
+                true,
+            ),
+        ] {
+            let statements = parse_script(sql).expect("parse explain");
+            assert_eq!(statements.len(), 1);
+            match &statements[0] {
+                Statement::Explain(select) => {
+                    assert!(!analyze);
+                    assert_eq!(select.table, "a");
+                    assert_eq!(select.joins.len(), 1);
+                    assert_eq!(select.joins[0].table, "b");
+                }
+                Statement::ExplainAnalyze(select) => {
+                    assert!(analyze);
+                    assert_eq!(select.table, "a");
+                    assert_eq!(select.joins.len(), 1);
+                    assert_eq!(select.joins[0].table, "b");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_explain_sexpr_select() {
+        let statements = parse_script("EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;")
+            .expect("parse explain sexpr");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::ExplainSexpr(select) => {
+                assert_eq!(select.table, "a");
+                assert_eq!(select.joins.len(), 1);
+                assert_eq!(select.joins[0].table, "b");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_analyze_sexpr_select() {
+        let statements =
+            parse_script("EXPLAIN ANALYZE SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;")
+                .expect("parse explain analyze sexpr");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::ExplainAnalyzeSexpr(select) => {
+                assert_eq!(select.table, "a");
+                assert_eq!(select.joins.len(), 1);
+                assert_eq!(select.joins[0].table, "b");
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -928,7 +1144,7 @@ mod tests {
                     assert_eq!(select.joins.len(), expected_joins, "{sql}");
                     for join in &select.joins {
                         assert_eq!(join.kind, JoinKind::Cross, "{sql}");
-                        assert!(join.on.is_none(), "{sql}");
+                        assert_eq!(join.condition, JoinCondition::None, "{sql}");
                     }
                 }
                 other => panic!("unexpected {other:?}"),
@@ -947,16 +1163,78 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_join() {
+    fn parses_natural_joins() {
+        for (sql, expected) in [
+            ("SELECT * FROM a NATURAL JOIN b;", JoinKind::Inner),
+            ("SELECT * FROM a NATURAL INNER JOIN b;", JoinKind::Inner),
+            ("SELECT * FROM a NATURAL LEFT JOIN b;", JoinKind::Left),
+            ("SELECT * FROM a NATURAL LEFT OUTER JOIN b;", JoinKind::Left),
+            ("SELECT * FROM a NATURAL RIGHT JOIN b;", JoinKind::Right),
+            ("SELECT * FROM a NATURAL FULL OUTER JOIN b;", JoinKind::Full),
+        ] {
+            let statements = parse_script(sql).expect("parse natural join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), 1, "{sql}");
+                    assert_eq!(select.joins[0].kind, expected, "{sql}");
+                    assert_eq!(select.joins[0].condition, JoinCondition::Natural, "{sql}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_using_joins() {
+        for (sql, expected_kind, expected_columns) in [
+            (
+                "SELECT * FROM a JOIN b USING (id);",
+                JoinKind::Inner,
+                vec!["id"],
+            ),
+            (
+                "SELECT * FROM a LEFT JOIN b USING (id, code);",
+                JoinKind::Left,
+                vec!["id", "code"],
+            ),
+            (
+                "SELECT * FROM a FULL OUTER JOIN b USING (id);",
+                JoinKind::Full,
+                vec!["id"],
+            ),
+        ] {
+            let statements = parse_script(sql).expect("parse using join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), 1, "{sql}");
+                    assert_eq!(select.joins[0].kind, expected_kind, "{sql}");
+                    assert_eq!(
+                        select.joins[0].condition,
+                        JoinCondition::Using(
+                            expected_columns.iter().map(ToString::to_string).collect()
+                        ),
+                        "{sql}"
+                    );
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_join_conditions() {
         for sql in [
-            "SELECT * FROM a NATURAL JOIN b;",
+            "SELECT * FROM a NATURAL JOIN b ON a.id = b.id;",
+            "SELECT * FROM a NATURAL JOIN b USING (id);",
+            "SELECT * FROM a NATURAL CROSS JOIN b;",
+            "SELECT * FROM a CROSS JOIN b USING (id);",
+            "SELECT * FROM a JOIN b USING (id) ON a.id = b.id;",
             "SELECT * FROM a OUTER JOIN b ON a.id = b.id;",
-            "SELECT * FROM a, b NATURAL JOIN c;",
             "SELECT * FROM a, b OUTER JOIN c ON b.id = c.id;",
         ] {
-            let error = parse_script(sql).expect_err("unsupported join");
+            let error = parse_script(sql).expect_err("conflicting join");
             assert!(
-                matches!(error, SqlError::Unsupported(_)),
+                matches!(error, SqlError::Unsupported(_) | SqlError::Parse { .. }),
                 "{sql} returned {error:?}"
             );
         }

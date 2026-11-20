@@ -20,9 +20,11 @@ dependencies = [
 name = "tritdb-bench"
 version = "0.0.1"
 dependencies = [
+ "tritdb-exec",
  "tritdb-format",
  "tritdb-page",
  "tritdb-radix",
+ "tritdb-sql",
  "tritdb-store",
  "tritdb-txn",
  "tritdb-wal",

@@ -1,6 +1,6 @@
 # trit-db 测试矩阵与 CI/CD
 
-M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE 语义拆开验证。当前工作区有 **226 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 HAVING 谓词/执行汇总/加法 schema 迁移语义拆开验证。当前工作区有 **255 个正常测试 + 4 个 `#[ignore]` 压力测试**。
 
 ## 1. 分层与计数
 
@@ -13,9 +13,9 @@ M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引�
 | `tritdb-txn` | 14 | 11 model | 25 | 随机事务 + checkpoint/reopen、提交组、读者单调性、snapshot-only reopen LSN |
 | `tritdb-store` | 12 | 9 model | 21 | 页模型、abort、sidecar 截断/损坏、并发读者 |
 | `tritdb-exec` | 12 | — | 12 | 三值 AND/OR/NOT 真值表、NULL 比较、算术、IN/BETWEEN/LIKE 三值语义、CASE 短路/简单式/缺省 NULL、非布尔谓词 |
-| `tritdb-sql` | 19 | 35 engine | 54 | parser、TRSQ 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、逗号 `FROM`、空表、IN/BETWEEN/LIKE、CASE（投影/WHERE/聚合/JOIN/UPDATE）、UPDATE、聚合排序、DELETE/reopen |
+| `tritdb-sql` | 29 | 54 engine | 83 | parser、TRSQ/TRSS 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join/非等值回退、`ANALYZE` 统计持久化与 DML 失效、`Auto` join 成本选择、`WHERE` 合取项拆分与单源下推、源表列裁剪（含无歧义未限定列裁剪、歧义回退与零列源表投影）、常量折叠与恒真条件简化、投影常量折叠（`SELECT` 常量项折叠/标签保持/投影错误保留）、结构化 `PlanNode` 与 `EXPLAIN SEXPR`（文本逐字保持、括号化计划、估算与零列、结构化过滤谓词）、结构化 `JoinKeys`（USING/NATURAL 列名、ON 等值对、residual/on-expr 标志、完整 join `:pred` 的 ON/USING/nested-loop 渲染）、`Having :pred`（`COUNT(*)` / `SUM` / 标量列谓词）、`EXPLAIN ANALYZE SEXPR`（执行汇总、节点 actual 字段、无 est 混入）、加法 schema 迁移（旧行 `NULL` 回填/重开持久化/统计失效/`IF NOT EXISTS` 幂等/`NOT NULL` 拒绝）、`EXPLAIN` 估算/`EXPLAIN ANALYZE` 实际行数与耗时/策略开关、逗号 `FROM`、空表、IN/BETWEEN/LIKE、CASE（投影/WHERE/聚合/JOIN/UPDATE）、UPDATE、聚合排序、DELETE/reopen |
 | `tritdb`（集成） | — | — | 16 | CLI 4、SQL CLI 2、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
-| **合计** | **108** | **118** | **226** | 另有 4 个 ignored 压力测试 |
+| **合计** | **118** | **121** | **255** | 另有 4 个 ignored 压力测试 |
 
 `vectors` 的 5 个测试覆盖 `radix.txt`、`trbl.txt`、`page.txt`、`wal.txt`、`snapshot.txt`。向量由 Python 参考实现生成，Rust 只负责解码、重编码和语义恢复。
 
@@ -35,9 +35,9 @@ M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引�
 
 ### SQL ↔ SQLite
 
-- `tools/crosscheck/sql_oracle.py`：同一份 `CREATE TABLE` + `INSERT` 同时灌入 `tritdb-sql` 和 Python `sqlite3`；22 条基础 + 12 条扩展 + 11 条 GROUP BY/HAVING + 18 条 JOIN + 5 条 UPDATE 后查询 + 15 条 IN/BETWEEN/LIKE + 10 条 CASE + 10 条 RIGHT/FULL JOIN + 9 条 CROSS JOIN/逗号 `FROM` 共 **112 条 SELECT** 逐行一致；另对 6 条 `UPDATE` 语句比对 tritdb 返回的更新行数与 `sqlite3` 的 `rowcount`，合计 **118/118**。
+- `tools/crosscheck/sql_oracle.py`：同一份 `CREATE TABLE` + `INSERT` 同时灌入 `tritdb-sql` 和 Python `sqlite3`；22 条基础 + 12 条扩展 + 11 条 GROUP BY/HAVING + 18 条 JOIN + 5 条 UPDATE 后查询 + 15 条 IN/BETWEEN/LIKE + 10 条 CASE + 10 条 RIGHT/FULL JOIN + 9 条 CROSS JOIN/逗号 `FROM` + 15 条 NATURAL JOIN/USING + 5 条 hash join 共 **132 条 SELECT** 逐行一致；另对 6 条 `UPDATE` 语句比对 tritdb 返回的更新行数与 `sqlite3` 的 `rowcount`，合计 **138/138**。
 - 比较前归一化 `TRUE`/`FALSE` 为 `1`/`0`、`NULL` 为 `NULL`，只比较行值不比较列名；SQLite 不支持的 `IS UNKNOWN` 由 Rust 测试单独覆盖。
-- 覆盖三值 `WHERE`、`NOT`、`IS NULL`、NULL 参与比较、NULL 排序、聚合、分组、HAVING、表别名、限定列、INNER/CROSS/LEFT/RIGHT/FULL JOIN、逗号 `FROM`、自连接、空表、`LIMIT`、`UPDATE` 多列赋值/旧行求值/更新行数、`IN`/`BETWEEN`/`LIKE` 的 NULL 与通配符语义、`CASE` 的搜索式/简单式/嵌套/缺省 `NULL`。
+- 覆盖三值 `WHERE`、`NOT`、`IS NULL`、NULL 参与比较、NULL 排序、聚合、分组、HAVING、表别名、限定列、INNER/CROSS/LEFT/RIGHT/FULL JOIN、逗号 `FROM`、自连接、空表、`LIMIT`、`WHERE` 顶层 `AND` 合取项拆分与单源下推、`UPDATE` 多列赋值/旧行求值/更新行数、`IN`/`BETWEEN`/`LIKE` 的 NULL 与通配符语义、`CASE` 的搜索式/简单式/嵌套/缺省 `NULL`。
 
 ### 格式 ↔ 引擎
 
@@ -90,13 +90,13 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 | `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
 | `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
 | `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge）、`sql_oracle.py`（SQLite 3VL 对拍） |
-| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 73.19%，UPDATE 后 73.65%，谓词后 74.48%，CASE 后 75.41%，RIGHT/FULL JOIN 后 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%** |
+| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 73.19%，UPDATE 后 73.65%，谓词后 74.48%，CASE 后 75.41%，RIGHT/FULL JOIN 后 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；后续 NATURAL/USING、hash join、EXPLAIN、EXPLAIN SEXPR、EXPLAIN ANALYZE、ANALYZE、谓词下推、合取拆分、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠、投影常量折叠、结构化计划、结构化 join 键、结构化过滤谓词与 join 谓词、结构化 HAVING 谓词、加法 schema 迁移未重跑 |
 | `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。
 
 首轮扩展后 CI：<https://github.com/bfxh/trit-db/actions/runs/44595436280>（11 个 job 全绿，覆盖 Ubuntu/Windows/macOS + MSRV + Python + coverage + docs）。加入 65% 覆盖门禁后的复跑：<https://github.com/bfxh/trit-db/actions/runs/44595879346>。
-SQL 切片 CI：<https://github.com/bfxh/trit-db/actions/runs/44610635876>（GROUP BY 基线，三平台 `sql_oracle.py` 均 45/45）。INNER JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44613405869>（11 个 job 全绿，三平台 `sql_oracle.py` 均 57/57，覆盖 73.02%）。LEFT JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44615053085>（11 个 job 全绿，三平台 `sql_oracle.py` 均 63/63，覆盖 73.19%）。UPDATE CI：<https://github.com/bfxh/trit-db/actions/runs/44617974358>（11 个 job 全绿，三平台 `sql_oracle.py` 均 74/74，覆盖 73.65%）。谓词 CI：<https://github.com/bfxh/trit-db/actions/runs/44620142871>（11 个 job 全绿，三平台 `sql_oracle.py` 均 89/89，覆盖 74.48%）。CASE CI：<https://github.com/bfxh/trit-db/actions/runs/44622362833>（11 个 job 全绿，三平台 `sql_oracle.py` 均 99/99，覆盖 75.41%）。RIGHT/FULL JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44635704677>（11 个 job 全绿，三平台 `sql_oracle.py` 均 109/109，覆盖 75.59%）。CROSS JOIN/逗号 FROM CI：<https://github.com/bfxh/trit-db/actions/runs/44639115915>（11 个 job 全绿，三平台 `sql_oracle.py` 均 118/118，覆盖 75.73%）。
+SQL 切片 CI：<https://github.com/bfxh/trit-db/actions/runs/44610635876>（GROUP BY 基线，三平台 `sql_oracle.py` 均 45/45）。INNER JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44613405869>（11 个 job 全绿，三平台 `sql_oracle.py` 均 57/57，覆盖 73.02%）。LEFT JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44615053085>（11 个 job 全绿，三平台 `sql_oracle.py` 均 63/63，覆盖 73.19%）。UPDATE CI：<https://github.com/bfxh/trit-db/actions/runs/44617974358>（11 个 job 全绿，三平台 `sql_oracle.py` 均 74/74，覆盖 73.65%）。谓词 CI：<https://github.com/bfxh/trit-db/actions/runs/44620142871>（11 个 job 全绿，三平台 `sql_oracle.py` 均 89/89，覆盖 74.48%）。CASE CI：<https://github.com/bfxh/trit-db/actions/runs/44622362833>（11 个 job 全绿，三平台 `sql_oracle.py` 均 99/99，覆盖 75.41%）。RIGHT/FULL JOIN CI：<https://github.com/bfxh/trit-db/actions/runs/44635704677>（11 个 job 全绿，三平台 `sql_oracle.py` 均 109/109，覆盖 75.59%）。CROSS JOIN/逗号 FROM CI：<https://github.com/bfxh/trit-db/actions/runs/44639115915>（11 个 job 全绿，三平台 `sql_oracle.py` 均 118/118，覆盖 75.73%）。NATURAL/USING + hash join：本地 `sql_oracle.py` 138/138，三平台 CI 待推送后补。
 
 nightly stress 手动首跑：<https://github.com/bfxh/trit-db/actions/runs/44596129132>（crash matrix、txn store 压力测试 3 个 job 全绿）。
 

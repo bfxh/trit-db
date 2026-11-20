@@ -1,5 +1,5 @@
 use tritdb_exec::Value;
-use tritdb_sql::{QueryResult, SqlEngine, SqlError};
+use tritdb_sql::{JoinStrategy, QueryResult, SqlEngine, SqlError};
 use tritdb_testkit::TempDir;
 
 fn as_rows(result: &QueryResult) -> (&[String], &[Vec<Value>]) {
@@ -60,6 +60,138 @@ fn create_insert_select_and_reopen() {
             Value::Bool(true)
         ]
     );
+}
+
+#[test]
+fn alter_table_add_column_migrates_old_rows_and_invalidates_stats() {
+    let dir = TempDir::new("sql-alter-add-column");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    let seeded = engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL); \
+             INSERT INTO t VALUES (1), (2), (3); \
+             ANALYZE; \
+             EXPLAIN SELECT id FROM t;",
+        )
+        .expect("seed");
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(text) => text.clone(),
+                other => panic!("unexpected plan value: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        plan_text(&seeded[3]).contains("est rows"),
+        "expected stats-backed estimates before migration"
+    );
+
+    let altered = engine
+        .execute_script("ALTER TABLE t ADD COLUMN note TEXT;")
+        .expect("alter");
+    assert_eq!(message(&altered[0]), "added column note to table t");
+    assert!(
+        !plan_text(
+            &engine
+                .execute_script("EXPLAIN SELECT id FROM t;")
+                .expect("explain")[0]
+        )
+        .contains("est rows"),
+        "migration must invalidate stored stats"
+    );
+
+    let migrated = engine
+        .execute_script("SELECT * FROM t ORDER BY id;")
+        .expect("select migrated");
+    let (columns, rows) = as_rows(&migrated[0]);
+    assert_eq!(columns, ["id", "note"]);
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Null],
+        ]
+    );
+
+    let inserted = engine
+        .execute_script("INSERT INTO t (id, note) VALUES (4, 'd');")
+        .expect("insert after alter");
+    assert_eq!(message(&inserted[0]), "inserted 1 row(s) into t");
+
+    let duplicate = engine
+        .execute_script("ALTER TABLE t ADD COLUMN IF NOT EXISTS note TEXT;")
+        .expect("idempotent alter");
+    assert_eq!(
+        message(&duplicate[0]),
+        "column note already exists in table t"
+    );
+    let duplicate_error = engine
+        .execute_script("ALTER TABLE t ADD COLUMN note TEXT;")
+        .expect_err("duplicate without IF NOT EXISTS");
+    assert!(duplicate_error
+        .to_string()
+        .contains("duplicate column: note"));
+    let not_null = engine
+        .execute_script("ALTER TABLE t ADD COLUMN required INT NOT NULL;")
+        .expect_err("NOT NULL must be rejected");
+    assert!(not_null.to_string().contains("NOT NULL"));
+    let unknown = engine
+        .execute_script("ALTER TABLE missing ADD COLUMN note TEXT;")
+        .expect_err("unknown table");
+    assert!(unknown.to_string().contains("unknown table: missing"));
+
+    let after_failures = engine
+        .execute_script("SELECT * FROM t ORDER BY id;")
+        .expect("select after rejected migrations");
+    let (columns, rows) = as_rows(&after_failures[0]);
+    assert_eq!(columns, ["id", "note"]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[3], vec![Value::Int(4), Value::Text("d".to_string())]);
+
+    let empty = engine
+        .execute_script(
+            "CREATE TABLE empty (id INT); \
+             ALTER TABLE empty ADD COLUMN note TEXT; \
+             SELECT * FROM empty;",
+        )
+        .expect("migrate empty table");
+    assert_eq!(message(&empty[1]), "added column note to table empty");
+    let (columns, rows) = as_rows(&empty[2]);
+    assert_eq!(columns, ["id", "note"]);
+    assert!(rows.is_empty());
+
+    let empty_not_null = engine
+        .execute_script(
+            "CREATE TABLE empty_required (id INT); \
+             ALTER TABLE empty_required ADD COLUMN required INT NOT NULL;",
+        )
+        .expect_err("NOT NULL must be rejected even on an empty table");
+    assert!(empty_not_null.to_string().contains("NOT NULL"));
+
+    drop(engine);
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    assert!(
+        !plan_text(
+            &reopened
+                .execute_script("EXPLAIN SELECT id FROM t;")
+                .expect("explain")[0]
+        )
+        .contains("est rows"),
+        "migration must leave no stale stats after reopen"
+    );
+    let persisted = reopened
+        .execute_script("SELECT * FROM t ORDER BY id;")
+        .expect("select after reopen");
+    let (columns, rows) = as_rows(&persisted[0]);
+    assert_eq!(columns, ["id", "note"]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], vec![Value::Int(1), Value::Null]);
+    assert_eq!(rows[3], vec![Value::Int(4), Value::Text("d".to_string())]);
 }
 
 #[test]
@@ -1529,6 +1661,1302 @@ fn cross_join_and_comma_from_produce_cartesian_product() {
 }
 
 #[test]
+fn natural_and_using_joins_merge_columns_through_outer_joins() {
+    let dir = TempDir::new("sql-natural-using");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE l (id INT NOT NULL, code INT, lv TEXT); \
+             CREATE TABLE r (id INT, code INT, rv TEXT); \
+             CREATE TABLE s (id INT, sv TEXT); \
+             INSERT INTO l VALUES (1, 10, 'l1'), (2, 20, 'l2'), (3, 30, 'l3'); \
+             INSERT INTO r VALUES (1, 10, 'r1'), (2, 20, 'r2'), (4, 40, 'r4'); \
+             INSERT INTO s VALUES (1, 's1'), (5, 's5');",
+        )
+        .expect("seed");
+
+    let natural = engine
+        .execute_script("SELECT * FROM l NATURAL JOIN r ORDER BY id;")
+        .expect("natural join");
+    let (columns, rows) = as_rows(&natural[0]);
+    assert_eq!(columns, ["id", "code", "lv", "rv"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Text("r2".to_string()),
+            ],
+        ]
+    );
+
+    let using = engine
+        .execute_script("SELECT * FROM l JOIN r USING (id) ORDER BY id;")
+        .expect("using join");
+    let (columns, rows) = as_rows(&using[0]);
+    assert_eq!(columns, ["id", "code", "lv", "code", "rv"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+        ]
+    );
+
+    let qualified = engine
+        .execute_script(
+            "SELECT l.id AS lid, r.id AS rid \
+             FROM l RIGHT JOIN r USING (id) ORDER BY rid;",
+        )
+        .expect("qualified merged columns");
+    assert_eq!(
+        as_rows(&qualified[0]).1,
+        [
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(4), Value::Int(4)],
+        ]
+    );
+
+    let left = engine
+        .execute_script("SELECT * FROM l LEFT JOIN r USING (id) ORDER BY id;")
+        .expect("left using");
+    assert_eq!(
+        as_rows(&left[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(30),
+                Value::Text("l3".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+
+    let right = engine
+        .execute_script("SELECT * FROM l RIGHT JOIN r USING (id) ORDER BY id;")
+        .expect("right using");
+    assert_eq!(
+        as_rows(&right[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+            vec![
+                Value::Int(4),
+                Value::Null,
+                Value::Null,
+                Value::Int(40),
+                Value::Text("r4".to_string()),
+            ],
+        ]
+    );
+
+    let full = engine
+        .execute_script("SELECT * FROM l FULL JOIN r USING (id) ORDER BY id;")
+        .expect("full using");
+    assert_eq!(
+        as_rows(&full[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(30),
+                Value::Text("l3".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Int(4),
+                Value::Null,
+                Value::Null,
+                Value::Int(40),
+                Value::Text("r4".to_string()),
+            ],
+        ]
+    );
+
+    let chained = engine
+        .execute_script("SELECT * FROM l NATURAL JOIN r NATURAL JOIN s ORDER BY id;")
+        .expect("chained natural joins");
+    let (columns, rows) = as_rows(&chained[0]);
+    assert_eq!(columns, ["id", "code", "lv", "rv", "sv"]);
+    assert_eq!(
+        rows,
+        [vec![
+            Value::Int(1),
+            Value::Int(10),
+            Value::Text("l1".to_string()),
+            Value::Text("r1".to_string()),
+            Value::Text("s1".to_string()),
+        ]]
+    );
+
+    let chained_qualified = engine
+        .execute_script("SELECT l.id, r.id, s.id FROM l NATURAL JOIN r NATURAL JOIN s;")
+        .expect("chained natural qualified columns");
+    assert_eq!(
+        as_rows(&chained_qualified[0]).1,
+        [vec![Value::Int(1), Value::Int(1), Value::Int(1)]]
+    );
+}
+
+#[test]
+fn hash_join_handles_composite_null_and_residual_predicates() {
+    let dir = TempDir::new("sql-hash-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE h1 (id INT, code INT, v TEXT); \
+             CREATE TABLE h2 (id INT, code INT, w TEXT); \
+             INSERT INTO h1 VALUES (1, 10, 'a1'), (1, 20, 'a2'), (NULL, 10, 'n1'), \
+                 (2, NULL, 'n2'), (3, 30, 'a3'); \
+             INSERT INTO h2 VALUES (1, 10, 'b1'), (1, 20, 'b2'), (2, 20, 'b3'), \
+                 (NULL, 10, 'bn'), (4, 40, 'b4');",
+        )
+        .expect("seed");
+
+    let matched = engine
+        .execute_script(
+            "SELECT h1.v, h2.w FROM h1 JOIN h2 \
+             ON h1.id = h2.id AND h1.code = h2.code ORDER BY h1.v;",
+        )
+        .expect("composite hash join");
+    assert_eq!(
+        as_rows(&matched[0]).1,
+        [
+            vec![Value::Text("a1".to_string()), Value::Text("b1".to_string())],
+            vec![Value::Text("a2".to_string()), Value::Text("b2".to_string())],
+        ]
+    );
+
+    let residual = engine
+        .execute_script(
+            "SELECT h1.v, h2.w FROM h1 LEFT JOIN h2 \
+             ON h1.id = h2.id AND h1.code = h2.code AND h2.w <> 'b2' ORDER BY h1.v;",
+        )
+        .expect("residual predicate");
+    assert_eq!(
+        as_rows(&residual[0]).1,
+        [
+            vec![Value::Text("a1".to_string()), Value::Text("b1".to_string())],
+            vec![Value::Text("a2".to_string()), Value::Null],
+            vec![Value::Text("a3".to_string()), Value::Null],
+            vec![Value::Text("n1".to_string()), Value::Null],
+            vec![Value::Text("n2".to_string()), Value::Null],
+        ]
+    );
+
+    let fallback = engine
+        .execute_script("SELECT COUNT(*) FROM h1 JOIN h2 ON h1.id < h2.id;")
+        .expect("non-equi fallback");
+    assert_eq!(as_rows(&fallback[0]).1, [vec![Value::Int(6)]]);
+
+    let full = engine
+        .execute_script("SELECT COUNT(*) FROM h1 FULL JOIN h2 ON h1.id = h2.id;")
+        .expect("full hash join with null keys");
+    assert_eq!(as_rows(&full[0]).1, [vec![Value::Int(9)]]);
+}
+
+#[test]
+fn explain_sexpr_reports_structured_plan() {
+    let dir = TempDir::new("sql-explain-sexpr");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script("CREATE TABLE a (id INT, v TEXT); CREATE TABLE b (id INT, w TEXT);")
+        .expect("seed");
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain sexpr");
+    assert_eq!(as_rows(&explained[0]).0, ["plan"]);
+    assert_eq!(as_rows(&explained[0]).1.len(), 1);
+    let plan = match &as_rows(&explained[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        "(limit :limit 1\n  (sort :keys 1\n    (project (\"v\")\n      \
+         (join hash inner :keys ((\"a.id\" \"b.id\")) \
+         :pred (= (col \"a.id\") (col \"b.id\"))\n        \
+         (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
+    );
+
+    let having = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v, COUNT(*) FROM a \
+             GROUP BY a.v HAVING COUNT(*) > 1 AND a.v IS NOT NULL;",
+        )
+        .expect("explain sexpr having");
+    let having_plan = match &as_rows(&having[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        having_plan.contains(
+            "(having :pred (and (> (count :all) 1) \
+             (is-not-null (col \"a.v\")))"
+        ),
+        "unexpected plan: {having_plan}"
+    );
+    assert!(!having_plan.contains(":est-groups"), "{having_plan}");
+    assert!(!having_plan.contains(":actual-groups"), "{having_plan}");
+
+    let summed = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v, SUM(a.id) FROM a \
+             GROUP BY a.v HAVING SUM(a.id) > 2;",
+        )
+        .expect("explain sexpr having sum");
+    let summed_plan = match &as_rows(&summed[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        summed_plan.contains("(having :pred (> (sum (col \"a.id\")) 2)"),
+        "unexpected plan: {summed_plan}"
+    );
+}
+
+#[test]
+fn explain_analyze_sexpr_reports_actual_metrics() {
+    let dir = TempDir::new("sql-explain-analyze-sexpr");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (2, 'b2x'), (4, 'b4');",
+        )
+        .expect("seed");
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SEXPR SELECT a.v FROM a JOIN b \
+             ON a.id = b.id AND b.w <> 'b2x' \
+             WHERE a.id >= 1 OR b.w <> 'b2x' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain analyze sexpr");
+    let (columns, rows) = as_rows(&analyzed[0]);
+    assert_eq!(columns, ["plan"]);
+    assert_eq!(rows.len(), 1);
+    let plan = match &rows[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        plan.starts_with("(execution :rows 1 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(limit :limit 1 :actual-rows 1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(sort :keys 1 :actual-rows 2 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(project (\"v\") :actual-rows 2 :time-ms "),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains(
+            "(filter :pred (or (>= (col \"a.id\") 1) (<> (col \"b.w\") \"b2x\")) \
+             :actual-rows 2 :time-ms "
+        ),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains(
+            "(join hash inner :keys ((\"a.id\" \"b.id\")) :residual #t \
+             :pred (and (= (col \"a.id\") (col \"b.id\")) \
+             (<> (col \"b.w\") \"b2x\")) :actual-rows 2 :time-ms "
+        ),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(scan \"a\" :actual-rows 3)"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("(scan \"b\" :actual-rows 4)"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains(":est-rows"), "unexpected plan: {plan}");
+    assert!(!plan.contains("Execution:"), "unexpected plan: {plan}");
+}
+
+#[test]
+fn explain_sexpr_reports_structured_filter_predicate() {
+    let dir = TempDir::new("sql-explain-sexpr-predicate");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'skip'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'skip'), (4, 'b4');",
+        )
+        .expect("seed");
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' OR b.w LIKE 'b%';",
+        )
+        .expect("explain sexpr predicate");
+    let (_, rows) = as_rows(&explained[0]);
+    let plan = match &rows[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        "(project (\"v\")\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
+         (like (col \"b.w\") \"b%\"))\n    (join hash inner :keys ((\"a.id\" \"b.id\")) \
+         :pred (= (col \"a.id\") (col \"b.id\"))\n      \
+         (scan \"a\")\n      (scan \"b\"))))"
+    );
+}
+
+#[test]
+fn explain_sexpr_reports_structured_join_keys() {
+    fn plan_text(engine: &mut SqlEngine, sql: &str) -> String {
+        let result = engine.execute_script(sql).expect("explain sexpr");
+        let (_, rows) = as_rows(&result[0]);
+        match &rows[0][0] {
+            Value::Text(plan) => plan.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        }
+    }
+
+    let dir = TempDir::new("sql-explain-sexpr-join-keys");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script("CREATE TABLE a (id INT, code INT); CREATE TABLE b (id INT, code INT);")
+        .expect("seed");
+
+    let using = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT * FROM a LEFT JOIN b USING (id);",
+    );
+    assert!(
+        using.contains("(join hash left :keys (\"id\") :pred (= (col \"a.id\") (col \"b.id\"))"),
+        "unexpected plan: {using}"
+    );
+    assert!(!using.contains(":details"), "unexpected plan: {using}");
+
+    let residual = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id AND b.code <> 0;",
+    );
+    assert!(
+        residual.contains(
+            ":keys ((\"a.id\" \"b.id\")) :residual #t \
+             :pred (and (= (col \"a.id\") (col \"b.id\")) (<> (col \"b.code\") 0))"
+        ),
+        "unexpected plan: {residual}"
+    );
+    assert!(
+        !residual.contains(":details"),
+        "unexpected plan: {residual}"
+    );
+
+    engine.set_join_strategy(JoinStrategy::NestedLoop);
+    let nested = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;",
+    );
+    assert!(
+        nested.contains(
+            "(join nested-loop inner :on-expr #t \
+             :pred (= (col \"a.id\") (col \"b.id\"))"
+        ),
+        "unexpected plan: {nested}"
+    );
+    assert!(!nested.contains(":details"), "unexpected plan: {nested}");
+}
+
+#[test]
+fn explain_sexpr_includes_estimates_and_zero_columns() {
+    let dir = TempDir::new("sql-explain-sexpr-est");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, spare TEXT); \
+             INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+    let explained = engine
+        .execute_script("EXPLAIN SEXPR SELECT 1 AS one FROM a;")
+        .expect("explain sexpr estimates");
+    let (columns, rows) = as_rows(&explained[0]);
+    assert_eq!(columns, ["plan"]);
+    assert_eq!(rows.len(), 1);
+    let plan = match &rows[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        "(project (\"one\") :est-rows 3\n  (scan \"a\" :est-rows 3 :cols ()))"
+    );
+}
+
+#[test]
+fn explain_reports_hash_and_nested_loop_join_plans() {
+    let dir = TempDir::new("sql-explain");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE e1 (id INT, code INT, v TEXT); \
+             CREATE TABLE e2 (id INT, code INT, w TEXT);",
+        )
+        .expect("seed");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT e1.v FROM e1 JOIN e2 \
+             ON e1.id = e2.id AND e1.code = e2.code AND e2.w <> 'x' \
+             WHERE e1.v <> 'skip' ORDER BY e1.v LIMIT 2;",
+        )
+        .expect("explain hash join");
+    let plan = plan_text(&explained[0]);
+    assert_eq!(
+        plan,
+        "Limit 2\n  Sort (1 key(s))\n    Project [v]\n      \
+         HashJoin (inner) keys=(e1.id = e2.id, e1.code = e2.code) residual=yes\n        \
+         Scan e1 filtered\n        Scan e2"
+    );
+    assert_eq!(as_rows(&explained[0]).0, ["plan"]);
+
+    engine.set_join_strategy(JoinStrategy::NestedLoop);
+    let forced = engine
+        .execute_script(
+            "EXPLAIN SELECT e1.v FROM e1 JOIN e2 \
+             ON e1.id = e2.id AND e1.code = e2.code;",
+        )
+        .expect("explain nested loop");
+    let plan = plan_text(&forced[0]);
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("HashJoin"), "unexpected plan: {plan}");
+
+    engine.set_join_strategy(JoinStrategy::Auto);
+    let using = engine
+        .execute_script("EXPLAIN SELECT * FROM e1 LEFT JOIN e2 USING (id);")
+        .expect("explain using");
+    let plan = plan_text(&using[0]);
+    assert!(
+        plan.contains("HashJoin (left) keys=(id)"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [id, code, v, code, w]"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("residual"), "unexpected plan: {plan}");
+}
+
+#[test]
+fn explain_analyze_reports_actual_rows_and_times() {
+    let dir = TempDir::new("sql-explain-analyze");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (2, 'b2x'), (4, 'b4');",
+        )
+        .expect("seed");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v FROM a JOIN b \
+             ON a.id = b.id AND b.w <> 'b2x' \
+             WHERE a.id >= 1 OR b.w <> 'b2x' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain analyze join");
+    let plan = plan_text(&analyzed[0]);
+    assert_eq!(as_rows(&analyzed[0]).0, ["plan"]);
+    assert!(
+        plan.contains("Limit 1 actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Sort (1 key(s)) actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [v] actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) residual=yes actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan a actual rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b actual rows=4"),
+        "unexpected plan: {plan}"
+    );
+    let execution = plan.lines().last().expect("execution line");
+    assert!(
+        execution.starts_with("Execution: rows=1 time=") && execution.ends_with("ms"),
+        "unexpected execution line: {execution}"
+    );
+
+    let grouped = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v HAVING COUNT(*) >= 1 ORDER BY a.v LIMIT 2;",
+        )
+        .expect("explain analyze grouped join");
+    let plan = plan_text(&grouped[0]);
+    assert!(
+        plan.contains("Aggregate actual groups=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Having actual groups=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [v, n] actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) actual rows=3 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Execution: rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
+fn inner_join_pushes_single_source_where_filter_to_scan() {
+    let dir = TempDir::new("sql-pushdown");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("explain pushed filter");
+    let plan = plan_text(&explained[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        !plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;",
+        )
+        .expect("explain analyze pushed filter");
+    let plan = plan_text(&analyzed[0]);
+    assert!(
+        plan.contains("Scan a filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("Scan b actual rows=3"),
+        "unexpected plan: {plan}"
+    );
+
+    let selected = engine
+        .execute_script("SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("select pushed filter");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let right = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE b.w = 'b2';",
+        )
+        .expect("explain analyze right scan filter");
+    let plan = plan_text(&right[0]);
+    assert!(
+        plan.contains("Scan b filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan a actual rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let outer = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a LEFT JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("outer join plan");
+    let plan = plan_text(&outer[0]);
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
+
+    let mixed = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = b.id;",
+        )
+        .expect("multi-source predicate plan");
+    let plan = plan_text(&mixed[0]);
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
+}
+
+#[test]
+fn inner_join_splits_conjunctive_where_filters_across_scans() {
+    let dir = TempDir::new("sql-conjunctive-pushdown");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let split = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("explain split conjunctive filter");
+    let plan = plan_text(&split[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let split_actual = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("explain analyze split conjunctive filter");
+    let plan = plan_text(&split_actual[0]);
+    assert!(
+        plan.contains("Scan a filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let selected = engine
+        .execute_script(
+            "SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("select split conjunctive filter");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let cross = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a CROSS JOIN b \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("explain cross join conjunctive filter");
+    let plan = plan_text(&cross[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (cross) est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let same_source = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND a.v = 'a2' AND b.w = 'b2';",
+        )
+        .expect("explain same-source conjuncts");
+    let plan = plan_text(&same_source[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let residual = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.id = 2 AND a.id = b.id;",
+        )
+        .expect("explain residual conjunct");
+    let plan = plan_text(&residual[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+
+    let residual_actual = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.id = 2 AND a.id = b.id;",
+        )
+        .expect("explain analyze residual conjunct");
+    let plan = plan_text(&residual_actual[0]);
+    assert!(
+        plan.contains("Scan a filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+
+    let unsplittable = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 OR b.id = 2;",
+        )
+        .expect("explain unsplittable OR filter");
+    let plan = plan_text(&unsplittable[0]);
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
+}
+
+#[test]
+fn analyze_persists_and_explain_uses_estimates() {
+    let dir = TempDir::new("sql-analyze-explain");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    let results = engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, NULL); \
+             INSERT INTO b VALUES (1, 'p'), (2, 'q'), (2, 'r'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+    assert_eq!(message(&results[4]), "analyzed 2 table(s)");
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT a.id, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id >= 2 ORDER BY a.id LIMIT 2;",
+        )
+        .expect("explain with estimates");
+    let (columns, rows) = as_rows(&explained[0]);
+    assert_eq!(columns, ["plan"]);
+    let plan = rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        plan,
+        "Limit 2 est rows=1\n  Sort (1 key(s)) est rows=1\n    \
+         Project [id, w] est rows=1\n      \
+         NestedLoop (inner) on=expr est rows=1\n        \
+         Scan a filtered est rows=1 cols=id\n        Scan b est rows=3"
+    );
+    let grouped = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v HAVING COUNT(*) >= 1 ORDER BY a.v;",
+        )
+        .expect("explain grouped estimates");
+    let plan = as_rows(&grouped[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Aggregate est groups=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Having est groups=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [v, n] est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    drop(engine);
+
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    let explained = reopened
+        .execute_script("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id;")
+        .expect("explain after reopen");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Project [id] est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3"),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
+fn auto_join_uses_statistics_to_choose_nested_loop() {
+    let dir = TempDir::new("sql-join-cost");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let plan_text = |result: &QueryResult| {
+        as_rows(result)
+            .1
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id;")
+        .expect("explain auto join");
+    let plan = plan_text(&explained[0]);
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("HashJoin"), "unexpected plan: {plan}");
+
+    let selected = engine
+        .execute_script("SELECT a.v FROM a JOIN b ON a.id = b.id ORDER BY a.v;")
+        .expect("execute auto join");
+    let (_, rows) = as_rows(&selected[0]);
+    assert_eq!(rows.len(), 2);
+
+    let analyzed = engine
+        .execute_script("EXPLAIN ANALYZE SELECT a.v FROM a JOIN b ON a.id = b.id;")
+        .expect("explain analyze auto join");
+    let plan = plan_text(&analyzed[0]);
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+
+    engine.set_join_strategy(JoinStrategy::Hash);
+    let forced = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id;")
+        .expect("explain forced hash");
+    let plan = plan_text(&forced[0]);
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) est rows=2"),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
+fn dml_invalidates_persisted_statistics_until_next_analyze() {
+    let dir = TempDir::new("sql-analyze-invalidate");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, v TEXT); \
+             INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'); \
+             ANALYZE t;",
+        )
+        .expect("seed and analyze");
+    let explained = engine
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain before dml");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+
+    engine
+        .execute_script("INSERT INTO t VALUES (4, 'd');")
+        .expect("insert");
+    let explained = engine
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain after dml");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("est rows"), "unexpected plan: {plan}");
+    drop(engine);
+
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    let explained = reopened
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain after reopen");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("est rows"), "unexpected plan: {plan}");
+
+    let analyzed = reopened
+        .execute_script("ANALYZE t;")
+        .expect("analyze again");
+    assert_eq!(message(&analyzed[0]), "analyzed 1 table(s)");
+    let explained = reopened
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain after re-analyze");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan t est rows=4"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(reopened.execute_script("ANALYZE missing;").is_err());
+}
+
+#[test]
+fn natural_join_without_common_columns_is_cross_join_and_validates_using() {
+    let dir = TempDir::new("sql-natural-using-errors");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE l (id INT NOT NULL, code INT); \
+             CREATE TABLE x (v TEXT); \
+             CREATE TABLE s (id TEXT); \
+             INSERT INTO l VALUES (1, 10), (2, 20); \
+             INSERT INTO x VALUES ('a'), ('b'); \
+             INSERT INTO s VALUES ('1');",
+        )
+        .expect("seed");
+
+    let crossed = engine
+        .execute_script("SELECT COUNT(*) FROM l NATURAL JOIN x;")
+        .expect("natural cross");
+    assert_eq!(as_rows(&crossed[0]).1, [vec![Value::Int(4)]]);
+
+    let missing = engine
+        .execute_script("SELECT * FROM l JOIN x USING (missing);")
+        .expect_err("missing using column")
+        .to_string();
+    assert!(missing.contains("unknown column: missing"), "{missing}");
+
+    let duplicate = engine
+        .execute_script("SELECT * FROM l JOIN l AS l2 USING (id, id);")
+        .expect_err("duplicate using column")
+        .to_string();
+    assert!(
+        duplicate.contains("duplicate USING column: id"),
+        "{duplicate}"
+    );
+
+    let mismatch = engine
+        .execute_script("SELECT * FROM l JOIN s USING (id);")
+        .expect_err("using type mismatch")
+        .to_string();
+    assert!(mismatch.contains("type mismatch"), "{mismatch}");
+}
+
+#[test]
 fn cross_join_composes_with_other_joins_and_group_by() {
     let dir = TempDir::new("sql-cross-compose");
     let db = dir.join("sql.db");
@@ -1612,6 +3040,460 @@ fn cross_join_handles_empty_inputs_and_validation() {
         matches!(&unknown, SqlError::UnknownTable(name) if name == "missing"),
         "unexpected {unknown:?}"
     );
+}
+
+#[test]
+fn join_projection_prunes_unused_source_columns() {
+    let dir = TempDir::new("sql-projection");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, v TEXT, spare TEXT); \
+             CREATE TABLE b (id INT NOT NULL, w TEXT, spare TEXT); \
+             INSERT INTO a VALUES (1, 'a1', 'sa1'), (2, 'a2', 'sa2'), (3, 'a3', 'sa3'); \
+             INSERT INTO b VALUES (1, 'b1', 'sb1'), (2, 'b2', 'sb2'), (3, 'b3', 'sb3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let selected = engine
+        .execute_script("SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("select with projection");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("explain projected join");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a filtered est rows=1 cols=id,v"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3 cols=id,w"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("spare"), "unexpected plan: {plan}");
+
+    let grouped = engine
+        .execute_script(
+            "SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v ORDER BY a.v;",
+        )
+        .expect("grouped projection");
+    assert_eq!(
+        as_rows(&grouped[0]).1,
+        [
+            vec![Value::Text("a1".to_string()), Value::Int(1)],
+            vec![Value::Text("a2".to_string()), Value::Int(1)],
+            vec![Value::Text("a3".to_string()), Value::Int(1)],
+        ]
+    );
+    let grouped_plan = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v ORDER BY a.v;",
+        )
+        .expect("grouped explain");
+    let plan = as_rows(&grouped_plan[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan b est rows=3 cols=id"),
+        "unexpected plan: {plan}"
+    );
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;",
+        )
+        .expect("explain analyze projected join");
+    let plan = as_rows(&analyzed[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a filtered actual rows=1 cols=id,v"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b actual rows=3 cols=id,w"),
+        "unexpected plan: {plan}"
+    );
+
+    let wildcard = engine
+        .execute_script("EXPLAIN SELECT * FROM a JOIN b ON a.id = b.id;")
+        .expect("wildcard explain");
+    let plan = as_rows(&wildcard[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("cols="), "unexpected plan: {plan}");
+
+    let unqualified = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE v = 'a2';")
+        .expect("unqualified explain");
+    let plan = as_rows(&unqualified[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("cols=id,v"),
+        "unambiguous unqualified column should be pruned: {plan}"
+    );
+    assert!(!plan.contains("spare"), "unexpected plan: {plan}");
+    assert!(plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let unqualified_result = engine
+        .execute_script("SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE v = 'a2';")
+        .expect("unqualified projected join");
+    assert_eq!(
+        as_rows(&unqualified_result[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let single_unqualified = engine
+        .execute_script("EXPLAIN SELECT v FROM a;")
+        .expect("single unqualified explain");
+    let plan = as_rows(&single_unqualified[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("cols=v"),
+        "single-source unqualified column should be pruned: {plan}"
+    );
+    assert!(!plan.contains("spare"), "unexpected plan: {plan}");
+
+    let using = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b USING (id);")
+        .expect("using explain");
+    let plan = as_rows(&using[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("cols="), "unexpected plan: {plan}");
+
+    let single = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a WHERE a.id = 2;")
+        .expect("single table explain");
+    let plan = as_rows(&single[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a est rows=3 cols=id,v"),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
+fn zero_column_source_projection_preserves_row_multiplicity() {
+    let dir = TempDir::new("sql-zero-column");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, v TEXT, spare TEXT); \
+             CREATE TABLE b (id INT NOT NULL, w TEXT, spare TEXT); \
+             INSERT INTO a VALUES (1, 'a1', 'sa1'), (2, 'a2', 'sa2'), (3, 'a3', 'sa3'); \
+             INSERT INTO b VALUES (1, 'b1', 'sb1'), (2, 'b2', 'sb2'), (3, 'b3', 'sb3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let constants = engine
+        .execute_script("SELECT 1 AS one FROM a;")
+        .expect("constant projection");
+    let (columns, rows) = as_rows(&constants[0]);
+    assert_eq!(columns, ["one"]);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row == &[Value::Int(1)]));
+
+    let counted = engine
+        .execute_script("SELECT COUNT(*) AS n FROM a;")
+        .expect("count over zero-column source");
+    assert_eq!(as_rows(&counted[0]).1, [vec![Value::Int(3)]]);
+
+    let crossed = engine
+        .execute_script("SELECT 1 AS one FROM a CROSS JOIN b;")
+        .expect("cross join over zero-column sources");
+    assert_eq!(as_rows(&crossed[0]).1.len(), 9);
+
+    let full = engine
+        .execute_script("SELECT 1 AS one FROM a FULL JOIN b ON FALSE;")
+        .expect("outer join over zero-column sources");
+    assert_eq!(as_rows(&full[0]).1.len(), 6);
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT 1 AS one FROM a;")
+        .expect("zero-column explain");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a est rows=3 cols=()"),
+        "zero-column scan should be visible: {plan}"
+    );
+
+    let analyzed = engine
+        .execute_script("EXPLAIN ANALYZE SELECT COUNT(*) AS n FROM a;")
+        .expect("zero-column analyze");
+    let plan = as_rows(&analyzed[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a actual rows=3 cols=()"),
+        "zero-column analyzed scan should be visible: {plan}"
+    );
+}
+
+#[test]
+fn constant_folding_removes_trivial_filters_and_keeps_errors() {
+    let dir = TempDir::new("sql-constant-fold");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, v TEXT); \
+             CREATE TABLE b (id INT NOT NULL, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let all = engine
+        .execute_script("SELECT a.v FROM a ORDER BY a.id;")
+        .expect("select all");
+    assert_eq!(as_rows(&all[0]).1.len(), 3);
+
+    let projected = engine
+        .execute_script("SELECT 1 + 1, a.id FROM a ORDER BY a.id;")
+        .expect("folded projection");
+    let (columns, rows) = as_rows(&projected[0]);
+    assert_eq!(columns, ["col1", "id"]);
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Int(2), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(3)],
+        ]
+    );
+    let aliased = engine
+        .execute_script("SELECT 1 + 1 AS two, a.id FROM a ORDER BY a.id;")
+        .expect("folded aliased projection");
+    assert_eq!(as_rows(&aliased[0]).0, ["two", "id"]);
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a WHERE 1 = 1;")
+        .expect("explain true filter");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("Scan a est rows=3 cols=v"),
+        "unexpected plan: {plan}"
+    );
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a WHERE 1 = 0;")
+        .expect("explain false filter");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Filter est rows=0"),
+        "unexpected plan: {plan}"
+    );
+    let none = engine
+        .execute_script("SELECT a.v FROM a WHERE 1 = 0;")
+        .expect("false select");
+    assert!(as_rows(&none[0]).1.is_empty());
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE 1 = 1 AND a.id = 2;",
+        )
+        .expect("explain folded join filter");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3 cols=id"),
+        "unexpected plan: {plan}"
+    );
+
+    for query in [
+        "EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id WHERE a.id = 2 AND 1 = 1;",
+        "EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id WHERE 1 = 0 OR a.id = 2;",
+    ] {
+        let explained = engine.execute_script(query).expect("explain identity");
+        let plan = as_rows(&explained[0])
+            .1
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !plan.contains("Filter"),
+            "unexpected plan for {query}: {plan}"
+        );
+        assert!(
+            plan.contains("Scan a filtered est rows=1"),
+            "unexpected plan for {query}: {plan}"
+        );
+    }
+
+    let joined = engine
+        .execute_script("SELECT a.v FROM a JOIN b ON a.id = b.id WHERE 1 = 1 AND a.id = 2;")
+        .expect("folded join select");
+    assert_eq!(as_rows(&joined[0]).1, [vec![Value::Text("a2".to_string())]]);
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT a.id, COUNT(*) AS n FROM a \
+             GROUP BY a.id HAVING 1 = 1;",
+        )
+        .expect("explain true having");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("Having"), "unexpected plan: {plan}");
+    let grouped = engine
+        .execute_script(
+            "SELECT a.id, COUNT(*) AS n FROM a \
+             GROUP BY a.id HAVING 1 = 1;",
+        )
+        .expect("true having select");
+    assert_eq!(as_rows(&grouped[0]).1.len(), 3);
+
+    let error = engine
+        .execute_script("SELECT 1 / 0 AS bad FROM a;")
+        .expect_err("projection constant error must survive folding")
+        .to_string();
+    assert!(error.contains("division by zero"), "{error}");
+
+    let error = engine
+        .execute_script("SELECT a.v FROM a WHERE 1 / 0 = 2;")
+        .expect_err("constant error must survive folding")
+        .to_string();
+    assert!(error.contains("division by zero"), "{error}");
+
+    for query in [
+        "SELECT a.v FROM a WHERE TRUE OR 1 / 0 = 2;",
+        "SELECT a.v FROM a WHERE FALSE AND 1 / 0 = 2;",
+    ] {
+        let error = engine
+            .execute_script(query)
+            .expect_err("non-identity boolean terms must keep errors")
+            .to_string();
+        assert!(
+            error.contains("division by zero"),
+            "unexpected error for {query}: {error}"
+        );
+    }
 }
 
 #[test]

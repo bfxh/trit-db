@@ -6,11 +6,12 @@
 //! when they appear as scalar values.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 /// A SQL scalar value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     /// SQL `NULL`, also boolean `UNKNOWN`.
     Null,
@@ -124,12 +125,30 @@ impl Column {
 pub struct Schema {
     /// Ordered columns.
     pub columns: Vec<Column>,
+    /// Additional qualified names that resolve to an existing column. `USING`
+    /// and `NATURAL JOIN` expose one merged output column through both input
+    /// qualifiers, while `SELECT *` must still see it only once.
+    aliases: BTreeMap<String, usize>,
 }
 
 impl Schema {
     /// Creates a schema from columns.
     pub fn new(columns: Vec<Column>) -> Self {
-        Self { columns }
+        Self {
+            columns,
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    /// Adds qualified aliases that resolve to existing column indexes.
+    pub fn with_aliases(mut self, aliases: BTreeMap<String, usize>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Returns the alias map.
+    pub fn aliases(&self) -> &BTreeMap<String, usize> {
+        &self.aliases
     }
 
     /// Number of columns.
@@ -142,10 +161,14 @@ impl Schema {
         self.columns.is_empty()
     }
 
-    /// Resolves a column name exactly. The parser lowercases unquoted
-    /// identifiers and preserves quoted identifiers.
+    /// Resolves a column name exactly, then through a join alias.
+    /// The parser lowercases unquoted identifiers and preserves quoted
+    /// identifiers.
     pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|column| column.name == name)
+        self.columns
+            .iter()
+            .position(|column| column.name == name)
+            .or_else(|| self.aliases.get(name).copied())
     }
 }
 

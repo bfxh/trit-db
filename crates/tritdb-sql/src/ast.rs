@@ -161,6 +161,19 @@ pub enum JoinKind {
     Full,
 }
 
+/// Join condition.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JoinCondition {
+    /// No condition: `CROSS JOIN` and comma-separated sources.
+    None,
+    /// Explicit `ON` predicate.
+    On(Expr),
+    /// `USING (column, ...)`.
+    Using(Vec<String>),
+    /// `NATURAL JOIN`.
+    Natural,
+}
+
 /// A join clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Join {
@@ -170,8 +183,8 @@ pub struct Join {
     pub table: String,
     /// Optional alias.
     pub alias: Option<String>,
-    /// Join predicate; absent for `CROSS JOIN` and comma-separated sources.
-    pub on: Option<Expr>,
+    /// Join condition.
+    pub condition: JoinCondition,
 }
 
 /// Parsed `SELECT`.
@@ -225,6 +238,15 @@ pub enum Statement {
         /// Skip when the table is absent.
         if_exists: bool,
     },
+    /// `ALTER TABLE ... ADD [COLUMN] ...`.
+    AlterTableAddColumn {
+        /// Table name.
+        name: String,
+        /// Skip when the column already exists.
+        if_not_exists: bool,
+        /// Appended column definition.
+        column: ColumnDef,
+    },
     /// `INSERT INTO ... VALUES`.
     Insert {
         /// Table name.
@@ -236,6 +258,19 @@ pub enum Statement {
     },
     /// `SELECT`.
     Select(Select),
+    /// `EXPLAIN SELECT`.
+    Explain(Select),
+    /// `EXPLAIN SEXPR SELECT`: read-only parenthesized plan output.
+    ExplainSexpr(Select),
+    /// `EXPLAIN ANALYZE SELECT`.
+    ExplainAnalyze(Select),
+    /// `EXPLAIN ANALYZE SEXPR SELECT`: parenthesized plan plus execution totals.
+    ExplainAnalyzeSexpr(Select),
+    /// `ANALYZE [table]`: recompute exact table statistics.
+    Analyze {
+        /// Optional table name; `None` analyzes every table.
+        table: Option<String>,
+    },
     /// `DELETE FROM`.
     Delete {
         /// Table name.

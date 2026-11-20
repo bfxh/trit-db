@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；`NATURAL JOIN`、`USING`、子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN SEXPR` 只读括号化计划、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、计划入口的常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`、加法 schema 迁移（`ALTER TABLE ... ADD [COLUMN]`）、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
 
 ## 1. 范围
 
@@ -35,15 +35,16 @@ SELECT id FROM t WHERE id IN (1, 2) AND score BETWEEN 10 AND 20 AND name LIKE 'a
 SELECT id, CASE WHEN score IS NULL THEN -1 ELSE score END AS s FROM t ORDER BY id;
 SELECT id, CASE flag WHEN TRUE THEN 'yes' ELSE 'no' END AS f FROM t ORDER BY id;
 UPDATE t SET name = 'b', flag = NULL WHERE id = 2;
+ALTER TABLE t ADD COLUMN note TEXT;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN` 和 `FULL [OUTER] JOIN`；不支持 `NATURAL JOIN`、`USING` 或子查询。
+- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN SEXPR SELECT` 输出同一计划树的只读括号化表示，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；列引用可唯一归属且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪，某源表不需要任何列时投影为零列并保留行数；计划入口会折叠不含列/聚合的常量表达式（含 `SELECT` 项），并移除恒真的 `WHERE` / `HAVING`；`ALTER TABLE ... ADD [COLUMN]` 只做加法迁移，只允许可空列并整表原子重写；不支持子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
-- 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE 重写整张表。
-- 没有 pgwire、没有优化器、没有索引、没有 MVCC。
+- 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE/ALTER 重写整张表。
+- 没有 pgwire、没有全局优化器、没有索引、没有 MVCC。
 - 类型严格：不会把 TEXT 隐式转成 INT。
 
 ## 2. 词法
@@ -68,6 +69,21 @@ CREATE TABLE [IF NOT EXISTS] name (
 类型：`INT` / `INTEGER` / `BIGINT`、`TEXT` / `VARCHAR` / `STRING`、`BOOL` / `BOOLEAN`。
 `INT` 全部落入 `i64`，`VARCHAR` 不带长度。
 
+### ALTER TABLE
+
+```sql
+ALTER TABLE name ADD [COLUMN] [IF NOT EXISTS] column type;
+```
+
+- 只支持追加一个列，不支持 `DROP` / `RENAME` / `ALTER COLUMN TYPE`，也不支持一次追加多列。
+- `COLUMN` 是可省略的普通词；未引用标识符 `column` 作为列名时要写成 `"column"`。
+- 新列必须是可空列；声明 `NOT NULL` 会报 `unsupported SQL`，因为当前没有 `DEFAULT` 回填机制。
+- 旧行的新列统一填 `NULL`，新列排在原 schema 最后；空表只改 schema。
+- 不带 `IF NOT EXISTS` 的重复列报 `duplicate column`；带 `IF NOT EXISTS` 时返回 `column c already exists in table t`，不写表。
+- 迁移按整表 value 单事务重写：先完整编码新表，再提交；失败不会留下半张表，内存表只在 commit 成功返回后切换。提交成功后自动删除该表统计，下一次 `EXPLAIN` 不再显示估算，直到重新 `ANALYZE`。
+- 成功消息为 `added column c to table t`；未知表报 `unknown table`。
+- 已提交的迁移没有自动回滚；需要回退时使用迁移前备份或另做显式 DDL。完整取舍见 [`ADR-013`](../ADR/013-additive-schema-migration.md)。
+
 ### INSERT
 
 ```sql
@@ -84,7 +100,11 @@ INSERT INTO name [(column, ...)] VALUES (expr, ...) [, (expr, ...)];
 SELECT * | expr [AS alias], ...
 FROM name [AS alias]
   [ , name [AS alias]
-  | { INNER | CROSS | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] } JOIN name [AS alias] [ON predicate] ]...
+  | CROSS JOIN name [AS alias]
+  | { INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] } JOIN name [AS alias]
+      ( ON predicate | USING (column, ...) )
+  | NATURAL [INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]] JOIN name [AS alias]
+  ]...
 [WHERE predicate]
 [GROUP BY column, ...]
 [HAVING predicate]
@@ -93,20 +113,115 @@ FROM name [AS alias]
 ```
 
 - `FROM` 后可带 `AS alias` 或裸别名；别名定义限定名命名空间。
-- `JOIN` 支持 `INNER`（`JOIN` 等价于 `INNER JOIN`）、`CROSS`、`LEFT [OUTER]`、`RIGHT [OUTER]` 和 `FULL [OUTER]`，可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
-- `CROSS JOIN` 与逗号分隔的源不写 `ON`，输出左右两侧所有行组合；任一侧为空时结果为空；不补 `NULL`，也不放宽列的可空标记。`CROSS JOIN ... ON` 会报错。
-- 逗号源等价于 `CROSS JOIN`，可以和显式 JOIN 混用；`ON` 只属于显式 JOIN。混合时按书写顺序左到右累积。
+- `JOIN` 支持 `INNER`（`JOIN` 等价于 `INNER JOIN`）、`CROSS`、`LEFT [OUTER]`、`RIGHT [OUTER]`、`FULL [OUTER]`、`NATURAL` 和 `USING`，可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
+- `CROSS JOIN` 与逗号分隔的源不写 `ON`/`USING`，输出左右两侧所有行组合；任一侧为空时结果为空；不补 `NULL`，也不放宽列的可空标记。`CROSS JOIN ... ON` / `USING` 会报错。
+- 逗号源等价于 `CROSS JOIN`，可以和显式 JOIN 混用；`ON`/`USING` 只属于显式 JOIN。混合时按书写顺序左到右累积。
 - `ON` 是逐行谓词，只保留结果为 `TRUE` 的组合；`FALSE` 和 `UNKNOWN` 都不产生匹配行。`ON` 中不接受聚合或子查询。
+- `USING (col, ...)` 只接受不带限定的列名；每个列必须在左右两侧各存在且类型一致，重复列名报错。条件等价于对这些列逐列做 `=` 再用 `AND` 连接。
+- 等值 JOIN 有 hash 和 nested loop 两条候选路径：`USING`/`NATURAL` 直接用公共列，`ON` 从顶层 `AND` 中提取左右列的 `=` 作为桶键；`OR`、非等值比较、表达式键或没有等值键时只能 nested loop。`JoinStrategy::Auto` 在两侧都有 `ANALYZE` 统计时按 [`ADR-008`](../ADR/008-auto-join-cost-model.md) 的局部成本选择，缺统计时退回 hash-by-key。任一桶键为 `NULL` 时不参与匹配（`NULL = NULL` 仍是 `UNKNOWN`），因此外连接仍按未匹配行规则保留。
+- `NATURAL JOIN` 自动使用左右两侧所有同名（去掉限定前缀后）列；同名公共列按左表顺序处理，两侧无公共列时退化为 `CROSS JOIN`。`NATURAL` 不能再带 `ON` 或 `USING`。
+- `USING`/`NATURAL` 的合并列在输出 schema 中只出现一次，排在非合并左列之前；其余左列随后，其余右列最后。合并列可同时用左右两侧的限定名访问，`SELECT *` 只输出一次；未合并的同名列仍必须限定，否则报 `ambiguous column`。
 - `INNER JOIN` 只输出匹配组合；`LEFT JOIN` 对每个左行，若没有任何 `ON=TRUE` 的右行，就输出该左行并把右侧所有列置为 `NULL`。右表为空时，左表每一行都以右侧全 `NULL` 输出。
 - `RIGHT JOIN` 对每个右行，若没有任何 `ON=TRUE` 的左行，就输出该右行并把左侧所有列置为 `NULL`；左表为空时，右表每一行都以左侧全 `NULL` 输出。
 - `FULL JOIN` 先输出所有匹配组合，再补未匹配左行（右侧全 `NULL`）和未匹配右行（左侧全 `NULL`）；左右任一为空时，另一侧每一行都会被保留。
-- `LEFT`/`FULL JOIN` 的右侧列、`RIGHT`/`FULL JOIN` 的左侧列在输出 schema 中一律标记为可空；`WHERE` 在 join 之后执行，因此 `WHERE right.col IS NULL` / `WHERE left.col IS NULL` 可筛出未匹配行。
+- `LEFT`/`FULL JOIN` 的右侧非合并列、`RIGHT`/`FULL JOIN` 的左侧非合并列在输出 schema 中一律标记为可空；`USING`/`NATURAL` 合并列在 `LEFT` 保留左值、`RIGHT` 保留右值、`FULL` 两侧取非 `NULL` 值。`WHERE` 只在谓词为 `TRUE` 时保留行；外连接中 `WHERE right.col IS NULL` / `WHERE left.col IS NULL` 可筛出未匹配行。
 - 限定列写作 `alias.column`；非限定列先精确匹配，再按唯一列名解析，多表同名列必须限定，否则报 `ambiguous column`。
 - 别名/表名在同一 `FROM` 子句内必须唯一；自连接必须给同一张表分配不同别名，否则报 `duplicate table name or alias`。
-- JOIN 使用嵌套循环实现，不引入 hash join 或优化器；`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果，内存随行数乘积增长。
-- 输出列标签去掉限定前缀；`SELECT *` 在多表 join 中遇到同名列会产生重复标签。
+- hash 路径使用右表 hash 桶 + 左表探测；nested loop 路径直接做左右行对匹配；非等值 `ON`/`CROSS JOIN`/逗号源只能用嵌套循环，`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果。hash join 的桶只存右表行号，输出仍按左行优先、`RIGHT`/`FULL` 的未匹配右行最后追加，和 nested loop 的顺序一致。`ANALYZE` 统计现在参与 `Auto` 的局部 join 选择，但不重排 join 顺序，也不是全局优化器。
+- 当 join 链全部是 `INNER` / `CROSS` 时，`WHERE` 顶层（含括号嵌套）的 `AND` 会被拆成独立合取项：每个只引用一个源表、且列都显式限定（`alias.column` / `table.column`）的合取项下推到该源表扫描；同一源表的多个合取项按原顺序用 `AND` 组合。不可下推的合取项按原顺序重组为残余 `WHERE`，留在 join 后。外连接、`OR` 分支、`NOT` 内部条件、引用多个源表的单个条件、含未限定列的条件仍留在 join 后。下推只减少 join 输入行，不改变内连接/交叉连接的结果行集。完整规则见 [`ADR-009`](../ADR/009-scan-predicate-pushdown.md) 与 [`ADR-010`](../ADR/010-conjunctive-predicate-pushdown.md)。
+- 源表列裁剪是独立的物理优化：当 `SELECT` 不含 `*`、每个列引用都能静态归属到唯一源表、且 join 链不含 `USING` / `NATURAL` 时，收集 `SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY` 和 `ON` 引用的列，在源表限定阶段只保留每个源表真正需要的列。显式 qualifier 直接归属；未限定列只有在所有源表 schema 中恰好一个包含该名时才归属，匹配零个或多个源表都让整条查询退回完整 schema，由 binder 按 `unknown column` / `ambiguous column` 报错。某源表引用覆盖全部列时保持完整 schema；没有引用列时投影为零列（空 schema），只保留源表行数。出现 `*`、`USING` 或 `NATURAL` 时整条查询退回完整 schema。零列的 `CROSS JOIN` / `ON TRUE` 仍按行数乘积构造，外连接仍按原有 NULL 行路径保留被保留侧行数。裁剪只减少 join 前的行副本宽度和中间结果宽度，源表仍完整加载，扫描 I/O 不减少，结果行集、输出标签和 join 选择不变。完整规则见 [`ADR-011`](../ADR/011-source-column-pruning.md)、[`ADR-015`](../ADR/015-unqualified-column-pruning.md) 与 [`ADR-016`](../ADR/016-zero-column-source-projection.md)。
+- 常量折叠在 `SELECT` / `EXPLAIN` 的计划入口执行：递归折叠 `SELECT` 项、`WHERE`、`HAVING`、`GROUP BY`、`ORDER BY` 和 `JOIN ... ON` 中不含 `Column` / `Aggregate` 的子表达式；成功求值替换为字面量，求值失败保留原表达式，让执行阶段按原语义报错。有 alias 的投影保留 alias，裸列保留列名，无 alias 的非列/聚合投影仍命名为 `colN`，折叠不改变输出标签。只做 `TRUE AND x`、`x AND TRUE`、`FALSE OR x`、`x OR FALSE` 四个不改变求值范围的恒等；`WHERE` / `HAVING` 折叠为字面 `TRUE` 时移除该节点，字面 `FALSE` / `NULL` 保留。完整规则见 [`ADR-012`](../ADR/012-constant-folding.md) 与 [`ADR-014`](../ADR/014-projection-constant-folding.md)。
+- 执行器默认 `JoinStrategy::Auto`：有等值键时，两侧都有统计则比较 `nested_cost = left_rows * right_rows` 与 `hash_cost = right_rows + left_rows + est_output_rows`，选择成本更低者（平局保留 hash）；缺统计时有等值键走 hash，否则 nested loop。`JoinStrategy::Hash` 强制 hash，`JoinStrategy::NestedLoop` 强制嵌套循环；该开关只通过 `SqlEngine::set_join_strategy` 暴露给基准和差分测试，不是 SQL hint。
+- 输出列标签去掉限定前缀；普通多表 join 遇到同名列会产生重复标签，`USING`/`NATURAL` 的合并列不会重复输出。
 
-- `WHERE` 在 join 之后执行，只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
+### ANALYZE
+
+```sql
+ANALYZE [table];
+```
+
+- `ANALYZE table` 扫描一张表；不带表名时扫描当前所有表。未知表报 `unknown table`。
+- 统计内容：行数、每列 `NULL` 数、每列非 `NULL` 的不同值数（NDV）；空表的列统计为 0。
+- 统计是精确快照，持久化在 `sql/stats/<table>` 的 `TRSS` value 中；重开数据库后可继续供 `EXPLAIN` 和 `Auto` join 选择使用。
+- 统计只由 `ANALYZE` 写入；`CREATE`/`INSERT`/`DELETE`/`UPDATE`/`DROP` 在同一事务里删除对应统计，避免旧统计和新表内容混用。写入后不会自动刷新，必须重新 `ANALYZE`。
+- 返回消息 `analyzed N table(s)`；不带表名且没有表时返回 `analyzed 0 table(s)`。
+- 持久化与失效的设计取舍见 [`ADR-007`](../ADR/007-analyze-statistics.md)。
+
+### EXPLAIN SELECT
+
+```sql
+EXPLAIN SELECT ...;
+```
+
+- `EXPLAIN` 只接受 `SELECT`；走与真实查询相同的表解析、别名检查、常量折叠和 binder，但不执行查询、不扫描表、不写表；纯常量子表达式会在折叠阶段求值，求值失败则保留原表达式。
+- 返回单列 `plan`，每个节点一行；缩进表示父子关系。
+- 节点包括 `Scan`、`Join`、`Filter`、`Aggregate`、`Having`、`Project`、`Sort`、`Limit`；发生谓词下推时扫描节点显示为 `Scan <label> filtered`，不再生成对应的独立 `Filter` 节点；发生源表列裁剪时在该节点末尾追加 `cols=<col,...>`，零列源表显示 `cols=()`；`WHERE` / `HAVING` 折叠为字面 `TRUE` 时不生成对应 `Filter` / `Having` 节点，字面 `FALSE` / `NULL` 仍保留。
+- Join 节点显示 `HashJoin` 或 `NestedLoop` 和 join 类型；`HashJoin` 显示 `keys=(...)`，`ON` 中除等值键外还有残余谓词时显示 `residual=yes`；强制 nested loop 时显示 `NestedLoop (...) on=expr`。
+- 当查询涉及的所有源表都有 `ANALYZE` 统计时，节点追加估算：
+  - `Scan`：`est rows=N`；无下推时是统计中的精确行数，有下推时是按谓词选择率估算后的扫描输出行数；发生列裁剪时另有 `cols=<col,...>`；
+  - `HashJoin` / `NestedLoop`：`est rows=N`；
+  - `Filter`、`Project`、`Sort`：`est rows=N`；
+  - `Aggregate`、`Having`：`est groups=N`；
+  - `Limit`：`est rows=N`。
+- 估算规则是启发式的：等值 join 用 `left_rows * right_rows / max(left_ndv, right_ndv)`（复合键逐键相乘），有残余谓词再乘 0.5；非等值 join 乘 0.1；外连接至少保留被保留侧的行数。过滤 `=` 用 `1/NDV`、`IS NULL` 用 0.1、范围用 0.33、`LIKE` 用 0.1，`AND` 相乘、`OR` 取并集概率，其他谓词默认 0.5；字面 `TRUE` 为 1，字面 `FALSE` / `NULL` 为 0。下推的单源扫描过滤复用同一套选择率规则；分组数用分组列 NDV 乘积并受输入行数上限约束，`HAVING` 再乘 0.5。所有基数向上取整。
+- 没有统计时退回不带数字的静态计划；有统计时，`Auto` 的局部 join 选择、估算展示和真实执行使用同一套统计输入。下推后的扫描行数会先按 `WHERE` 谓词选择率调整，再参与 join 基数和成本选择，因此计划可能从 `HashJoin` 变为 `NestedLoop`（或相反）；估算显示所选算法，但不重排 join 顺序。
+- 该计划仍是当前执行路径的静态文本，不是全局优化器；没有统计采样、直方图、候选计划枚举、join 顺序重排、表达式级列下推或跨 join 列需求传播；也不拆分 `OR` 分支、`NOT` 内部条件或外连接谓词。顶层 `AND` 的单源合取项已按 ADR-010 分别下推，单源列需求按 ADR-011/ADR-015 裁剪（含可唯一归属的未限定列），零列源表按 ADR-016 只保留行数，常量折叠按 ADR-012/ADR-014 处理不含列/聚合的子表达式（含 `SELECT` 项）和四个安全布尔恒等。`FALSE AND x`、`TRUE OR x`、`NOT NOT x`、常量传播与投影下推均不做。
+
+### EXPLAIN SEXPR SELECT
+
+```sql
+EXPLAIN SEXPR SELECT ...;
+```
+
+- `EXPLAIN SEXPR` 走与 `EXPLAIN` 相同的折叠、下推、列裁剪、绑定和估算路径，但不执行查询；它只把同一棵 `PlanNode` 树用只读括号化形式输出。
+- `SEXPR` 只在 `EXPLAIN` 后按普通单词识别，不是全局关键字；静态 `EXPLAIN SEXPR` 与 `EXPLAIN ANALYZE SEXPR` 共用同一条解析分支，后者额外执行一次查询。
+- 返回单列 `plan`、单行文本；文本内部保留换行和缩进，便于直接作为机器可读的计划值保存。
+- join 节点形如：
+  - `ON` hash join：`(join hash inner :keys (("a.id" "b.id")) :est-rows 2 child child)`；每个键是 `("左列" "右列")` 二元列表；
+  - `USING` / `NATURAL`：`(join hash left :keys ("id" "code") child child)`；键是共享列名列表；
+  - `ON` 有等值键之外的谓词时追加 `:residual #t`；强制 nested loop 时显示 `:on-expr #t`；
+  - 有绑定谓词时追加 `:pred <PlanExpr>`，表示完整的 `ON` / `USING` / `NATURAL` 连接条件；`ON` hash 的等值键会同时出现在 `:keys` 与 `:pred` 中；
+  - 没有键、残余、`on=expr` 或谓词时省略对应字段；不再输出 `:details` 字符串列表。
+- `filter` / `having` 节点形如 `(filter :pred (or (= (col "a.id") 1) (like (col "b.w") "b%")) :est-rows N child)`、`(having :pred (> (count :all) 1) :est-groups N child)`。谓词是嵌套列表：`(col "name")`、字面量（整数、`"text"`、`#t` / `#f` / `null`）、`(<op> left right)`、`(not expr)`、`(is-null expr)` / `(is-not-null expr)`、`(is-truth expr true|false|unknown)` / `(is-not-truth ...)`、`(in expr (value ...))` / `(not-in ...)`、`(between expr low high)` / `(not-between ...)`、`(like expr pattern)` / `(not-like ...)`、`(case [:operand expr] (when cond then) ... [:else expr])`。运算符使用 `and` / `or` / `=` / `<>` / `<` / `<=` / `>` / `>=` / `+` / `-` / `*` / `/`。`having` 还允许 `(count :all)`（`COUNT(*)`）、`(count expr)`、`(sum expr)`、`(min expr)`、`(max expr)`。
+- 谓词的列索引在绑定后转回 schema 列名；`EXPLAIN` 文本仍不显示谓词，文本格式不变。
+- 算法为 `hash` 或 `nested-loop`；键、残余标志和 `on-expr` 直接来自 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 字段，输出格式见 ADR-019；`:pred` 来自 ADR-022，按左右表拼接 schema 绑定，列索引还原为列名。
+- `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :pred <PlanExpr> :est-groups N child)`；
+  - `(project ("v" "n") :est-rows N child)`、`(sort :keys 1 :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
+- 静态模式只输出估算，不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。`EXPLAIN ANALYZE SEXPR` 在同一个树外增加 `(execution ...)` 汇总，节点改用 actual 字段，见下节。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md)、[`ADR-021`](../ADR/021-structured-filter-predicate.md)、[`ADR-022`](../ADR/022-structured-join-predicate.md) 与 [`ADR-023`](../ADR/023-structured-having-predicate.md)。
+
+### EXPLAIN ANALYZE SELECT
+
+```sql
+EXPLAIN ANALYZE SELECT ...;
+```
+
+- 只接受 `SELECT`；真实执行一次查询，但不返回查询结果行，只返回单列 `plan`。
+- 在静态计划的节点上追加运行时统计（有 `ANALYZE` 统计时也不混入 `est`）：
+  - `Scan`：`actual rows=N`；发生下推时节点为 `Scan <label> filtered`，`N` 是扫描过滤后的行数；发生列裁剪时另有 `cols=<col,...>`；
+  - `HashJoin` / `NestedLoop`：`actual rows=N time=Xms`；
+  - `Filter`、`Project`、`Sort`：`actual rows=N time=Xms`；
+  - `Aggregate`、`Having`：`actual groups=N time=Xms`；
+  - `Limit`：`actual rows=N`。
+- 末行 `Execution: rows=N time=Xms`：`rows` 是最终输出行数，`time` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间，不含计划文本渲染。
+- 节点耗时是单次运行测量：Join 只计 `join_tables`，Filter/Aggregate/Having/Project/Sort 分别计对应阶段；`Scan` 不单独计时。
+- 这不是全局代价模型；耗时受机器负载影响，只用于观察当前执行路径。`EXPLAIN SELECT` 的 `est` 是统计估算和 `Auto` 选择结果，`EXPLAIN ANALYZE` 的 `actual` 是本次执行实测，并显示执行时实际选中的 `HashJoin` / `NestedLoop`；下推后的过滤行数会同时影响两侧的静态估算和实测成本选择。
+
+### EXPLAIN ANALYZE SEXPR SELECT
+
+```sql
+EXPLAIN ANALYZE SEXPR SELECT ...;
+```
+
+- 与 `EXPLAIN ANALYZE` 走同一次真实执行、同一套节点统计和同一棵 `PlanNode` 树，但不返回查询结果行，只返回单列 `plan`、单行文本。
+- 顶层增加执行汇总：`(execution :rows N :time-ms X`，其中 `N` 是最终输出行数，`X` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间；汇总字段与文本格式末行 `Execution:` 同源。
+- 节点只输出实际字段：`Scan` 为 `:actual-rows`，`HashJoin` / `NestedLoop` 为 `:actual-rows` 和 `:time-ms`，`Filter` / `Project` / `Sort` 为 `:actual-rows` 和 `:time-ms`，`Aggregate` / `Having` 为 `:actual-groups` 和 `:time-ms`，`Limit` 只有 `:actual-rows`；`Scan` 不单独计时。
+- 不再输出 `:est-rows` / `:est-groups`，避免估算与实际混在同一棵树；join 的 `:keys` / `:residual` / `:on-expr` / `:pred` 仍按 ADR-019 / ADR-022 输出，`having` 的 `:pred` 仍按 ADR-023 输出。
+- 格式和边界见 [`ADR-020`](../ADR/020-explain-analyze-sexpr.md)。
+
+### 查询语义
+
+- `WHERE` 只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。计划入口先折叠不含列/聚合的常量，恒真 `WHERE` 直接移除；内连接/交叉连接会把顶层（含括号嵌套）的 `AND` 拆成合取项，单个显式限定的单源条件在 join 前下推到该源表扫描；外连接、`OR` 分支、`NOT` 内部条件、多源单条件和未限定列仍在 join 后求值。源表列裁剪按 ADR-011/ADR-015 执行：显式限定列直接归属，未限定列只在全源唯一时归属，歧义或未知列回退完整 schema。
 - `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
 - `HAVING` 在分组聚合之后、投影/排序之前执行，只保留 `TRUE`；可以引用分组键和聚合表达式，不能引用未分组列。
 - `SELECT` 聚合项支持 `COUNT(*)`、`COUNT(expr)`、`SUM(expr)`、`MIN(expr)`、`MAX(expr)`；分组查询中的裸列必须是 `GROUP BY` 列，标量表达式只能引用分组列。
@@ -219,10 +334,34 @@ per row:
 - 表值走 `TxnStore` 的 `Begin/Put/Commit`，因此复用 WAL、提交组、快照 checkpoint 和崩溃恢复。
 - 每次写重写整表；大表会产生明显写放大，这是 M1 语义切片的已知边界。
 
+`ANALYZE` 统计 key：
+
+```text
+sql/stats/<table-name>
+```
+
+value 是 `TRSS` v0：
+
+```text
+0..4    "TRSS"
+4       version = 0
+5..13   u64 LE row_count
+13..17  u32 column_count
+per column:
+  u32   name_len
+  bytes name
+  u64 LE null_count
+  u64 LE distinct_non_null_count
+```
+
+- 解码时校验 magic/version/截断/trailing bytes、列名与表 schema 一致、`null_count <= row_count`、`distinct <= row_count - null_count`、`row_count` 与表值一致。
+- 统计只由 `ANALYZE` 写入；表的 `CREATE/INSERT/DELETE/UPDATE` 与统计删除在同一事务提交，`DROP` 同时删除表与统计 key。
+
 ## 6. CLI
 
 ```bash
 tritdb sql --db sql.db --sql "CREATE TABLE t (id INT); INSERT INTO t VALUES (1);"
+tritdb sql --db sql.db --sql "ANALYZE; EXPLAIN SELECT id FROM t WHERE id >= 1;"
 tritdb sql --db sql.db --sql "SELECT * FROM t;"
 tritdb sql --db sql.db --file script.sql
 ```
@@ -231,6 +370,7 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 118/118 项通过（112 条 SELECT + 6 条 UPDATE 行数）。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`、`EXPLAIN SEXPR` 与 `JoinKeys`、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）；`ANALYZE`/计划输出不做 SQLite 对拍。
+- `tritdb-bench sql-join` 提供可复现的规模基准；本机 1024 行时 hash 中位 0.688ms、nested 67.560ms。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。
