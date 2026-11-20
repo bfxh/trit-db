@@ -2053,6 +2053,69 @@ fn analyze_persists_and_explain_uses_estimates() {
 }
 
 #[test]
+fn auto_join_uses_statistics_to_choose_nested_loop() {
+    let dir = TempDir::new("sql-join-cost");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let plan_text = |result: &QueryResult| {
+        as_rows(result)
+            .1
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id;")
+        .expect("explain auto join");
+    let plan = plan_text(&explained[0]);
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("HashJoin"), "unexpected plan: {plan}");
+
+    let selected = engine
+        .execute_script("SELECT a.v FROM a JOIN b ON a.id = b.id ORDER BY a.v;")
+        .expect("execute auto join");
+    let (_, rows) = as_rows(&selected[0]);
+    assert_eq!(rows.len(), 2);
+
+    let analyzed = engine
+        .execute_script("EXPLAIN ANALYZE SELECT a.v FROM a JOIN b ON a.id = b.id;")
+        .expect("explain analyze auto join");
+    let plan = plan_text(&analyzed[0]);
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+
+    engine.set_join_strategy(JoinStrategy::Hash);
+    let forced = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id;")
+        .expect("explain forced hash");
+    let plan = plan_text(&forced[0]);
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) est rows=2"),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
 fn dml_invalidates_persisted_statistics_until_next_analyze() {
     let dir = TempDir::new("sql-analyze-invalidate");
     let db = dir.join("sql.db");

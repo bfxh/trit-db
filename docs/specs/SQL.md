@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
 
 ## 1. 范围
 
@@ -102,7 +102,7 @@ FROM name [AS alias]
 - 逗号源等价于 `CROSS JOIN`，可以和显式 JOIN 混用；`ON`/`USING` 只属于显式 JOIN。混合时按书写顺序左到右累积。
 - `ON` 是逐行谓词，只保留结果为 `TRUE` 的组合；`FALSE` 和 `UNKNOWN` 都不产生匹配行。`ON` 中不接受聚合或子查询。
 - `USING (col, ...)` 只接受不带限定的列名；每个列必须在左右两侧各存在且类型一致，重复列名报错。条件等价于对这些列逐列做 `=` 再用 `AND` 连接。
-- 等值 JOIN 优先走 hash join：`USING`/`NATURAL` 直接用公共列，`ON` 从顶层 `AND` 中提取左右列的 `=` 作为桶键；右表建桶、左表探测。`OR`、非等值比较、表达式键或没有等值键时回退 nested loop。任一桶键为 `NULL` 时不参与匹配（`NULL = NULL` 仍是 `UNKNOWN`），因此外连接仍按未匹配行规则保留。
+- 等值 JOIN 有 hash 和 nested loop 两条候选路径：`USING`/`NATURAL` 直接用公共列，`ON` 从顶层 `AND` 中提取左右列的 `=` 作为桶键；`OR`、非等值比较、表达式键或没有等值键时只能 nested loop。`JoinStrategy::Auto` 在两侧都有 `ANALYZE` 统计时按 [`ADR-008`](../ADR/008-auto-join-cost-model.md) 的局部成本选择，缺统计时退回 hash-by-key。任一桶键为 `NULL` 时不参与匹配（`NULL = NULL` 仍是 `UNKNOWN`），因此外连接仍按未匹配行规则保留。
 - `NATURAL JOIN` 自动使用左右两侧所有同名（去掉限定前缀后）列；同名公共列按左表顺序处理，两侧无公共列时退化为 `CROSS JOIN`。`NATURAL` 不能再带 `ON` 或 `USING`。
 - `USING`/`NATURAL` 的合并列在输出 schema 中只出现一次，排在非合并左列之前；其余左列随后，其余右列最后。合并列可同时用左右两侧的限定名访问，`SELECT *` 只输出一次；未合并的同名列仍必须限定，否则报 `ambiguous column`。
 - `INNER JOIN` 只输出匹配组合；`LEFT JOIN` 对每个左行，若没有任何 `ON=TRUE` 的右行，就输出该左行并把右侧所有列置为 `NULL`。右表为空时，左表每一行都以右侧全 `NULL` 输出。
@@ -111,8 +111,8 @@ FROM name [AS alias]
 - `LEFT`/`FULL JOIN` 的右侧非合并列、`RIGHT`/`FULL JOIN` 的左侧非合并列在输出 schema 中一律标记为可空；`USING`/`NATURAL` 合并列在 `LEFT` 保留左值、`RIGHT` 保留右值、`FULL` 两侧取非 `NULL` 值。`WHERE` 在 join 之后执行，因此 `WHERE right.col IS NULL` / `WHERE left.col IS NULL` 可筛出未匹配行。
 - 限定列写作 `alias.column`；非限定列先精确匹配，再按唯一列名解析，多表同名列必须限定，否则报 `ambiguous column`。
 - 别名/表名在同一 `FROM` 子句内必须唯一；自连接必须给同一张表分配不同别名，否则报 `duplicate table name or alias`。
-- 等值 JOIN 使用右表 hash 桶 + 左表探测；非等值 `ON`/`CROSS JOIN`/逗号源仍用嵌套循环，`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果。hash join 的桶只存右表行号，输出仍按左行优先、`RIGHT`/`FULL` 的未匹配右行最后追加，和 nested loop 的顺序一致；`ANALYZE` 统计只供估算展示，尚未反向影响执行策略，也不引入优化器或代价模型。
-- 执行器默认 `JoinStrategy::Auto`：有等值键走 hash，否则 nested loop。`JoinStrategy::Hash` 与 `Auto` 在当前有键时行为相同，`JoinStrategy::NestedLoop` 强制嵌套循环；该开关只通过 `SqlEngine::set_join_strategy` 暴露给基准和差分测试，不是 SQL hint。
+- hash 路径使用右表 hash 桶 + 左表探测；nested loop 路径直接做左右行对匹配；非等值 `ON`/`CROSS JOIN`/逗号源只能用嵌套循环，`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果。hash join 的桶只存右表行号，输出仍按左行优先、`RIGHT`/`FULL` 的未匹配右行最后追加，和 nested loop 的顺序一致。`ANALYZE` 统计现在参与 `Auto` 的局部 join 选择，但不重排 join 顺序，也不是全局优化器。
+- 执行器默认 `JoinStrategy::Auto`：有等值键时，两侧都有统计则比较 `nested_cost = left_rows * right_rows` 与 `hash_cost = right_rows + left_rows + est_output_rows`，选择成本更低者（平局保留 hash）；缺统计时有等值键走 hash，否则 nested loop。`JoinStrategy::Hash` 强制 hash，`JoinStrategy::NestedLoop` 强制嵌套循环；该开关只通过 `SqlEngine::set_join_strategy` 暴露给基准和差分测试，不是 SQL hint。
 - 输出列标签去掉限定前缀；普通多表 join 遇到同名列会产生重复标签，`USING`/`NATURAL` 的合并列不会重复输出。
 
 ### ANALYZE
@@ -123,7 +123,7 @@ ANALYZE [table];
 
 - `ANALYZE table` 扫描一张表；不带表名时扫描当前所有表。未知表报 `unknown table`。
 - 统计内容：行数、每列 `NULL` 数、每列非 `NULL` 的不同值数（NDV）；空表的列统计为 0。
-- 统计是精确快照，持久化在 `sql/stats/<table>` 的 `TRSS` value 中；重开数据库后可继续供 `EXPLAIN` 使用。
+- 统计是精确快照，持久化在 `sql/stats/<table>` 的 `TRSS` value 中；重开数据库后可继续供 `EXPLAIN` 和 `Auto` join 选择使用。
 - 统计只由 `ANALYZE` 写入；`CREATE`/`INSERT`/`DELETE`/`UPDATE`/`DROP` 在同一事务里删除对应统计，避免旧统计和新表内容混用。写入后不会自动刷新，必须重新 `ANALYZE`。
 - 返回消息 `analyzed N table(s)`；不带表名且没有表时返回 `analyzed 0 table(s)`。
 - 持久化与失效的设计取舍见 [`ADR-007`](../ADR/007-analyze-statistics.md)。
@@ -145,8 +145,8 @@ EXPLAIN SELECT ...;
   - `Aggregate`、`Having`：`est groups=N`；
   - `Limit`：`est rows=N`。
 - 估算规则是启发式的：等值 join 用 `left_rows * right_rows / max(left_ndv, right_ndv)`（复合键逐键相乘），有残余谓词再乘 0.5；非等值 join 乘 0.1；外连接至少保留被保留侧的行数。过滤 `=` 用 `1/NDV`、`IS NULL` 用 0.1、范围用 0.33、`LIKE` 用 0.1，`AND` 相乘、`OR` 取并集概率，其他谓词默认 0.5。分组数用分组列 NDV 乘积并受输入行数上限约束，`HAVING` 再乘 0.5。所有基数向上取整。
-- 没有统计时退回不带数字的静态计划；估算只用于展示，不选择 join 策略，也不改变执行路径。
-- 该计划仍是当前执行路径的静态文本，不是优化器或代价模型；没有统计采样、直方图和候选计划比较。
+- 没有统计时退回不带数字的静态计划；有统计时，`Auto` 的局部 join 选择、估算展示和真实执行使用同一套统计输入。估算会显示所选的 `HashJoin` 或 `NestedLoop`，但不重排 join 顺序。
+- 该计划仍是当前执行路径的静态文本，不是全局优化器；没有统计采样、直方图、候选计划枚举或基于代价的 join 顺序重排。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -163,7 +163,7 @@ EXPLAIN ANALYZE SELECT ...;
   - `Limit`：`actual rows=N`。
 - 末行 `Execution: rows=N time=Xms`：`rows` 是最终输出行数，`time` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间，不含计划文本渲染。
 - 节点耗时是单次运行测量：Join 只计 `join_tables`，Filter/Aggregate/Having/Project/Sort 分别计对应阶段；`Scan` 不单独计时。
-- 这不是代价模型；耗时受机器负载影响，只用于观察当前执行路径。`EXPLAIN SELECT` 的 `est` 是统计估算，`EXPLAIN ANALYZE` 的 `actual` 是本次执行实测。
+- 这不是全局代价模型；耗时受机器负载影响，只用于观察当前执行路径。`EXPLAIN SELECT` 的 `est` 是统计估算和 `Auto` 选择结果，`EXPLAIN ANALYZE` 的 `actual` 是本次执行实测，并显示执行时实际选中的 `HashJoin` / `NestedLoop`。
 
 - `WHERE` 在 join 之后执行，只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
 - `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
@@ -314,7 +314,7 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
 - Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）；`ANALYZE`/计划输出不做 SQLite 对拍。
 - `tritdb-bench sql-join` 提供可复现的规模基准；本机 1024 行时 hash 中位 0.688ms、nested 67.560ms。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

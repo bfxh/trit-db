@@ -37,7 +37,9 @@ pub enum QueryResult {
 /// JOIN execution strategy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JoinStrategy {
-    /// Use hash join when equi-keys are available, otherwise nested loop.
+    /// Use hash join when equi-keys are available; otherwise nested loop.
+    /// When both sides have `ANALYZE` statistics, compare the two join costs
+    /// instead of always choosing hash.
     #[default]
     Auto,
     /// Prefer hash join when equi-keys are available.
@@ -52,6 +54,7 @@ struct ExecutionStats {
     scan_rows: Vec<usize>,
     join_rows: Vec<usize>,
     join_ms: Vec<f64>,
+    join_uses_hash: Vec<bool>,
     filter_rows: usize,
     filter_ms: f64,
     aggregate_groups: usize,
@@ -71,12 +74,21 @@ struct ExecutionStats {
 struct PlanEstimate {
     scan_rows: Vec<u64>,
     join_rows: Vec<u64>,
+    join_uses_hash: Vec<bool>,
     filter_rows: u64,
     aggregate_groups: u64,
     having_groups: u64,
     project_rows: u64,
     sort_rows: u64,
     output_rows: u64,
+}
+
+/// NDV inputs for one join cost decision.
+#[derive(Clone, Copy)]
+struct JoinStats<'a> {
+    left_ndvs: &'a [u64],
+    right_ndvs: &'a [u64],
+    available: bool,
 }
 
 /// A SQL engine backed by one [`TxnStore`].
@@ -550,6 +562,19 @@ impl SqlEngine {
                 .iter()
                 .map(|column| column.distinct)
                 .collect::<Vec<_>>();
+            let uses_hash = choose_join_algorithm(
+                self.join_strategy,
+                join.kind,
+                left_rows,
+                right_stats.rows as f64,
+                &hash_pairs,
+                predicate.as_ref(),
+                JoinStats {
+                    left_ndvs: &left_ndvs,
+                    right_ndvs: &right_ndvs,
+                    available: true,
+                },
+            );
             let join_rows = estimate_join_rows(
                 join.kind,
                 left_rows,
@@ -570,6 +595,7 @@ impl SqlEngine {
             left_rows = join_rows;
             estimate.scan_rows.push(right_stats.rows);
             estimate.join_rows.push(ceil_estimate(join_rows));
+            estimate.join_uses_hash.push(uses_hash);
         }
 
         let bound = bind_select(select, &left_table)?;
@@ -640,24 +666,57 @@ impl SqlEngine {
         if let Some(stats) = stats.as_deref_mut() {
             stats.scan_rows.push(left.rows.len());
         }
+        let mut stats_available = self.stats.contains_key(&left.name);
+        let mut left_ndvs = self
+            .stats
+            .get(&left.name)
+            .map(|stats| {
+                stats
+                    .columns
+                    .iter()
+                    .map(|column| column.distinct)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut joined = qualify_table(left, &left_qualifier);
         for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.scan_rows.push(right.rows.len());
             }
+            let right_ndvs = self
+                .stats
+                .get(&right.name)
+                .map(|stats| {
+                    stats
+                        .columns
+                        .iter()
+                        .map(|column| column.distinct)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let has_stats = stats_available && self.stats.contains_key(&right.name);
             let start = stats.is_some().then(Instant::now);
             let right = qualify_table(right, &qualifier);
-            joined = join_tables(
+            let (joined_table, output_sources, uses_hash) = join_tables(
                 &joined,
                 &right,
                 &join.condition,
                 join.kind,
                 self.join_strategy,
+                JoinStats {
+                    left_ndvs: &left_ndvs,
+                    right_ndvs: &right_ndvs,
+                    available: has_stats,
+                },
             )?;
+            joined = joined_table;
             if let (Some(stats), Some(start)) = (stats.as_deref_mut(), start) {
                 stats.join_rows.push(joined.rows.len());
                 stats.join_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                stats.join_uses_hash.push(uses_hash);
             }
+            left_ndvs = join_output_ndvs(&output_sources, &left_ndvs, &right_ndvs);
+            stats_available = has_stats;
         }
         Ok(joined)
     }
@@ -711,7 +770,12 @@ impl SqlEngine {
                     .unwrap_or_default(),
                 JoinCondition::None => Vec::new(),
             };
-            let uses_hash = use_hash_join(self.join_strategy, &hash_pairs);
+            let uses_hash = stats
+                .and_then(|stats| stats.join_uses_hash.get(join_index).copied())
+                .or_else(|| {
+                    estimates.and_then(|estimate| estimate.join_uses_hash.get(join_index).copied())
+                })
+                .unwrap_or_else(|| use_hash_join(self.join_strategy, &hash_pairs));
             let mut header = join_plan_header(
                 join,
                 uses_hash,
@@ -1254,6 +1318,53 @@ fn use_hash_join(strategy: JoinStrategy, pairs: &[(usize, usize)]) -> bool {
     }
 }
 
+/// One hash-build row, one hash-probe row, and one output row are treated as
+/// comparable units. This is deliberately a local join heuristic, not a
+/// global optimizer: nested loop performs `left * right` predicate probes,
+/// while hash join builds the right side and probes the left side.
+const HASH_BUILD_ROW_COST: f64 = 1.0;
+const HASH_PROBE_ROW_COST: f64 = 1.0;
+const HASH_OUTPUT_ROW_COST: f64 = 1.0;
+
+fn choose_join_algorithm(
+    strategy: JoinStrategy,
+    kind: JoinKind,
+    left_rows: f64,
+    right_rows: f64,
+    hash_pairs: &[(usize, usize)],
+    predicate: Option<&ExecExpr>,
+    stats: JoinStats<'_>,
+) -> bool {
+    if hash_pairs.is_empty() {
+        return false;
+    }
+    match strategy {
+        JoinStrategy::Hash => true,
+        JoinStrategy::NestedLoop => false,
+        JoinStrategy::Auto => {
+            // Without statistics the historical fallback is hash-by-key.
+            if !stats.available {
+                return true;
+            }
+            let output_rows = estimate_join_rows(
+                kind,
+                left_rows,
+                right_rows,
+                hash_pairs,
+                stats.left_ndvs,
+                stats.right_ndvs,
+                predicate,
+            );
+            let hash_cost = right_rows * HASH_BUILD_ROW_COST
+                + left_rows * HASH_PROBE_ROW_COST
+                + output_rows * HASH_OUTPUT_ROW_COST;
+            let nested_cost = left_rows * right_rows;
+            // Ties keep the historical hash-by-key default.
+            hash_cost <= nested_cost
+        }
+    }
+}
+
 fn ceil_estimate(value: f64) -> u64 {
     if value.is_finite() {
         value.max(0.0).ceil() as u64
@@ -1554,7 +1665,8 @@ fn join_tables(
     condition: &JoinCondition,
     kind: JoinKind,
     strategy: JoinStrategy,
-) -> Result<Table, SqlError> {
+    stats: JoinStats<'_>,
+) -> Result<(Table, Vec<JoinSource>, bool), SqlError> {
     let pairs = match condition {
         JoinCondition::Using(names) => using_pairs(left, right, names)?,
         JoinCondition::Natural => natural_pairs(left, right)?,
@@ -1584,7 +1696,16 @@ fn join_tables(
             .unwrap_or_default(),
         JoinCondition::None => Vec::new(),
     };
-    let rows = if use_hash_join(strategy, &hash_pairs) {
+    let uses_hash = choose_join_algorithm(
+        strategy,
+        kind,
+        left.rows.len() as f64,
+        right.rows.len() as f64,
+        &hash_pairs,
+        predicate.as_ref(),
+        stats,
+    );
+    let rows = if uses_hash {
         hash_join_rows(
             left,
             right,
@@ -1604,11 +1725,15 @@ fn join_tables(
             &pair_schema,
         )?
     };
-    Ok(Table {
-        name: format!("{}+{}", left.name, right.name),
-        schema,
-        rows,
-    })
+    Ok((
+        Table {
+            name: format!("{}+{}", left.name, right.name),
+            schema,
+            rows,
+        },
+        sources,
+        uses_hash,
+    ))
 }
 
 fn passes_filter(filter: Option<&ExecExpr>, schema: &Schema, row: &Row) -> Result<bool, SqlError> {
