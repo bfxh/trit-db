@@ -10,7 +10,9 @@ use tritdb_exec::{
 };
 use tritdb_txn::TxnStore;
 
-use crate::ast::{AggregateKind, Assignment, Join, JoinCondition, JoinKind, Select, Statement};
+use crate::ast::{
+    AggregateKind, Assignment, Expr, Join, JoinCondition, JoinKind, Select, Statement,
+};
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
@@ -52,6 +54,7 @@ pub enum JoinStrategy {
 #[derive(Debug, Default)]
 struct ExecutionStats {
     scan_rows: Vec<usize>,
+    scan_filters: Vec<bool>,
     join_rows: Vec<usize>,
     join_ms: Vec<f64>,
     join_uses_hash: Vec<bool>,
@@ -81,6 +84,17 @@ struct PlanEstimate {
     project_rows: u64,
     sort_rows: u64,
     output_rows: u64,
+}
+
+/// A single-table `WHERE` predicate moved to one source scan.
+#[derive(Clone, Debug)]
+struct PushdownPlan {
+    /// Source index in base-table + join order.
+    source: Option<usize>,
+    /// Predicate to bind against that source's qualified schema.
+    filter: Option<Expr>,
+    /// Part of the original filter that remains above the join.
+    residual: Option<Expr>,
 }
 
 /// NDV inputs for one join cost decision.
@@ -424,8 +438,10 @@ impl SqlEngine {
     }
 
     fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {
-        let table = self.build_from(select)?;
-        let plan = bind_select(select, &table)?;
+        let pushdown = plan_filter_pushdown(select);
+        let table = self.build_from(select, &pushdown)?;
+        let filtered_select = select_with_filter(select, pushdown.residual.clone());
+        let plan = bind_select(&filtered_select, &table)?;
         execute_select(&table, &plan)
     }
 
@@ -469,25 +485,30 @@ impl SqlEngine {
     }
 
     fn explain(&self, select: &Select, analyze: bool) -> Result<QueryResult, SqlError> {
+        let pushdown = plan_filter_pushdown(select);
+        let filtered_select = select_with_filter(select, pushdown.residual.clone());
         let estimates = if analyze {
             None
         } else {
-            self.estimate_plan(select)?
+            self.estimate_plan(select, &pushdown)?
         };
         let (plan, stats) = if analyze {
             let start = Instant::now();
             let mut stats = ExecutionStats::default();
-            let table = self.build_from_inner(select, Some(&mut stats))?;
-            let plan = bind_select(select, &table)?;
+            let table = self.build_from_inner(select, &pushdown, Some(&mut stats))?;
+            let plan = bind_select(&filtered_select, &table)?;
             let result = execute_select_inner(&table, &plan, Some(&mut stats))?;
             if let QueryResult::Rows { rows, .. } = &result {
                 stats.output_rows = rows.len();
             }
             stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let plan = self.build_plan(select, Some(&stats), None)?;
+            let plan = self.build_plan(select, &pushdown, Some(&stats), None)?;
             (plan, Some(stats))
         } else {
-            (self.build_plan(select, None, estimates.as_ref())?, None)
+            (
+                self.build_plan(select, &pushdown, None, estimates.as_ref())?,
+                None,
+            )
         };
         let mut plan = plan;
         if let Some(stats) = stats {
@@ -505,29 +526,37 @@ impl SqlEngine {
         })
     }
 
-    fn estimate_plan(&self, select: &Select) -> Result<Option<PlanEstimate>, SqlError> {
+    fn estimate_plan(
+        &self,
+        select: &Select,
+        pushdown: &PushdownPlan,
+    ) -> Result<Option<PlanEstimate>, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
         let Some(left_stats) = self.stats.get(&left.name) else {
             return Ok(None);
         };
         let mut left_table = qualify_table_schema(left, &left_qualifier);
-        let mut left_rows = left_stats.rows as f64;
+        let left_filter = pushdown_filter(pushdown, 0);
+        let mut left_rows = estimate_scan_rows(left, left_stats, &left_qualifier, left_filter)?;
         let mut left_ndvs = left_stats
             .columns
             .iter()
             .map(|column| column.distinct)
             .collect::<Vec<_>>();
         let mut estimate = PlanEstimate {
-            scan_rows: vec![left_stats.rows],
+            scan_rows: vec![ceil_estimate(left_rows)],
             ..PlanEstimate::default()
         };
 
-        for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+        for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
+        {
             let Some(right_stats) = self.stats.get(&right.name) else {
                 return Ok(None);
             };
             let right_table = qualify_table_schema(right, &qualifier);
+            let right_filter = pushdown_filter(pushdown, join_index + 1);
+            let right_rows = estimate_scan_rows(right, right_stats, &qualifier, right_filter)?;
             let pairs = match &join.condition {
                 JoinCondition::Using(names) => using_pairs(&left_table, &right_table, names)?,
                 JoinCondition::Natural => natural_pairs(&left_table, &right_table)?,
@@ -566,7 +595,7 @@ impl SqlEngine {
                 self.join_strategy,
                 join.kind,
                 left_rows,
-                right_stats.rows as f64,
+                right_rows,
                 &hash_pairs,
                 predicate.as_ref(),
                 JoinStats {
@@ -578,7 +607,7 @@ impl SqlEngine {
             let join_rows = estimate_join_rows(
                 join.kind,
                 left_rows,
-                right_stats.rows as f64,
+                right_rows,
                 &hash_pairs,
                 &left_ndvs,
                 &right_ndvs,
@@ -593,12 +622,13 @@ impl SqlEngine {
                 rows: Vec::new(),
             };
             left_rows = join_rows;
-            estimate.scan_rows.push(right_stats.rows);
+            estimate.scan_rows.push(ceil_estimate(right_rows));
             estimate.join_rows.push(ceil_estimate(join_rows));
             estimate.join_uses_hash.push(uses_hash);
         }
 
-        let bound = bind_select(select, &left_table)?;
+        let filtered_select = select_with_filter(select, pushdown.residual.clone());
+        let bound = bind_select(&filtered_select, &left_table)?;
         let filtered = match bound.filter.as_ref() {
             Some(filter) => left_rows * estimate_selectivity(filter, &left_ndvs),
             None => left_rows,
@@ -652,19 +682,26 @@ impl SqlEngine {
         Ok(sources)
     }
 
-    fn build_from(&self, select: &Select) -> Result<Table, SqlError> {
-        self.build_from_inner(select, None)
+    fn build_from(&self, select: &Select, pushdown: &PushdownPlan) -> Result<Table, SqlError> {
+        self.build_from_inner(select, pushdown, None)
     }
 
     fn build_from_inner(
         &self,
         select: &Select,
+        pushdown: &PushdownPlan,
         mut stats: Option<&mut ExecutionStats>,
     ) -> Result<Table, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
+        let mut joined = qualify_table(left, &left_qualifier);
+        let left_filtered = pushdown.source == Some(0);
+        if let Some(filter) = pushdown_filter(pushdown, 0) {
+            joined = filter_table(joined, filter)?;
+        }
         if let Some(stats) = stats.as_deref_mut() {
-            stats.scan_rows.push(left.rows.len());
+            stats.scan_rows.push(joined.rows.len());
+            stats.scan_filters.push(left_filtered);
         }
         let mut stats_available = self.stats.contains_key(&left.name);
         let mut left_ndvs = self
@@ -678,10 +715,16 @@ impl SqlEngine {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mut joined = qualify_table(left, &left_qualifier);
-        for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+        for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
+        {
+            let mut right = qualify_table(right, &qualifier);
+            let right_filtered = pushdown.source == Some(join_index + 1);
+            if let Some(filter) = pushdown_filter(pushdown, join_index + 1) {
+                right = filter_table(right, filter)?;
+            }
             if let Some(stats) = stats.as_deref_mut() {
                 stats.scan_rows.push(right.rows.len());
+                stats.scan_filters.push(right_filtered);
             }
             let right_ndvs = self
                 .stats
@@ -696,7 +739,6 @@ impl SqlEngine {
                 .unwrap_or_default();
             let has_stats = stats_available && self.stats.contains_key(&right.name);
             let start = stats.is_some().then(Instant::now);
-            let right = qualify_table(right, &qualifier);
             let (joined_table, output_sources, uses_hash) = join_tables(
                 &joined,
                 &right,
@@ -724,6 +766,7 @@ impl SqlEngine {
     fn build_plan(
         &self,
         select: &Select,
+        pushdown: &PushdownPlan,
         stats: Option<&ExecutionStats>,
         estimates: Option<&PlanEstimate>,
     ) -> Result<String, SqlError> {
@@ -731,11 +774,15 @@ impl SqlEngine {
         let (left, left_qualifier) = sources.next().expect("base table is always present");
         let mut left_table = qualify_table_schema(left, &left_qualifier);
         let mut scan_index = 0;
+        let left_filtered = stats
+            .and_then(|stats| stats.scan_filters.get(scan_index).copied())
+            .unwrap_or(pushdown.source == Some(scan_index));
         let mut plan = scan_plan(
             &source_label(left.name.as_str(), &left_qualifier),
             stats,
             estimates,
             scan_index,
+            left_filtered,
         );
         scan_index += 1;
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
@@ -796,11 +843,15 @@ impl SqlEngine {
             {
                 header.push_str(&format!(" est rows={rows}"));
             }
+            let right_filtered = stats
+                .and_then(|stats| stats.scan_filters.get(scan_index).copied())
+                .unwrap_or(pushdown.source == Some(scan_index));
             let right_plan = scan_plan(
                 &source_label(right.name.as_str(), &qualifier),
                 stats,
                 estimates,
                 scan_index,
+                right_filtered,
             );
             scan_index += 1;
             plan = format!(
@@ -816,7 +867,8 @@ impl SqlEngine {
             };
         }
 
-        let bound = bind_select(select, &left_table)?;
+        let filtered_select = select_with_filter(select, pushdown.residual.clone());
+        let bound = bind_select(&filtered_select, &left_table)?;
         if bound.filter.is_some() {
             let label = if let Some(stats) = stats {
                 format!(
@@ -945,6 +997,159 @@ fn qualify_table_schema(table: &Table, qualifier: &str) -> Table {
         schema: Schema::new(columns),
         rows: Vec::new(),
     }
+}
+
+/// Chooses a single-source `WHERE` predicate for scan pushdown.
+///
+/// The whole predicate is moved only when every column is explicitly
+/// qualified by exactly one source and every join is inner or cross. Moving a
+/// predicate across an outer join, or one that references multiple sources,
+/// changes semantics or is not a source-local filter.
+fn plan_filter_pushdown(select: &Select) -> PushdownPlan {
+    let no_push = || PushdownPlan {
+        source: None,
+        filter: None,
+        residual: select.filter.clone(),
+    };
+    let Some(filter) = select.filter.as_ref() else {
+        return no_push();
+    };
+    if select.joins.is_empty()
+        || select
+            .joins
+            .iter()
+            .any(|join| !matches!(join.kind, JoinKind::Inner | JoinKind::Cross))
+    {
+        return no_push();
+    }
+
+    let qualifiers = source_qualifiers(select);
+    let mut referenced = BTreeSet::new();
+    if !expr_sources(filter, &mut referenced) || referenced.len() != 1 {
+        return no_push();
+    }
+    let source = referenced.iter().next().expect("one source");
+    let Some(index) = qualifiers.iter().position(|qualifier| qualifier == source) else {
+        return no_push();
+    };
+    PushdownPlan {
+        source: Some(index),
+        filter: Some(filter.clone()),
+        residual: None,
+    }
+}
+
+fn source_qualifiers(select: &Select) -> Vec<String> {
+    let mut qualifiers = Vec::with_capacity(select.joins.len() + 1);
+    qualifiers.push(
+        select
+            .table_alias
+            .as_deref()
+            .unwrap_or(&select.table)
+            .to_string(),
+    );
+    for join in &select.joins {
+        qualifiers.push(join.alias.as_deref().unwrap_or(&join.table).to_string());
+    }
+    qualifiers
+}
+
+/// Returns false for an unqualified column: its source is resolved only later
+/// by the binder, so it is not safe to move at this stage.
+fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Column {
+            table: Some(table), ..
+        } => {
+            sources.insert(table.clone());
+            true
+        }
+        Expr::Column { table: None, .. } => false,
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+            expr_sources(expr, sources)
+        }
+        Expr::InList { expr, values, .. } => {
+            expr_sources(expr, sources) && values.iter().all(|value| expr_sources(value, sources))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_sources(expr, sources) && expr_sources(low, sources) && expr_sources(high, sources)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_sources(expr, sources) && expr_sources(pattern, sources)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|expr| expr_sources(expr, sources))
+                && branches
+                    .iter()
+                    .all(|(when, then)| expr_sources(when, sources) && expr_sources(then, sources))
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|expr| expr_sources(expr, sources))
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_sources(left, sources) && expr_sources(right, sources)
+        }
+        Expr::Aggregate { input, .. } => input
+            .as_deref()
+            .is_none_or(|expr| expr_sources(expr, sources)),
+    }
+}
+
+fn select_with_filter(select: &Select, filter: Option<Expr>) -> Select {
+    let mut filtered = select.clone();
+    filtered.filter = filter;
+    filtered
+}
+
+fn pushdown_filter(pushdown: &PushdownPlan, index: usize) -> Option<&Expr> {
+    if pushdown.source == Some(index) {
+        pushdown.filter.as_ref()
+    } else {
+        None
+    }
+}
+
+fn filter_table(table: Table, filter: &Expr) -> Result<Table, SqlError> {
+    let Table { name, schema, rows } = table;
+    let bound = bind_expr(filter, &schema)?;
+    let rows = rows
+        .iter()
+        .filter_map(|row| match passes_filter(Some(&bound), &schema, row) {
+            Ok(true) => Some(Ok(row.clone())),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Table { name, schema, rows })
+}
+
+fn estimate_scan_rows(
+    table: &Table,
+    stats: &TableStats,
+    qualifier: &str,
+    filter: Option<&Expr>,
+) -> Result<f64, SqlError> {
+    let rows = stats.rows as f64;
+    let Some(filter) = filter else {
+        return Ok(rows);
+    };
+    let source_table = qualify_table_schema(table, qualifier);
+    let bound = bind_expr(filter, &source_table.schema)?;
+    let ndvs = stats
+        .columns
+        .iter()
+        .map(|column| column.distinct)
+        .collect::<Vec<_>>();
+    Ok(rows * estimate_selectivity(&bound, &ndvs))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1552,8 +1757,12 @@ fn scan_plan(
     stats: Option<&ExecutionStats>,
     estimates: Option<&PlanEstimate>,
     index: usize,
+    filtered: bool,
 ) -> String {
     let mut node = format!("Scan {label}");
+    if filtered {
+        node.push_str(" filtered");
+    }
     if let Some(rows) = stats.and_then(|stats| stats.scan_rows.get(index)) {
         node.push_str(&format!(" actual rows={rows}"));
     } else if let Some(rows) = estimates.and_then(|estimate| estimate.scan_rows.get(index)) {

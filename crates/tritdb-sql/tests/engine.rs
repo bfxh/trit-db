@@ -1820,9 +1820,9 @@ fn explain_reports_hash_and_nested_loop_join_plans() {
     let plan = plan_text(&explained[0]);
     assert_eq!(
         plan,
-        "Limit 2\n  Sort (1 key(s))\n    Project [v]\n      Filter\n        \
-         HashJoin (inner) keys=(e1.id = e2.id, e1.code = e2.code) residual=yes\n          \
-         Scan e1\n          Scan e2"
+        "Limit 2\n  Sort (1 key(s))\n    Project [v]\n      \
+         HashJoin (inner) keys=(e1.id = e2.id, e1.code = e2.code) residual=yes\n        \
+         Scan e1 filtered\n        Scan e2"
     );
     assert_eq!(as_rows(&explained[0]).0, ["plan"]);
 
@@ -1885,7 +1885,7 @@ fn explain_analyze_reports_actual_rows_and_times() {
         .execute_script(
             "EXPLAIN ANALYZE SELECT a.v FROM a JOIN b \
              ON a.id = b.id AND b.w <> 'b2x' \
-             WHERE a.id >= 1 ORDER BY a.v LIMIT 1;",
+             WHERE a.id >= 1 AND b.w <> 'b2x' ORDER BY a.v LIMIT 1;",
         )
         .expect("explain analyze join");
     let plan = plan_text(&analyzed[0]);
@@ -1954,6 +1954,134 @@ fn explain_analyze_reports_actual_rows_and_times() {
 }
 
 #[test]
+fn inner_join_pushes_single_source_where_filter_to_scan() {
+    let dir = TempDir::new("sql-pushdown");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("explain pushed filter");
+    let plan = plan_text(&explained[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        !plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;",
+        )
+        .expect("explain analyze pushed filter");
+    let plan = plan_text(&analyzed[0]);
+    assert!(
+        plan.contains("Scan a filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("Scan b actual rows=3"),
+        "unexpected plan: {plan}"
+    );
+
+    let selected = engine
+        .execute_script("SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("select pushed filter");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let right = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE b.w = 'b2';",
+        )
+        .expect("explain analyze right scan filter");
+    let plan = plan_text(&right[0]);
+    assert!(
+        plan.contains("Scan b filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan a actual rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let outer = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("outer join plan");
+    let plan = plan_text(&outer[0]);
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
+
+    let mixed = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.id = 2;",
+        )
+        .expect("mixed-source filter plan");
+    let plan = plan_text(&mixed[0]);
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
+}
+
+#[test]
 fn analyze_persists_and_explain_uses_estimates() {
     let dir = TempDir::new("sql-analyze-explain");
     let db = dir.join("sql.db");
@@ -1988,9 +2116,9 @@ fn analyze_persists_and_explain_uses_estimates() {
     assert_eq!(
         plan,
         "Limit 2 est rows=1\n  Sort (1 key(s)) est rows=1\n    \
-         Project [id, w] est rows=1\n      Filter est rows=1\n        \
-         HashJoin (inner) keys=(a.id = b.id) est rows=3\n          \
-         Scan a est rows=3\n          Scan b est rows=3"
+         Project [id, w] est rows=1\n      \
+         NestedLoop (inner) on=expr est rows=1\n        \
+         Scan a filtered est rows=1\n        Scan b est rows=3"
     );
     let grouped = engine
         .execute_script(
