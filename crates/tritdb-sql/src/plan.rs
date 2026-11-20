@@ -871,6 +871,8 @@ fn push_plan_value(out: &mut String, value: &Value) {
         Value::Bool(true) => out.push_str("#t"),
         Value::Bool(false) => out.push_str("#f"),
         Value::Logic(value) => out.push_str(value.as_str()),
+        Value::Lukasiewicz(value) => out.push_str(&format!("{:.3}", f64::from(*value) / 1000.0)),
+        Value::Nat(value) => out.push_str(&value.to_string()),
     }
 }
 

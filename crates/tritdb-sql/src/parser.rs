@@ -163,6 +163,10 @@ impl Parser {
         if data_type == DataType::Logic {
             if self.eat_word("belnap") {
                 data_type = DataType::Belnap;
+            } else if self.eat_word("lukasiewicz") {
+                data_type = DataType::Lukasiewicz;
+            } else if self.eat_word("nat") {
+                data_type = DataType::Nat;
             } else {
                 self.eat_word("k3");
             }

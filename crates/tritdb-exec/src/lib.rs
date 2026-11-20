@@ -27,6 +27,10 @@ pub enum Value {
     Bool(bool),
     /// Belnap four-valued logic (`LOGIC BELNAP`).
     Logic(B4),
+    /// Łukasiewicz `[0, 1]` in thousandths (`LOGIC LUKASIEWICZ`).
+    Lukasiewicz(u16),
+    /// Natural-number counting annotation (`LOGIC NAT`).
+    Nat(u64),
 }
 
 impl Value {
@@ -38,6 +42,8 @@ impl Value {
             Value::Text(_) => "TEXT",
             Value::Bool(_) => "BOOL",
             Value::Logic(_) => "BELNAP",
+            Value::Lukasiewicz(_) => "LUKASIEWICZ",
+            Value::Nat(_) => "NAT",
         }
     }
 
@@ -55,6 +61,8 @@ impl Value {
             Value::Bool(true) => "TRUE".to_string(),
             Value::Bool(false) => "FALSE".to_string(),
             Value::Logic(value) => value.as_str().to_string(),
+            Value::Lukasiewicz(value) => format!("{:.3}", f64::from(*value) / 1000.0),
+            Value::Nat(value) => value.to_string(),
         }
     }
 }
@@ -72,6 +80,10 @@ pub enum DataType {
     Logic,
     /// Belnap four-valued annotation column (`LOGIC BELNAP`).
     Belnap,
+    /// Łukasiewicz annotation column (`LOGIC LUKASIEWICZ`).
+    Lukasiewicz,
+    /// Natural-number counting column (`LOGIC NAT`).
+    Nat,
 }
 
 impl DataType {
@@ -83,6 +95,8 @@ impl DataType {
             "BOOL" | "BOOLEAN" => Some(DataType::Bool),
             "LOGIC" | "K3" => Some(DataType::Logic),
             "BELNAP" | "B4" => Some(DataType::Belnap),
+            "LUKASIEWICZ" | "LUK" => Some(DataType::Lukasiewicz),
+            "NAT" | "N" => Some(DataType::Nat),
             _ => None,
         }
     }
@@ -95,6 +109,8 @@ impl DataType {
             DataType::Bool => "BOOL",
             DataType::Logic => "LOGIC",
             DataType::Belnap => "BELNAP",
+            DataType::Lukasiewicz => "LUKASIEWICZ",
+            DataType::Nat => "NAT",
         }
     }
 
@@ -117,6 +133,12 @@ impl DataType {
             },
             (DataType::Belnap, Value::Logic(value)) => Ok(Value::Logic(value)),
             (DataType::Belnap, Value::Bool(value)) => Ok(Value::Logic(B4::from_bool(value))),
+            (DataType::Lukasiewicz, Value::Lukasiewicz(value)) => Ok(Value::Lukasiewicz(value)),
+            (DataType::Lukasiewicz, Value::Int(value)) if (0..=1000).contains(&value) => {
+                Ok(Value::Lukasiewicz(value as u16))
+            }
+            (DataType::Nat, Value::Nat(value)) => Ok(Value::Nat(value)),
+            (DataType::Nat, Value::Int(value)) if value >= 0 => Ok(Value::Nat(value as u64)),
             (expected, actual) => Err(ExecError::TypeMismatch {
                 expected: expected.name(),
                 actual: actual.type_name(),
@@ -504,6 +526,8 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, E
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
         (Value::Logic(left), Value::Logic(right)) => Ok(Some(left.cmp(right))),
+        (Value::Lukasiewicz(left), Value::Lukasiewicz(right)) => Ok(Some(left.cmp(right))),
+        (Value::Nat(left), Value::Nat(right)) => Ok(Some(left.cmp(right))),
         (Value::Bool(left), Value::Logic(right)) => Ok(Some(B4::from_bool(*left).cmp(right))),
         (Value::Logic(left), Value::Bool(right)) => Ok(Some(left.cmp(&B4::from_bool(*right)))),
         (Value::Int(left), Value::Int(right)) => Ok(Some(left.cmp(right))),

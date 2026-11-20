@@ -58,6 +58,8 @@ fn type_tag(data_type: DataType) -> u8 {
         DataType::Bool => 2,
         DataType::Logic => 3,
         DataType::Belnap => 4,
+        DataType::Lukasiewicz => 5,
+        DataType::Nat => 6,
     }
 }
 
@@ -68,6 +70,8 @@ fn type_from_tag(tag: u8) -> Option<DataType> {
         2 => Some(DataType::Bool),
         3 => Some(DataType::Logic),
         4 => Some(DataType::Belnap),
+        5 => Some(DataType::Lukasiewicz),
+        6 => Some(DataType::Nat),
         _ => None,
     }
 }
@@ -156,6 +160,16 @@ fn encode_value(
             out.push(value.code());
             Ok(())
         }
+        Value::Lukasiewicz(value) if data_type == DataType::Lukasiewicz => {
+            out.push(5);
+            out.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        Value::Nat(value) if data_type == DataType::Nat => {
+            out.push(6);
+            put_u64(out, *value);
+            Ok(())
+        }
         other => Err(SqlError::CorruptTable {
             table: table.to_string(),
             reason: format!(
@@ -222,6 +236,8 @@ fn value_matches(value: &Value, data_type: DataType) -> bool {
             | (DataType::Bool, Value::Bool(_))
             | (DataType::Logic, Value::Bool(_))
             | (DataType::Belnap, Value::Logic(_))
+            | (DataType::Lukasiewicz, Value::Lukasiewicz(_))
+            | (DataType::Nat, Value::Nat(_))
     )
 }
 
@@ -283,6 +299,16 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
                             .ok_or_else(|| corrupt("invalid belnap code"))?,
                     )
                 }
+                5 => {
+                    let low = reader
+                        .u8()
+                        .ok_or_else(|| corrupt("missing lukasiewicz value"))?;
+                    let high = reader
+                        .u8()
+                        .ok_or_else(|| corrupt("missing lukasiewicz value"))?;
+                    Value::Lukasiewicz(u16::from_le_bytes([low, high]))
+                }
+                6 => Value::Nat(reader.u64().ok_or_else(|| corrupt("missing nat value"))?),
                 _ => return Err(corrupt("invalid value tag")),
             };
             if !value_matches(&value, column.data_type) {
