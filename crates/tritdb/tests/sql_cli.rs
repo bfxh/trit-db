@@ -287,3 +287,32 @@ fn belnap_both_and_neither_project_to_unknown() {
     }
     assert!(!text.contains("\n1"), "TRUE must not be UNKNOWN: {text}");
 }
+
+#[test]
+fn lukasiewicz_and_nat_columns_roundtrip() {
+    let dir = TempDir::new("sql-luk-nat");
+    let db = dir.join("ln.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, conf LOGIC LUKASIEWICZ, n LOGIC NAT);          INSERT INTO t VALUES (1, 500, 7), (2, 1000, 0);          SELECT id, conf, n FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1	0.500	7"), "out: {text}");
+    assert!(text.contains("2	1.000	0"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, conf, n FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1	0.500	7"), "reopen: {text}");
+}

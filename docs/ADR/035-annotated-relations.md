@@ -69,7 +69,7 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 - **SQL 接了 `count_models` 与最小 `UNDER REPAIR`**：`SELECT count_models('<expr>'[, vars])`、`SELECT ... FROM t UNDER REPAIR ON (key)`；后者只按单列 FD `key -> 其他列` 分组，完整约束系统仍未做。
 - `count_models` 用 DPLL，不是 BDD；变量上限 32。
 - `under_repair` 按 denial 连通分量分解：总事实上限 64，单分量上限 16；没有增量修复或更优的 MCS 枚举。
-- 注解列已接 `LOGIC K3` 与 `LOGIC BELNAP`：K3 复用 `TRUE/FALSE/NULL` 存储，Belnap 用独立值 tag 存 `TRUE/FALSE/BOTH/NEITHER`；`truth(expr)` 投影为 `TRUE/FALSE/UNKNOWN`。Ł/ℕ 列与列存编码仍未做。
+- 注解列已接 `LOGIC K3` / `LOGIC BELNAP` / `LOGIC LUKASIEWICZ` / `LOGIC NAT`：K3 复用 `TRUE/FALSE/NULL`，Belnap 用值 tag 存四值，Ł 用千分位整数，ℕ 用 `u64`；`truth(expr)` 只接受 K3/Belnap（投影为 `TRUE/FALSE/UNKNOWN`）。
 
 ## 验收
 

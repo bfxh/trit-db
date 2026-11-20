@@ -46,7 +46,7 @@ SELECT id, truth(status) AS s FROM reading;
 SELECT id FROM reading WHERE status IS UNKNOWN;
 ```
 
-`LOGIC K3` 列按 `TRUE`/`FALSE`/`NULL` 存储；`LOGIC BELNAP` 列存 `TRUE`/`FALSE`/`BOTH`/`NEITHER`（另有 `NULL`），`IS UNKNOWN` 把 `BOTH`/`NEITHER` 投影为未知。`truth(expr)` 是把三值投影成 `TRUE`/`FALSE`/`UNKNOWN` 的语法糖（内部展开为 `CASE`）。
+`LOGIC K3` 列按 `TRUE`/`FALSE`/`NULL` 存储；`LOGIC BELNAP` 列存 `TRUE`/`FALSE`/`BOTH`/`NEITHER`（另有 `NULL`），`IS UNKNOWN` 把 `BOTH`/`NEITHER` 投影为未知；`LOGIC LUKASIEWICZ` 用千分位整数存 `0.000–1.000`，`LOGIC NAT` 存非负整数。`truth(expr)` 是把三值投影成 `TRUE`/`FALSE`/`UNKNOWN` 的语法糖（内部展开为 `CASE`）。
 
 ## 4. 语义
 
@@ -70,7 +70,7 @@ cargo test -p tritdb --test ann_cli    # 2 passed
 ## 6. 还没做
 
 - SQL 只支持最小 `UNDER REPAIR ON (key)`：按单列函数依赖 `key -> 其他列` 分组，冲突组整组丢弃；完整的 UNIQUE/FD/否定约束系统仍未做；
-- Łukasiewicz / ℕ 列类型与存储编码（`LOGIC BELNAP` 已接）；
+- Ł / ℕ 的专用聚合与 `truth()` 投影（这两类不是布尔，`truth()` 会拒绝）；
 - BDD 与组件级计数仍未做（当前 DPLL，变量上限 32）；
 - `under_repair` 的组件分解已做（按 denial 连通分量）；增量修复与更优的 MCS 枚举仍未做；
 - 概率/模糊聚合与 `Łukasiewicz` 的更多 t-norm。
