@@ -29,8 +29,8 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use tritdb_page::crc32_parts;
 use tritdb_wal::{RecordKind, WalError, WalScan, WalWriter};
@@ -618,6 +618,33 @@ impl TxnStore {
         Self::recover_at(&self.path, target_lsn)
     }
 
+    /// Starts a background thread that checkpoints every `interval`.
+    ///
+    /// A checkpoint that races with active transactions returns
+    /// [`TxnError::ActiveTxns`] and is retried on the next tick. Dropping the
+    /// returned handle stops the thread and joins it.
+    pub fn start_background_checkpoint(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+    ) -> BackgroundCheckpoint {
+        let store = Arc::clone(self);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::SeqCst) {
+                std::thread::sleep(interval);
+                if stop_thread.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = store.checkpoint();
+            }
+        });
+        BackgroundCheckpoint {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
     /// Removes the oldest archived checkpoints, keeping the newest `keep`.
     ///
     /// Only complete archive pairs are considered. Removing an archive means
@@ -722,6 +749,21 @@ impl TxnStore {
         drop(queue);
         drop(wal);
         Ok(())
+    }
+}
+
+/// Handle for [`TxnStore::start_background_checkpoint`].
+pub struct BackgroundCheckpoint {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for BackgroundCheckpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
