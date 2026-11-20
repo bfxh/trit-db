@@ -1438,6 +1438,11 @@ fn fold_select(select: &Select) -> Select {
             folded.having = Some(having);
         }
     }
+    for item in &mut folded.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            *expr = fold_expr(expr);
+        }
+    }
     for expr in &mut folded.group_by {
         *expr = fold_expr(expr);
     }
@@ -2892,6 +2897,54 @@ fn eval_aggregate(
                 }
             }
             Ok(best.unwrap_or(Value::Null))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_script;
+
+    #[test]
+    fn folds_projection_constants_and_preserves_column_items() {
+        let statements =
+            parse_script("SELECT 1 + 1 AS two, id, 1 / 0 AS bad FROM t;").expect("parse select");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected SELECT");
+        };
+        let folded = fold_select(select);
+        match &folded.items[0] {
+            SelectItem::Expr { expr, alias } => {
+                assert_eq!(expr, &Expr::Literal(Value::Int(2)));
+                assert_eq!(alias.as_deref(), Some("two"));
+            }
+            other => panic!("unexpected first item: {other:?}"),
+        }
+        match &folded.items[1] {
+            SelectItem::Expr { expr, alias } => {
+                assert_eq!(
+                    expr,
+                    &Expr::Column {
+                        table: None,
+                        name: "id".to_string(),
+                    }
+                );
+                assert_eq!(*alias, None);
+            }
+            other => panic!("unexpected second item: {other:?}"),
+        }
+        match &folded.items[2] {
+            SelectItem::Expr { expr, .. } => {
+                assert!(matches!(
+                    expr,
+                    Expr::Binary {
+                        op: BinaryOp::Div,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected third item: {other:?}"),
         }
     }
 }

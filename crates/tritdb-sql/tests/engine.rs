@@ -2972,6 +2972,24 @@ fn constant_folding_removes_trivial_filters_and_keeps_errors() {
         .expect("select all");
     assert_eq!(as_rows(&all[0]).1.len(), 3);
 
+    let projected = engine
+        .execute_script("SELECT 1 + 1, a.id FROM a ORDER BY a.id;")
+        .expect("folded projection");
+    let (columns, rows) = as_rows(&projected[0]);
+    assert_eq!(columns, ["col1", "id"]);
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Int(2), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(3)],
+        ]
+    );
+    let aliased = engine
+        .execute_script("SELECT 1 + 1 AS two, a.id FROM a ORDER BY a.id;")
+        .expect("folded aliased projection");
+    assert_eq!(as_rows(&aliased[0]).0, ["two", "id"]);
+
     let explained = engine
         .execute_script("EXPLAIN SELECT a.v FROM a WHERE 1 = 1;")
         .expect("explain true filter");
@@ -3088,6 +3106,12 @@ fn constant_folding_removes_trivial_filters_and_keeps_errors() {
         )
         .expect("true having select");
     assert_eq!(as_rows(&grouped[0]).1.len(), 3);
+
+    let error = engine
+        .execute_script("SELECT 1 / 0 AS bad FROM a;")
+        .expect_err("projection constant error must survive folding")
+        .to_string();
+    assert!(error.contains("division by zero"), "{error}");
 
     let error = engine
         .execute_script("SELECT a.v FROM a WHERE 1 / 0 = 2;")
