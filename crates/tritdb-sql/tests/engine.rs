@@ -1,5 +1,5 @@
 use tritdb_exec::Value;
-use tritdb_sql::{QueryResult, SqlEngine, SqlError};
+use tritdb_sql::{JoinStrategy, QueryResult, SqlEngine, SqlError};
 use tritdb_testkit::TempDir;
 
 fn as_rows(result: &QueryResult) -> (&[String], &[Vec<Value>]) {
@@ -1785,6 +1785,75 @@ fn hash_join_handles_composite_null_and_residual_predicates() {
         .execute_script("SELECT COUNT(*) FROM h1 FULL JOIN h2 ON h1.id = h2.id;")
         .expect("full hash join with null keys");
     assert_eq!(as_rows(&full[0]).1, [vec![Value::Int(9)]]);
+}
+
+#[test]
+fn explain_reports_hash_and_nested_loop_join_plans() {
+    let dir = TempDir::new("sql-explain");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE e1 (id INT, code INT, v TEXT); \
+             CREATE TABLE e2 (id INT, code INT, w TEXT);",
+        )
+        .expect("seed");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT e1.v FROM e1 JOIN e2 \
+             ON e1.id = e2.id AND e1.code = e2.code AND e2.w <> 'x' \
+             WHERE e1.v <> 'skip' ORDER BY e1.v LIMIT 2;",
+        )
+        .expect("explain hash join");
+    let plan = plan_text(&explained[0]);
+    assert_eq!(
+        plan,
+        "Limit 2\n  Sort (1 key(s))\n    Project [v]\n      Filter\n        \
+         HashJoin (inner) keys=(e1.id = e2.id, e1.code = e2.code) residual=yes\n          \
+         Scan e1\n          Scan e2"
+    );
+    assert_eq!(as_rows(&explained[0]).0, ["plan"]);
+
+    engine.set_join_strategy(JoinStrategy::NestedLoop);
+    let forced = engine
+        .execute_script(
+            "EXPLAIN SELECT e1.v FROM e1 JOIN e2 \
+             ON e1.id = e2.id AND e1.code = e2.code;",
+        )
+        .expect("explain nested loop");
+    let plan = plan_text(&forced[0]);
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("HashJoin"), "unexpected plan: {plan}");
+
+    engine.set_join_strategy(JoinStrategy::Auto);
+    let using = engine
+        .execute_script("EXPLAIN SELECT * FROM e1 LEFT JOIN e2 USING (id);")
+        .expect("explain using");
+    let plan = plan_text(&using[0]);
+    assert!(
+        plan.contains("HashJoin (left) keys=(id)"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [id, code, v, code, w]"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("residual"), "unexpected plan: {plan}");
 }
 
 #[test]

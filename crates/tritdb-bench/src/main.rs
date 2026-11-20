@@ -5,6 +5,7 @@
 //! skeleton harness, not the final `tritdb-bench`; it intentionally has no
 //! external dependencies.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -12,9 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
+use tritdb_exec::Value;
 use tritdb_format::Block;
 use tritdb_page::{Page, PageKind, MAX_PAYLOAD, PAGE_SIZE};
 use tritdb_radix::{pack_into, unpack_into, Radix, Trit};
+use tritdb_sql::{parse_script, JoinStrategy, QueryResult, SqlEngine};
 use tritdb_store::{PageId, PageStore};
 use tritdb_txn::TxnStore;
 use tritdb_wal::{RecordKind, WalReader, WalWriter};
@@ -31,6 +34,7 @@ fn main() {
         Some("pstore-checkpoint") => run_pstore_checkpoint(&args),
         Some("txn-checkpoint") => run_txn_checkpoint(&args),
         Some("txn-group") => run_txn_group(&args),
+        Some("sql-join") => run_sql_join(&args),
         Some("help") | Some("--help") => print_help(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
@@ -51,6 +55,7 @@ fn print_help() {
     println!("  pstore-checkpoint --txns 32 --payload 4096 --rounds 6");
     println!("  txn-checkpoint --txns 64 --keys-per-txn 4 --rounds 3");
     println!("  txn-group --txns 256 --threads 16 --keys-per-txn 4 --rounds 3");
+    println!("  sql-join --rows 1024 --rounds 3 [--strategy auto|hash|nested]");
 }
 
 fn run_radix(args: &[String]) {
@@ -864,6 +869,83 @@ fn run_txn_group(args: &[String]) {
         syncs_median,
         syncs_max,
         syncs_per_txn
+    );
+}
+
+fn run_sql_join(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 1024);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+    let strategy = match arg_value(args, "--strategy").as_deref().unwrap_or("auto") {
+        "auto" => JoinStrategy::Auto,
+        "hash" => JoinStrategy::Hash,
+        "nested" => JoinStrategy::NestedLoop,
+        other => {
+            eprintln!("unknown strategy: {other}; expected auto, hash, or nested");
+            std::process::exit(2);
+        }
+    };
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-join.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    let mut setup = String::new();
+    setup.push_str(
+        "CREATE TABLE a (id INT NOT NULL, payload INT); \
+                    CREATE TABLE b (id INT NOT NULL, payload INT); \
+                    INSERT INTO a VALUES ",
+    );
+    for row in 0..rows {
+        write!(&mut setup, "({row}, {row})").expect("write seed");
+        if row + 1 < rows {
+            setup.push(',');
+        }
+    }
+    setup.push_str("; INSERT INTO b VALUES ");
+    for row in 0..rows {
+        write!(&mut setup, "({row}, {row})").expect("write seed");
+        if row + 1 < rows {
+            setup.push(',');
+        }
+    }
+    setup.push(';');
+    engine.execute_script(&setup).expect("seed tables");
+    engine.set_join_strategy(strategy);
+
+    let query = parse_script("SELECT COUNT(*) FROM a JOIN b ON a.id = b.id;").expect("parse query");
+    let statement = &query[0];
+    let mut samples = Vec::with_capacity(rounds);
+    let mut matches = 0usize;
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let result = engine.execute_statement(statement).expect("execute join");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        let QueryResult::Rows { rows, .. } = &result else {
+            panic!("join query did not return rows");
+        };
+        let Value::Int(count) = rows[0][0] else {
+            panic!("COUNT did not return INT");
+        };
+        matches = usize::try_from(count).expect("match count");
+    }
+
+    let stats = Stats::new(samples);
+    let name = match strategy {
+        JoinStrategy::Auto => "auto",
+        JoinStrategy::Hash => "hash",
+        JoinStrategy::NestedLoop => "nested",
+    };
+    println!("rows\tstrategy\trounds\tjoin_ms(min/med/max)\tmatches");
+    println!(
+        "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+        rows, name, rounds, stats.min, stats.median, stats.max, matches
+    );
+    println!(
+        "{{\"bench_id\":\"sql_join\",\"rows\":{},\"strategy\":\"{}\",\"rounds\":{},\"join_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
+        rows, name, rounds, stats.min, stats.median, stats.max, matches
     );
 }
 

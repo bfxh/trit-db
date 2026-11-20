@@ -249,6 +249,8 @@ pub enum Statement {
     },
     /// `SELECT`.
     Select(Select),
+    /// `EXPLAIN SELECT`.
+    Explain(Select),
     /// `DELETE FROM`.
     Delete {
         /// Table name.

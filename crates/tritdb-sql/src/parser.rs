@@ -124,9 +124,12 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Drop)) => self.parse_drop(),
             Some(TokenKind::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(TokenKind::Keyword(Keyword::Select)) => self.parse_select(),
+            Some(TokenKind::Keyword(Keyword::Explain)) => self.parse_explain(),
             Some(TokenKind::Keyword(Keyword::Update)) => self.parse_update(),
             Some(TokenKind::Keyword(Keyword::Delete)) => self.parse_delete(),
-            Some(_) => Err(self.error("expected CREATE, DROP, INSERT, SELECT, UPDATE, or DELETE")),
+            Some(_) => {
+                Err(self.error("expected CREATE, DROP, INSERT, SELECT, EXPLAIN, UPDATE, or DELETE"))
+            }
             None => Err(self.error("empty statement")),
         }
     }
@@ -223,6 +226,15 @@ impl Parser {
             columns,
             rows,
         })
+    }
+
+    fn parse_explain(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Explain)?;
+        let select = match self.parse_select()? {
+            Statement::Select(select) => select,
+            _ => unreachable!("parse_select always returns SELECT"),
+        };
+        Ok(Statement::Explain(select))
     }
 
     fn parse_select(&mut self) -> Result<Statement, SqlError> {
@@ -781,6 +793,21 @@ mod tests {
                 assert_eq!(assignments[0].column, "score");
                 assert_eq!(assignments[1].column, "name");
                 assert!(filter.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_select() {
+        let statements = parse_script("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id;")
+            .expect("parse explain");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Explain(select) => {
+                assert_eq!(select.table, "a");
+                assert_eq!(select.joins.len(), 1);
+                assert_eq!(select.joins[0].table, "b");
             }
             other => panic!("unexpected {other:?}"),
         }

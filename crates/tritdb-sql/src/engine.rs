@@ -9,7 +9,7 @@ use tritdb_exec::{
 };
 use tritdb_txn::TxnStore;
 
-use crate::ast::{AggregateKind, Assignment, JoinCondition, JoinKind, Select, Statement};
+use crate::ast::{AggregateKind, Assignment, Join, JoinCondition, JoinKind, Select, Statement};
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
@@ -29,6 +29,18 @@ pub enum QueryResult {
     Message(String),
 }
 
+/// JOIN execution strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JoinStrategy {
+    /// Use hash join when equi-keys are available, otherwise nested loop.
+    #[default]
+    Auto,
+    /// Prefer hash join when equi-keys are available.
+    Hash,
+    /// Always use nested loop, for benchmarks and differential tests.
+    NestedLoop,
+}
+
 /// A SQL engine backed by one [`TxnStore`].
 ///
 /// M1 keeps the whole table in memory and rewrites the table value on every
@@ -36,6 +48,7 @@ pub enum QueryResult {
 pub struct SqlEngine {
     store: TxnStore,
     tables: BTreeMap<String, Table>,
+    join_strategy: JoinStrategy,
 }
 
 impl SqlEngine {
@@ -60,12 +73,26 @@ impl SqlEngine {
             let table = decode_table(name, &value)?;
             tables.insert(name.to_string(), table);
         }
-        Ok(Self { store, tables })
+        Ok(Self {
+            store,
+            tables,
+            join_strategy: JoinStrategy::Auto,
+        })
     }
 
     /// WAL path.
     pub fn path(&self) -> &Path {
         self.store.path()
+    }
+
+    /// Current JOIN strategy.
+    pub const fn join_strategy(&self) -> JoinStrategy {
+        self.join_strategy
+    }
+
+    /// Overrides the JOIN strategy for benchmarks or differential tests.
+    pub fn set_join_strategy(&mut self, strategy: JoinStrategy) {
+        self.join_strategy = strategy;
     }
 
     /// Executes a SQL script and returns one result per statement.
@@ -93,6 +120,7 @@ impl SqlEngine {
                 rows,
             } => self.insert(table, columns.as_deref(), rows),
             Statement::Select(select) => self.select(select),
+            Statement::Explain(select) => self.explain(select),
             Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
             Statement::Update {
                 table,
@@ -322,7 +350,18 @@ impl SqlEngine {
         execute_select(&table, &plan)
     }
 
-    fn build_from(&self, select: &Select) -> Result<Table, SqlError> {
+    fn explain(&self, select: &Select) -> Result<QueryResult, SqlError> {
+        let plan = self.build_plan(select)?;
+        Ok(QueryResult::Rows {
+            columns: vec!["plan".to_string()],
+            rows: plan
+                .lines()
+                .map(|line| vec![Value::Text(line.to_string())])
+                .collect(),
+        })
+    }
+
+    fn source_tables<'a>(&'a self, select: &Select) -> Result<Vec<(&'a Table, String)>, SqlError> {
         let table = self
             .tables
             .get(&select.table)
@@ -333,7 +372,7 @@ impl SqlEngine {
         if !qualifiers.insert(left_qualifier.to_string()) {
             return Err(SqlError::DuplicateTableAlias(left_qualifier.to_string()));
         }
-        sources.push((table, left_qualifier));
+        sources.push((table, left_qualifier.to_string()));
         for join in &select.joins {
             let right = self
                 .tables
@@ -343,15 +382,115 @@ impl SqlEngine {
             if !qualifiers.insert(qualifier.to_string()) {
                 return Err(SqlError::DuplicateTableAlias(qualifier.to_string()));
             }
-            sources.push((right, qualifier));
+            sources.push((right, qualifier.to_string()));
         }
+        Ok(sources)
+    }
 
-        let mut joined = qualify_table(table, left_qualifier);
-        for (join, (right, qualifier)) in select.joins.iter().zip(sources.into_iter().skip(1)) {
-            let right = qualify_table(right, qualifier);
-            joined = join_tables(&joined, &right, &join.condition, join.kind)?;
+    fn build_from(&self, select: &Select) -> Result<Table, SqlError> {
+        let mut sources = self.source_tables(select)?.into_iter();
+        let (left, left_qualifier) = sources.next().expect("base table is always present");
+        let mut joined = qualify_table(left, &left_qualifier);
+        for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+            let right = qualify_table(right, &qualifier);
+            joined = join_tables(
+                &joined,
+                &right,
+                &join.condition,
+                join.kind,
+                self.join_strategy,
+            )?;
         }
         Ok(joined)
+    }
+
+    fn build_plan(&self, select: &Select) -> Result<String, SqlError> {
+        let mut sources = self.source_tables(select)?.into_iter();
+        let (left, left_qualifier) = sources.next().expect("base table is always present");
+        let mut left_table = qualify_table_schema(left, &left_qualifier);
+        let mut plan = format!("Scan {}", source_label(left.name.as_str(), &left_qualifier));
+        for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+            let right_table = qualify_table_schema(right, &qualifier);
+            let pairs = match &join.condition {
+                JoinCondition::Using(names) => using_pairs(&left_table, &right_table, names)?,
+                JoinCondition::Natural => natural_pairs(&left_table, &right_table)?,
+                JoinCondition::On(_) | JoinCondition::None => Vec::new(),
+            };
+            let pair_schema = Schema::new(
+                left_table
+                    .schema
+                    .columns
+                    .iter()
+                    .chain(right_table.schema.columns.iter())
+                    .cloned()
+                    .collect(),
+            );
+            let predicate = match &join.condition {
+                JoinCondition::On(expr) => Some(bind_expr(expr, &pair_schema)?),
+                JoinCondition::Using(_) | JoinCondition::Natural => {
+                    using_predicate(&pairs, left_table.schema.len())
+                }
+                JoinCondition::None => None,
+            };
+            let hash_pairs = match &join.condition {
+                JoinCondition::Using(_) | JoinCondition::Natural => pairs.clone(),
+                JoinCondition::On(_) => predicate
+                    .as_ref()
+                    .map(|expr| equi_join_pairs(expr, left_table.schema.len()))
+                    .unwrap_or_default(),
+                JoinCondition::None => Vec::new(),
+            };
+            let uses_hash = use_hash_join(self.join_strategy, &hash_pairs);
+            let header = join_plan_header(
+                join,
+                uses_hash,
+                &hash_pairs,
+                &left_table,
+                &right_table,
+                predicate.as_ref(),
+            );
+            let right_plan = format!("Scan {}", source_label(right.name.as_str(), &qualifier));
+            plan = format!(
+                "{header}\n{}\n{}",
+                indent_plan(&plan, 2),
+                indent_plan(&right_plan, 2)
+            );
+            let (schema, _) = build_join_layout(&left_table, &right_table, &pairs, join.kind);
+            left_table = Table {
+                name: left_table.name,
+                schema,
+                rows: Vec::new(),
+            };
+        }
+
+        let bound = bind_select(select, &left_table)?;
+        if bound.filter.is_some() {
+            plan = format!("Filter\n{}", indent_plan(&plan, 2));
+        }
+        if bound.is_grouped() {
+            plan = format!("Aggregate\n{}", indent_plan(&plan, 2));
+            if bound.having.is_some() {
+                plan = format!("Having\n{}", indent_plan(&plan, 2));
+            }
+        }
+        let projection = bound
+            .items
+            .iter()
+            .map(|item| item.name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        plan = format!("Project [{projection}]\n{}", indent_plan(&plan, 2));
+        if !bound.order_by.is_empty() {
+            plan = format!(
+                "Sort ({} key(s))\n{}",
+                bound.order_by.len(),
+                indent_plan(&plan, 2)
+            );
+        }
+        if let Some(limit) = bound.limit {
+            plan = format!("Limit {limit}\n{}", indent_plan(&plan, 2));
+        }
+        Ok(plan)
     }
 
     fn put_table(&mut self, table: Table) -> Result<(), SqlError> {
@@ -366,6 +505,12 @@ impl SqlEngine {
 }
 
 fn qualify_table(table: &Table, qualifier: &str) -> Table {
+    let mut qualified = qualify_table_schema(table, qualifier);
+    qualified.rows = table.rows.clone();
+    qualified
+}
+
+fn qualify_table_schema(table: &Table, qualifier: &str) -> Table {
     let columns = table
         .schema
         .columns
@@ -379,7 +524,7 @@ fn qualify_table(table: &Table, qualifier: &str) -> Table {
     Table {
         name: table.name.clone(),
         schema: Schema::new(columns),
-        rows: table.rows.clone(),
+        rows: Vec::new(),
     }
 }
 
@@ -747,11 +892,124 @@ fn nested_loop_join_rows(
     Ok(rows)
 }
 
+fn use_hash_join(strategy: JoinStrategy, pairs: &[(usize, usize)]) -> bool {
+    match strategy {
+        JoinStrategy::NestedLoop => false,
+        JoinStrategy::Auto | JoinStrategy::Hash => !pairs.is_empty(),
+    }
+}
+
+fn source_label(table: &str, qualifier: &str) -> String {
+    if table == qualifier {
+        table.to_string()
+    } else {
+        format!("{table} AS {qualifier}")
+    }
+}
+
+fn indent_plan(plan: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    plan.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn join_kind_name(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Inner => "inner",
+        JoinKind::Cross => "cross",
+        JoinKind::Left => "left",
+        JoinKind::Right => "right",
+        JoinKind::Full => "full",
+    }
+}
+
+fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {
+    match expr {
+        ExecExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => is_pure_equi_conjunction(left) && is_pure_equi_conjunction(right),
+        ExecExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => matches!(
+            (left.as_ref(), right.as_ref()),
+            (ExecExpr::Column(_), ExecExpr::Column(_))
+        ),
+        _ => false,
+    }
+}
+
+fn join_plan_header(
+    join: &Join,
+    uses_hash: bool,
+    hash_pairs: &[(usize, usize)],
+    left: &Table,
+    right: &Table,
+    predicate: Option<&ExecExpr>,
+) -> String {
+    let mut header = format!(
+        "{} ({})",
+        if uses_hash { "HashJoin" } else { "NestedLoop" },
+        join_kind_name(join.kind)
+    );
+    let mut details = Vec::new();
+    match &join.condition {
+        JoinCondition::Using(names) => {
+            if !names.is_empty() {
+                details.push(format!("keys=({})", names.join(", ")));
+            }
+        }
+        JoinCondition::Natural => {
+            if !hash_pairs.is_empty() {
+                let names = hash_pairs
+                    .iter()
+                    .map(|(left_index, _)| unqualified_name(&left.schema.columns[*left_index].name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                details.push(format!("keys=({names})"));
+            }
+        }
+        JoinCondition::On(_) => {
+            if uses_hash {
+                let keys = hash_pairs
+                    .iter()
+                    .map(|(left_index, right_index)| {
+                        format!(
+                            "{} = {}",
+                            left.schema.columns[*left_index].name,
+                            right.schema.columns[*right_index].name
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                details.push(format!("keys=({keys})"));
+                if predicate.is_some_and(|expr| !is_pure_equi_conjunction(expr)) {
+                    details.push("residual=yes".to_string());
+                }
+            } else if predicate.is_some() {
+                details.push("on=expr".to_string());
+            }
+        }
+        JoinCondition::None => {}
+    }
+    if !details.is_empty() {
+        header.push(' ');
+        header.push_str(&details.join(" "));
+    }
+    header
+}
+
 fn join_tables(
     left: &Table,
     right: &Table,
     condition: &JoinCondition,
     kind: JoinKind,
+    strategy: JoinStrategy,
 ) -> Result<Table, SqlError> {
     let pairs = match condition {
         JoinCondition::Using(names) => using_pairs(left, right, names)?,
@@ -782,16 +1040,7 @@ fn join_tables(
             .unwrap_or_default(),
         JoinCondition::None => Vec::new(),
     };
-    let rows = if hash_pairs.is_empty() {
-        nested_loop_join_rows(
-            left,
-            right,
-            &sources,
-            kind,
-            predicate.as_ref(),
-            &pair_schema,
-        )?
-    } else {
+    let rows = if use_hash_join(strategy, &hash_pairs) {
         hash_join_rows(
             left,
             right,
@@ -800,6 +1049,15 @@ fn join_tables(
             predicate.as_ref(),
             &pair_schema,
             &hash_pairs,
+        )?
+    } else {
+        nested_loop_join_rows(
+            left,
+            right,
+            &sources,
+            kind,
+            predicate.as_ref(),
+            &pair_schema,
         )?
     };
     Ok(Table {
