@@ -12,7 +12,7 @@
 8. `tritdb-testkit`：零依赖测试工具；唯一临时目录、确定性 xorshift64*、hex 编解码。
 9. `tools/crosscheck/` + `testdata/vectors/`：独立 Python 字节级参考实现、确定性向量、Rust→Python 反向校验和二进制 framed bridge。
 10. `tritdb-exec`：SQL 值、schema、三值逻辑真值表、比较/算术表达式求值。
-11. `tritdb-sql`：最小 lexer/parser/binder/executor；`CREATE/INSERT/SELECT/UPDATE/DELETE/DROP`、加法 schema 迁移 `ALTER TABLE ... ADD [COLUMN]`、`WHERE/ORDER BY/LIMIT`、`IN/BETWEEN/LIKE` 谓词、`CASE` 表达式、`GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN`、`JOIN ... USING (col, ...)`、等值 JOIN 的 hash join 执行（非等值条件回退 nested loop）、基于 `ANALYZE` 统计的 `Auto` join 代价选择、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、无 `*` / `USING` / `NATURAL` 且列引用可唯一归属时的源表列裁剪（含无歧义未限定列与零列源表投影）、计划入口的常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`（含 join 键/残余标志/过滤谓词/完整 join 谓词/HAVING 谓词）、只读 `EXPLAIN SEXPR` 与带执行汇总的 `EXPLAIN ANALYZE SEXPR`、逗号分隔 `FROM`（表别名 + 限定列）、分组聚合与聚合结果排序、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 静态计划与统计估算；表以 `TRSQ` 整表 value 存进 `TxnStore`，统计以 `TRSS` value 存在 `sql/stats/` 下。`ALTER TABLE ADD COLUMN` 只允许追加可空列，旧行回填 `NULL`，整表在单事务中重写并在成功后使统计失效；不支持 `DROP` / `RENAME` / `ALTER TYPE`。
+11. `tritdb-sql`：最小 lexer/parser/binder/executor；`CREATE/INSERT/SELECT/UPDATE/DELETE/DROP`、加法 schema 迁移 `ALTER TABLE ... ADD [COLUMN]`、`WHERE/ORDER BY/LIMIT`、`IN/BETWEEN/LIKE` 谓词、`CASE` 表达式、`GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN`、`JOIN ... USING (col, ...)`、等值 JOIN 的 hash join 执行（非等值条件回退 nested loop）、基于 `ANALYZE` 统计的 `Auto` join 代价选择、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、无 `*` / `USING` / `NATURAL` 且列引用可唯一归属时的源表列裁剪（含无歧义未限定列与零列源表投影）、计划入口的常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`（含 join 键/残余标志/过滤谓词/完整 join 谓词/HAVING 谓词/Scan 表名、别名与下推谓词）、只读 `EXPLAIN SEXPR` 与带执行汇总的 `EXPLAIN ANALYZE SEXPR`、逗号分隔 `FROM`（表别名 + 限定列）、分组聚合与聚合结果排序、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 静态计划与统计估算；表以 `TRSQ` 整表 value 存进 `TxnStore`，统计以 `TRSS` value 存在 `sql/stats/` 下。`ALTER TABLE ADD COLUMN` 只允许追加可空列，旧行回填 `NULL`，整表在单事务中重写并在成功后使统计失效；不支持 `DROP` / `RENAME` / `ALTER TYPE`。
 
 **还没有做**：子查询、窗口函数、全局优化器、pgwire、MVCC、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、跨进程文件锁、带默认值的非空列迁移、`DROP/RENAME/ALTER COLUMN` 等破坏性 schema 变更、schema 迁移版本历史。不要把这个骨架当成数据库。
 
@@ -77,7 +77,7 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 
 ## 测试与 CI
 
-当前 **255 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/执行汇总/加法 schema 迁移分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
+当前 **255 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/结构化 Scan 下推谓词/执行汇总/加法 schema 迁移分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
 
 - `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / 三平台 Python 交叉校验（向量 + CLI + SQLite SQL 对拍）/ coverage / docs。
 - `stress.yml`：每天 04:00 UTC 跑 release 模式压力测试与 crash matrix。
@@ -128,4 +128,4 @@ docs/results/          M0/M1 读数与负结果
 - `已设计`：只有文档。
 - `未做`：没有代码。
 
-当前：radix/page/format/wal/txn/store/页 checkpoint/键值 checkpoint/提交组/CLI/bench/最小 SQL 3VL/单表 GROUP BY/多表 INNER JOIN/CROSS JOIN/逗号 FROM/LEFT JOIN/RIGHT JOIN/FULL JOIN/NATURAL JOIN/USING/等值 hash join/`ANALYZE` 表统计/`Auto` join 代价选择/`WHERE` 合取项拆分与单源下推/源表列裁剪（含无歧义未限定列与零列源表投影）/常量折叠与投影常量折叠/结构化计划树与 `EXPLAIN SEXPR`/结构化 join 键/结构化过滤谓词与 join 谓词/结构化 join 残余谓词/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/`EXPLAIN SELECT` 估算/`EXPLAIN ANALYZE`/JOIN 策略开关/UPDATE/IN·BETWEEN·LIKE/CASE 为 `已实现`；子查询、全局优化器/pgwire/MVCC/WAL 段轮转/后台 checkpoint/跨进程锁 为 `未做`。
+当前：radix/page/format/wal/txn/store/页 checkpoint/键值 checkpoint/提交组/CLI/bench/最小 SQL 3VL/单表 GROUP BY/多表 INNER JOIN/CROSS JOIN/逗号 FROM/LEFT JOIN/RIGHT JOIN/FULL JOIN/NATURAL JOIN/USING/等值 hash join/`ANALYZE` 表统计/`Auto` join 代价选择/`WHERE` 合取项拆分与单源下推/源表列裁剪（含无歧义未限定列与零列源表投影）/常量折叠与投影常量折叠/结构化计划树与 `EXPLAIN SEXPR`/结构化 join 键/结构化过滤谓词与 join 谓词/结构化 join 残余谓词/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/结构化 Scan 下推谓词/`EXPLAIN SELECT` 估算/`EXPLAIN ANALYZE`/JOIN 策略开关/UPDATE/IN·BETWEEN·LIKE/CASE 为 `已实现`；子查询、全局优化器/pgwire/MVCC/WAL 段轮转/后台 checkpoint/跨进程锁 为 `未做`。

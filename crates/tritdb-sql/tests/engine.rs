@@ -1945,7 +1945,26 @@ fn explain_sexpr_reports_structured_plan() {
         "(limit :limit 1\n  (sort :keys ((asc (col \"a.v\")))\n    (project ((\"v\" (col \"a.v\")))\n      \
          (join hash inner :keys ((\"a.id\" \"b.id\")) \
          :pred (= (col \"a.id\") (col \"b.id\"))\n        \
-         (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
+         (scan \"a\" :filtered #t :filter (<> (col \"a.v\") \"skip\"))\n        (scan \"b\" :cols (\"id\"))))))"
+    );
+
+    let both = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' AND b.w <> 'keep';",
+        )
+        .expect("explain sexpr both scan filters");
+    let both_plan = match &as_rows(&both[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        both_plan.contains("(scan \"a\" :filtered #t :filter (<> (col \"a.v\") \"skip\"))"),
+        "unexpected plan: {both_plan}"
+    );
+    assert!(
+        both_plan.contains("(scan \"b\" :filtered #t :filter (<> (col \"b.w\") \"keep\"))"),
+        "unexpected plan: {both_plan}"
     );
 
     let aliased = engine
@@ -2155,6 +2174,23 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     );
     assert!(!plan.contains(":est-rows"), "unexpected plan: {plan}");
     assert!(!plan.contains("Execution:"), "unexpected plan: {plan}");
+
+    let pushed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain analyze sexpr pushed filter");
+    let pushed_plan = match &as_rows(&pushed[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        pushed_plan.contains(
+            "(scan \"a\" :filtered #t :filter (<> (col \"a.v\") \"skip\") :actual-rows 3)"
+        ),
+        "unexpected plan: {pushed_plan}"
+    );
 
     let grouped = engine
         .execute_script("EXPLAIN ANALYZE SEXPR SELECT a.v, COUNT(*) FROM a GROUP BY a.v;")

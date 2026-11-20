@@ -4,6 +4,8 @@
 
 日期：2026-11-20
 
+> 后续：ADR-029 在 `:filtered` 后新增可选 `:filter`，把下推过滤谓词结构化；本 ADR 的表名/别名字段与文本规则不变。
+
 ## 背景
 
 `PlanKind::Scan` 之前只有一个 `label: String`。引擎在构造计划时调用 `source_label(table, qualifier)`，把表名和别名拼成：

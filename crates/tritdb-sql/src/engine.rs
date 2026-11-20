@@ -990,10 +990,12 @@ impl SqlEngine {
         let left_filtered = stats
             .and_then(|stats| stats.scan_filters.get(scan_index).copied())
             .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
+        let left_filter = plan_scan_filter(pushdown, scan_index, &left_table.schema)?;
         let mut plan = PlanNode::scan(
             left.name.clone(),
             source_alias(left.name.as_str(), &left_qualifier),
             left_filtered,
+            left_filter,
             stats
                 .and_then(|stats| stats.scan_rows.get(scan_index).copied())
                 .map(|rows| rows as u64),
@@ -1065,10 +1067,12 @@ impl SqlEngine {
             let right_filtered = stats
                 .and_then(|stats| stats.scan_filters.get(scan_index).copied())
                 .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
+            let right_filter = plan_scan_filter(pushdown, scan_index, &right_table.schema)?;
             let right_plan = PlanNode::scan(
                 right.name.clone(),
                 source_alias(right.name.as_str(), &qualifier),
                 right_filtered,
+                right_filter,
                 stats
                     .and_then(|stats| stats.scan_rows.get(scan_index).copied())
                     .map(|rows| rows as u64),
@@ -1780,6 +1784,21 @@ fn select_with_filter(select: &Select, filter: Option<Expr>) -> Select {
 
 fn pushdown_filter(pushdown: &PushdownPlan, index: usize) -> Option<&Expr> {
     pushdown.filters.get(index).and_then(Option::as_ref)
+}
+
+/// Binds a pushed-down source filter against the full source schema and
+/// converts it to the read-only plan expression shape.
+fn plan_scan_filter(
+    pushdown: &PushdownPlan,
+    index: usize,
+    schema: &Schema,
+) -> Result<Option<PlanExpr>, SqlError> {
+    pushdown_filter(pushdown, index)
+        .map(|filter| {
+            let bound = bind_expr(filter, schema)?;
+            PlanExpr::from_exec(&bound, schema)
+        })
+        .transpose()
 }
 
 fn filter_table(table: Table, filter: &Expr) -> Result<Table, SqlError> {

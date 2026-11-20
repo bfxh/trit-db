@@ -25,6 +25,7 @@ pub(crate) enum PlanKind {
         table: String,
         alias: Option<String>,
         filtered: bool,
+        filter: Option<PlanExpr>,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
         columns: Option<Vec<String>>,
@@ -194,6 +195,7 @@ impl PlanNode {
         table: String,
         alias: Option<String>,
         filtered: bool,
+        filter: Option<PlanExpr>,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
         columns: Option<Vec<String>>,
@@ -203,6 +205,7 @@ impl PlanNode {
                 table,
                 alias,
                 filtered,
+                filter,
                 actual_rows,
                 est_rows,
                 columns,
@@ -271,6 +274,7 @@ impl PlanNode {
                 table,
                 alias,
                 filtered,
+                filter: _,
                 actual_rows,
                 est_rows,
                 columns,
@@ -372,6 +376,7 @@ impl PlanNode {
                 table,
                 alias,
                 filtered,
+                filter,
                 actual_rows,
                 est_rows,
                 columns,
@@ -384,6 +389,10 @@ impl PlanNode {
                 }
                 if *filtered {
                     out.push_str(" :filtered #t");
+                }
+                if let Some(filter) = filter {
+                    out.push_str(" :filter ");
+                    filter.write_sexpr(out);
                 }
                 push_sexpr_metrics(
                     out,
