@@ -129,6 +129,9 @@ pub enum TxnError {
         /// Human-readable reason.
         reason: &'static str,
     },
+    /// Time-based recovery was requested but the time index has no entry at
+    /// or before the target.
+    TimeIndexUnavailable,
     /// A lock was poisoned by a panicking thread.
     Poisoned,
 }
@@ -176,6 +179,9 @@ impl fmt::Display for TxnError {
                 f,
                 "pitr archive at lsn {checkpoint_lsn} is incomplete: {reason}"
             ),
+            TxnError::TimeIndexUnavailable => {
+                write!(f, "time index has no entry at or before the requested timestamp")
+            }
             TxnError::Poisoned => write!(f, "transaction lock poisoned"),
         }
     }
@@ -316,7 +322,7 @@ impl TxnStore {
         let checkpoint_lsn = snapshot.as_ref().map_or(0, |snap| snap.checkpoint_lsn);
         let state = snapshot.map_or_else(BTreeMap::new, |snap| snap.entries);
 
-        let (wal, scan) = WalWriter::open(path)?;
+        let (wal, scan) = WalWriter::open_with_time_index(path, tritdb_wal::DEFAULT_SEGMENT_LIMIT)?;
         let recovered = recover(&scan, state, checkpoint_lsn)?;
         let next_txn_id = recovered.max_txn_id.saturating_add(1).max(1);
 
@@ -569,6 +575,17 @@ impl TxnStore {
             committed_txns: recovered.info.committed_txns,
             discarded_txns: recovered.info.discarded_txns,
         })
+    }
+
+    /// Reconstructs the committed state at the given wall-clock time.
+    ///
+    /// The time index is written at append time, so the result is the last
+    /// commit that was indexed at or before `ts_ms`. If the index is missing
+    /// or has no entry at or before the target, this returns
+    /// [`TxnError::TimeIndexUnavailable`] instead of guessing.
+    pub fn recover_at_time(path: &Path, ts_ms: u64) -> Result<PitrView, TxnError> {
+        let lsn = tritdb_wal::lookup_time(path, ts_ms)?.ok_or(TxnError::TimeIndexUnavailable)?;
+        Self::recover_at(path, lsn)
     }
 
     /// Removes the oldest archived checkpoints, keeping the newest `keep`.

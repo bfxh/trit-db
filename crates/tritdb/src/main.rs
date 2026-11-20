@@ -62,7 +62,7 @@ fn print_help() {
     println!("  txn dump --wal test.wal");
     println!("  txn checkpoint --wal test.wal [--archive]");
     println!("  txn history --wal test.wal [--prune --keep N]");
-    println!("  txn recover --wal test.wal --to-lsn 42");
+    println!("  txn recover --wal test.wal --to-lsn 42 | --to-time-ms 1700000000000");
     println!("  txn writer --wal test.wal --txns 1000 --keys-per-txn 4 --sleep-ms 1");
     println!("  pstore alloc --data pstore.pages --wal pstore.wal --kind data --text \"hello\"");
     println!("  pstore put --data pstore.pages --wal pstore.wal --id 0 --text \"hello\"");
@@ -441,10 +441,18 @@ fn join_lsns(lsns: &[u64]) -> String {
 
 fn txn_recover(args: &[String]) -> Result<(), String> {
     let wal = required_arg(args, "--wal")?;
-    let target_lsn = arg_u64(args, "--to-lsn")?;
     let limit = arg_usize(args, "--limit", 32).max(1);
-    let view = TxnStore::recover_at(Path::new(&wal), target_lsn)
-        .map_err(|error| format!("recover {wal} to lsn {target_lsn}: {error}"))?;
+    let view = if let Some(ts) = arg_value(args, "--to-time-ms") {
+        let ts: u64 = ts
+            .parse()
+            .map_err(|_| format!("invalid --to-time-ms: {ts}"))?;
+        TxnStore::recover_at_time(Path::new(&wal), ts)
+            .map_err(|error| format!("recover {wal} to time {ts}ms: {error}"))?
+    } else {
+        let target_lsn = arg_u64(args, "--to-lsn")?;
+        TxnStore::recover_at(Path::new(&wal), target_lsn)
+            .map_err(|error| format!("recover {wal} to lsn {target_lsn}: {error}"))?
+    };
     println!(
         "target_lsn={} checkpoint_lsn={} applied_lsn={} committed_txns={} discarded_txns={} keys={}",
         view.target_lsn,
