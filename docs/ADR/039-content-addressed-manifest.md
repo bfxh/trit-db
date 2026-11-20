@@ -42,9 +42,9 @@ tritdb manifest show --store dir --hash <hex>
 
 ## 后果 / 限制
 
-- **没有 GC**：删除 manifest 不会回收无引用 chunk；需要后续 `gc`。
+- **GC 是显式操作**：`gc(roots)` 只保留从给定 manifest 头可达的 chunk；调用方必须先确认 roots 完整。
 - **没有签名**：哈希链只能证明「没被改写」，不能证明「谁写的」；链头需要外部锚点。
-- **没有只读副本/部分拉取**：`ChunkStore` 只做本地读写。
+- **只读副本是最小闭环**：`replicate` 复制 manifest 链与 entry chunk，复制后重新 `verify_chain`；目标目录由调用方按只读方式使用。部分拉取/增量同步未做。
 - SHA-256 而非 BLAKE3；替换只影响 `Hash` 实现。
 - `created_ms` 只是本地时间，不是可信时间戳。
 

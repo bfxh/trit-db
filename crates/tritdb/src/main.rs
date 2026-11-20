@@ -81,7 +81,9 @@ fn print_help() {
     println!("  cas put --store dir --file blob");
     println!("  cas get --store dir --hash <hex> --out blob");
     println!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
+    println!("  cas gc --store dir --root <hex>");
     println!("  manifest verify --store dir --head <hex>");
+    println!("  manifest replicate --from src --to dst --head <hex>");
     println!("  manifest show --store dir --hash <hex>");
     println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
@@ -761,6 +763,26 @@ fn run_cas(args: &[String]) -> Result<(), String> {
             println!("hash={hash} present={}", store.has(&hash));
             Ok(())
         }
+        Some("gc") => {
+            let root = required_arg(args, "--store")?;
+            let roots = arg_values(args, "--root");
+            if roots.is_empty() {
+                return Err("cas gc requires at least one --root <hex>".to_string());
+            }
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let roots = roots
+                .iter()
+                .map(|text| tritdb_cas::Hash::from_hex(text))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            let report = store.gc(&roots).map_err(|error| error.to_string())?;
+            println!(
+                "reachable={} removed={} bytes_removed={}",
+                report.reachable, report.removed, report.bytes_removed
+            );
+            Ok(())
+        }
         Some(other) => Err(format!("unknown cas subcommand: {other}")),
         None => Err("cas requires `put`, `get`, or `has`".to_string()),
     }
@@ -827,6 +849,23 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             for (name, hash) in &manifest.entries {
                 println!("entry={name} hash={hash}");
             }
+            Ok(())
+        }
+        Some("replicate") => {
+            let from = required_arg(args, "--from")?;
+            let to = required_arg(args, "--to")?;
+            let head = required_arg(args, "--head")?;
+            let source = tritdb_cas::ChunkStore::open(std::path::Path::new(&from))
+                .map_err(|error| error.to_string())?;
+            let target = tritdb_cas::ChunkStore::open(std::path::Path::new(&to))
+                .map_err(|error| error.to_string())?;
+            let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
+            let info = tritdb_cas::replicate(&source, &target, &head)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "head={} manifests={} chunks={} bytes={}",
+                info.head, info.manifests, info.chunks, info.bytes
+            );
             Ok(())
         }
         Some(other) => Err(format!("unknown manifest subcommand: {other}")),
