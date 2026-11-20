@@ -302,6 +302,220 @@ impl WalScan {
     }
 }
 
+/// Time index magic bytes at offset 0.
+pub const TIME_INDEX_MAGIC: [u8; 4] = *b"TRTI";
+/// Time index format version.
+pub const TIME_INDEX_VERSION: u8 = 0;
+/// Time index header size in bytes.
+pub const TIME_INDEX_HEADER_SIZE: usize = 8;
+/// One time index entry: LSN (u64 LE) + wall-clock milliseconds (u64 LE).
+pub const TIME_INDEX_ENTRY_SIZE: usize = 16;
+
+/// Returns `<wal>.timeidx`.
+pub fn time_index_path_for(wal_path: &Path) -> std::path::PathBuf {
+    let mut name = wal_path.as_os_str().to_os_string();
+    name.push(".timeidx");
+    std::path::PathBuf::from(name)
+}
+
+/// Sidecar mapping wall-clock milliseconds to WAL LSNs.
+///
+/// The WAL record format has no timestamp field, so this index is written at
+/// append time and cannot be rebuilt from the WAL. It is best-effort: a crash
+/// can leave it one or more records behind, and a missing index means
+/// time-based recovery is unavailable rather than silently wrong.
+pub struct TimeIndex {
+    file: File,
+    last_lsn: u64,
+    last_ts_ms: u64,
+}
+
+impl TimeIndex {
+    /// Opens or creates `<wal>.timeidx`.
+    pub fn open(wal_path: &Path) -> Result<Self, WalError> {
+        let path = time_index_path_for(wal_path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let len = file.metadata()?.len();
+
+        if len < TIME_INDEX_HEADER_SIZE as u64 {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            write_time_index_header(&mut file)?;
+            file.sync_all()?;
+            return Ok(Self {
+                file,
+                last_lsn: 0,
+                last_ts_ms: 0,
+            });
+        }
+
+        let mut header = [0u8; TIME_INDEX_HEADER_SIZE];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header)?;
+        if header[0..4] != TIME_INDEX_MAGIC || header[4] != TIME_INDEX_VERSION {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            write_time_index_header(&mut file)?;
+            file.sync_all()?;
+            return Ok(Self {
+                file,
+                last_lsn: 0,
+                last_ts_ms: 0,
+            });
+        }
+
+        file.seek(SeekFrom::Start(TIME_INDEX_HEADER_SIZE as u64))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let mut offset = 0usize;
+        let mut last_lsn = 0u64;
+        let mut last_ts_ms = 0u64;
+        while offset + TIME_INDEX_ENTRY_SIZE <= bytes.len() {
+            let lsn = u64::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
+            ]);
+            let ts_ms = u64::from_le_bytes([
+                bytes[offset + 8],
+                bytes[offset + 9],
+                bytes[offset + 10],
+                bytes[offset + 11],
+                bytes[offset + 12],
+                bytes[offset + 13],
+                bytes[offset + 14],
+                bytes[offset + 15],
+            ]);
+            if lsn <= last_lsn {
+                break;
+            }
+            last_lsn = lsn;
+            last_ts_ms = last_ts_ms.max(ts_ms);
+            offset += TIME_INDEX_ENTRY_SIZE;
+        }
+        let valid_len = TIME_INDEX_HEADER_SIZE as u64 + offset as u64;
+        if valid_len < len {
+            file.set_len(valid_len)?;
+        }
+        file.seek(SeekFrom::Start(valid_len))?;
+        Ok(Self {
+            file,
+            last_lsn,
+            last_ts_ms,
+        })
+    }
+
+    /// Appends `(lsn, ts_ms)` when `lsn` moves forward. Timestamps are clamped
+    /// to be non-decreasing so a clock adjustment cannot break lookups.
+    pub fn append(&mut self, lsn: u64, ts_ms: u64) -> Result<(), WalError> {
+        if lsn <= self.last_lsn {
+            return Ok(());
+        }
+        let ts_ms = ts_ms.max(self.last_ts_ms);
+        let mut entry = [0u8; TIME_INDEX_ENTRY_SIZE];
+        entry[0..8].copy_from_slice(&lsn.to_le_bytes());
+        entry[8..16].copy_from_slice(&ts_ms.to_le_bytes());
+        self.file.write_all(&entry)?;
+        self.last_lsn = lsn;
+        self.last_ts_ms = ts_ms;
+        Ok(())
+    }
+
+    /// Last indexed LSN (`0` when empty).
+    pub const fn last_lsn(&self) -> u64 {
+        self.last_lsn
+    }
+
+    /// Discards every entry and writes a fresh header.
+    pub fn reset(&mut self) -> Result<(), WalError> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        write_time_index_header(&mut self.file)?;
+        self.file.sync_all()?;
+        self.last_lsn = 0;
+        self.last_ts_ms = 0;
+        Ok(())
+    }
+}
+
+/// Looks up the largest LSN whose timestamp is at or before `ts_ms`.
+///
+/// Returns `Ok(None)` when the index is missing, empty, or newer than the
+/// target. A missing index is not an error here; callers decide whether time
+/// recovery is required.
+pub fn lookup_time(wal_path: &Path, ts_ms: u64) -> Result<Option<u64>, WalError> {
+    let path = time_index_path_for(wal_path);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() < TIME_INDEX_HEADER_SIZE
+        || bytes[0..4] != TIME_INDEX_MAGIC
+        || bytes[4] != TIME_INDEX_VERSION
+    {
+        return Ok(None);
+    }
+    let mut best = None;
+    let mut offset = TIME_INDEX_HEADER_SIZE;
+    while offset + TIME_INDEX_ENTRY_SIZE <= bytes.len() {
+        let lsn = u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]);
+        let ts = u64::from_le_bytes([
+            bytes[offset + 8],
+            bytes[offset + 9],
+            bytes[offset + 10],
+            bytes[offset + 11],
+            bytes[offset + 12],
+            bytes[offset + 13],
+            bytes[offset + 14],
+            bytes[offset + 15],
+        ]);
+        if ts <= ts_ms {
+            best = Some(lsn);
+        } else {
+            break;
+        }
+        offset += TIME_INDEX_ENTRY_SIZE;
+    }
+    Ok(best)
+}
+
+fn write_time_index_header(file: &mut File) -> Result<(), WalError> {
+    let mut header = [0u8; TIME_INDEX_HEADER_SIZE];
+    header[0..4].copy_from_slice(&TIME_INDEX_MAGIC);
+    header[4] = TIME_INDEX_VERSION;
+    file.write_all(&header)?;
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Append-only WAL writer.
 ///
 /// A writer holds an exclusive OS handle only in the sense that it is the
@@ -313,6 +527,7 @@ pub struct WalWriter {
     segment_first_lsn: u64,
     segment_bytes: u64,
     segment_limit: u64,
+    time_index: Option<TimeIndex>,
 }
 
 /// Default size at which [`WalWriter::append`] starts a new segment.
@@ -370,6 +585,7 @@ impl WalWriter {
                     segment_first_lsn: 1,
                     segment_bytes: SEGMENT_HEADER_SIZE as u64,
                     segment_limit: segment_limit.max(MIN_SEGMENT_LIMIT),
+                    time_index: None,
                 },
                 scan,
             ));
@@ -400,9 +616,24 @@ impl WalWriter {
                 segment_first_lsn: scan.last_segment_first_lsn,
                 segment_bytes,
                 segment_limit: segment_limit.max(MIN_SEGMENT_LIMIT),
+                time_index: None,
             },
             scan,
         ))
+    }
+
+    /// Opens a WAL and keeps a `<wal>.timeidx` sidecar up to date.
+    ///
+    /// The index is appended after each record without an fsync: a crash can
+    /// leave it behind the WAL, which makes time recovery conservative, not
+    /// wrong.
+    pub fn open_with_time_index(
+        path: &Path,
+        segment_limit: u64,
+    ) -> Result<(Self, WalScan), WalError> {
+        let (mut writer, scan) = Self::open_with_limit(path, segment_limit)?;
+        writer.time_index = Some(TimeIndex::open(path)?);
+        Ok((writer, scan))
     }
 
     /// Appends one record and optionally fsyncs it.
@@ -451,6 +682,10 @@ impl WalWriter {
 
         self.next_lsn = self.next_lsn.saturating_add(1);
         self.segment_bytes = self.segment_bytes.saturating_add(total as u64);
+        if let Some(index) = &mut self.time_index {
+            // The index is advisory; a write failure must not fail the WAL.
+            let _ = index.append(lsn, now_ms());
+        }
         Ok(lsn)
     }
 
@@ -492,6 +727,14 @@ impl WalWriter {
         self.next_lsn = first_lsn;
         self.segment_first_lsn = first_lsn;
         self.segment_bytes = SEGMENT_HEADER_SIZE as u64;
+        if let Some(index) = &mut self.time_index {
+            // A normal checkpoint resets to `checkpoint_lsn + 1`, so the
+            // existing time entries stay valid. Only an LSN rollback (mostly
+            // tests) needs a fresh index.
+            if first_lsn <= index.last_lsn() {
+                index.reset()?;
+            }
+        }
         Ok(())
     }
 

@@ -9,9 +9,12 @@
 ```text
 crates/tritdb-txn/src/lib.rs        checkpoint_archive / recover_at / PitrView
 crates/tritdb/src/main.rs           txn history / txn recover / txn checkpoint --archive
-crates/tritdb-txn/tests/pitr.rs     4 个库级测试
-crates/tritdb/tests/pitr_cli.rs     1 个 CLI 端到端测试
-docs/ADR/032-pitr-wal-archive.md    决策与边界
+crates/tritdb-txn/tests/pitr.rs      5 个库级测试
+crates/tritdb-txn/tests/pitr_time.rs 3 个时间索引测试
+crates/tritdb/tests/pitr_cli.rs      2 个 CLI 端到端测试
+docs/ADR/032-pitr-wal-archive.md     归档与 PITR
+docs/ADR/033-wal-segment-rotation.md WAL 段轮转
+docs/ADR/034-time-index.md           时间索引
 ```
 
 ## 2. 用法
@@ -34,25 +37,29 @@ tritdb txn recover --wal test.wal --to-lsn 42
 - 重放 `base < lsn <= target` 的记录，来源是后续归档 WAL + 当前 WAL，按 LSN 排序去重；
 - `Commit` 在 target 之后的事务整个丢弃，不会半应用；
 - target 早于最早归档 → `PitrBeforeHistory`；
-- 归档缺 snap/wal → `PitrIncompleteArchive`。
+- 归档缺 snap/wal → `PitrIncompleteArchive`；
+- `<wal>.timeidx` 记录 LSN→墙钟毫秒，`recover_at_time` / `txn recover --to-time-ms` 选择 `ts <= target` 的最大 LSN，再走 `recover_at`；
+- 时间索引缺失或没有更早条目 → `TimeIndexUnavailable`，不静默退化成按 LSN 恢复。
 
 ## 4. 验收
 
 ```bash
 cargo test -p tritdb-txn --test pitr
+cargo test -p tritdb-txn --test pitr_time
 cargo test -p tritdb --test pitr_cli
 ```
 
 本机结果：
 
 ```text
-pitr: 4 passed
-pitr_cli: 1 passed
+pitr: 5 passed
+pitr_time: 3 passed
+pitr_cli: 2 passed
 ```
 
 ## 5. 还没做
 
 - 自动触发的归档 GC（当前只提供手动 `prune_history` / `txn history --prune`）；
-- 时间戳 → LSN 索引（当前只接受 `--to-lsn`）；
-- WAL 段轮转（归档仍是单段文件）；
+- 时间索引只能写入时维护，无法从 WAL 重建；崩溃可能落后最后几条；
+- WAL 段轮转已在同一文件内实现（ADR-033），但不能按段释放文件空间；
 - 在 `TxnStore` 打开状态下提供一致性快照读（当前 `recover_at` 读取 live WAL 时假设没有并发写者）。
