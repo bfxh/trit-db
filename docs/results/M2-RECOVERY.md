@@ -60,6 +60,7 @@ pitr_cli: 2 passed
 
 ## 5. 还没做
 
+- 100 次 kill -9 崩溃矩阵已覆盖（`crash_matrix.rs`：确定性随机 0–59 ms，100/100 恢复）；
 - 后台 checkpoint 已提供 `TxnStore::start_background_checkpoint`；它只做普通 checkpoint，不自动归档/prune；
 - 跨进程写锁已提供 `<wal>.lock`（PID 存活检测，stale 自动清理）；
 - 自动 GC 的保留数默认 8（`checkpoint_archive_keep` / `--keep` 可改，0 关闭）；
