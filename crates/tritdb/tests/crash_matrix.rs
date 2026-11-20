@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use tritdb_testkit::TempDir;
+use tritdb_testkit::{Rng, TempDir};
 use tritdb_txn::TxnStore;
 
 fn parse_key(key: &[u8]) -> (u64, usize) {
@@ -25,7 +25,11 @@ fn parse_key(key: &[u8]) -> (u64, usize) {
 #[test]
 fn hard_kill_delay_matrix_recovers_exact_committed_groups() {
     let exe = env!("CARGO_BIN_EXE_tritdb");
-    for delay_ms in [0u64, 2, 5, 10, 25, 50, 100, 200] {
+    // 100 hard kills at deterministic pseudo-random delays. The delay is
+    // capped so the matrix stays within a few seconds on CI.
+    let mut rng = Rng::new(0xC0FF_EE00);
+    for round in 0..100 {
+        let delay_ms = rng.below(60) as u64;
         let dir = TempDir::new("crash-matrix");
         let wal = dir.join("matrix.wal");
         let mut child = Command::new(exe)
@@ -53,7 +57,10 @@ fn hard_kill_delay_matrix_recovers_exact_committed_groups() {
         thread::sleep(Duration::from_millis(delay_ms));
         child.kill().expect("hard kill");
         let status = child.wait().expect("wait");
-        assert!(!status.success(), "delay {delay_ms}: writer survived");
+        assert!(
+            !status.success(),
+            "round {round} delay {delay_ms}: writer survived"
+        );
 
         let store = TxnStore::open(&wal).expect("recover");
         let recovery = store.recovery().clone();
@@ -64,31 +71,34 @@ fn hard_kill_delay_matrix_recovers_exact_committed_groups() {
             assert_eq!(
                 value,
                 format!("v{txn}-{index}").as_bytes(),
-                "delay {delay_ms}: corrupted value for {key:?}"
+                "round {round} delay {delay_ms}: corrupted value for {key:?}"
             );
             *groups.entry(txn).or_insert(0) += 1;
         }
         assert!(
             recovery.committed_txns >= 1,
-            "delay {delay_ms}: no committed transaction"
+            "round {round} delay {delay_ms}: no committed transaction"
         );
         assert!(
             recovery.discarded_txns <= 1,
-            "delay {delay_ms}: discarded={}",
+            "round {round} delay {delay_ms}: discarded={}",
             recovery.discarded_txns
         );
         assert_eq!(
             groups.len(),
             recovery.committed_txns,
-            "delay {delay_ms}: groups={} committed={}",
+            "round {round} delay {delay_ms}: groups={} committed={}",
             groups.len(),
             recovery.committed_txns
         );
         for (txn, count) in groups {
-            assert_eq!(count, 4, "delay {delay_ms}: txn {txn} has {count} keys");
+            assert_eq!(
+                count, 4,
+                "round {round} delay {delay_ms}: txn {txn} has {count} keys"
+            );
         }
         println!(
-            "delay={delay_ms} committed={} discarded={} torn={} keys={}",
+            "round={round} delay={delay_ms} committed={} discarded={} torn={} keys={}",
             recovery.committed_txns,
             recovery.discarded_txns,
             recovery.torn_tail_bytes,
