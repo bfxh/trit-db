@@ -40,6 +40,7 @@ cargo run -p tritdb -- txn dump --wal test.wal
 cargo run -p tritdb -- txn checkpoint --wal test.wal
 cargo run -p tritdb -- txn checkpoint --wal test.wal --archive
 cargo run -p tritdb -- txn history --wal test.wal
+cargo run -p tritdb -- txn history --wal test.wal --prune --keep 5
 cargo run -p tritdb -- txn recover --wal test.wal --to-lsn 10
 cargo run -p tritdb -- wal inspect --in test.wal
 cargo run -p tritdb -- pstore alloc --data pstore.pages --wal pstore.wal --text "hello"

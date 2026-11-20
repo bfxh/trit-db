@@ -61,7 +61,7 @@ fn print_help() {
     println!("  txn get --wal test.wal --key k");
     println!("  txn dump --wal test.wal");
     println!("  txn checkpoint --wal test.wal [--archive]");
-    println!("  txn history --wal test.wal");
+    println!("  txn history --wal test.wal [--prune --keep N]");
     println!("  txn recover --wal test.wal --to-lsn 42");
     println!("  txn writer --wal test.wal --txns 1000 --keys-per-txn 4 --sleep-ms 1");
     println!("  pstore alloc --data pstore.pages --wal pstore.wal --kind data --text \"hello\"");
@@ -392,6 +392,19 @@ fn txn_history(args: &[String]) -> Result<(), String> {
     let mut dir = std::ffi::OsString::from(&wal);
     dir.push(".history");
     let dir = std::path::PathBuf::from(dir);
+
+    if args.iter().any(|arg| arg == "--prune") {
+        let keep = arg_usize(args, "--keep", 1);
+        let info = TxnStore::prune_history(Path::new(&wal), keep)
+            .map_err(|error| format!("prune {wal}: {error}"))?;
+        println!(
+            "pruned={} kept={}",
+            join_lsns(&info.removed),
+            join_lsns(&info.kept)
+        );
+        return Ok(());
+    }
+
     if !dir.is_dir() {
         println!("history={} entries=0", dir.display());
         return Ok(());
@@ -414,6 +427,16 @@ fn txn_history(args: &[String]) -> Result<(), String> {
         println!("lsn={lsn} wal_bytes={bytes} snapshot={has_snapshot}");
     }
     Ok(())
+}
+
+fn join_lsns(lsns: &[u64]) -> String {
+    if lsns.is_empty() {
+        return "-".to_string();
+    }
+    lsns.iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn txn_recover(args: &[String]) -> Result<(), String> {

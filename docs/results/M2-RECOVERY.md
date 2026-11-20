@@ -22,6 +22,7 @@ tritdb txn checkpoint --wal test.wal --archive
 
 # 列出可用历史
 tritdb txn history --wal test.wal
+tritdb txn history --wal test.wal --prune --keep 5
 
 # 恢复到指定 LSN（只读；不修改 live store）
 tritdb txn recover --wal test.wal --to-lsn 42
@@ -51,7 +52,7 @@ pitr_cli: 1 passed
 
 ## 5. 还没做
 
-- 自动保留策略 / 归档 GC；
+- 自动触发的归档 GC（当前只提供手动 `prune_history` / `txn history --prune`）；
 - 时间戳 → LSN 索引（当前只接受 `--to-lsn`）；
 - WAL 段轮转（归档仍是单段文件）；
 - 在 `TxnStore` 打开状态下提供一致性快照读（当前 `recover_at` 读取 live WAL 时假设没有并发写者）。
