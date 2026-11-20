@@ -176,13 +176,16 @@ EXPLAIN SEXPR SELECT ...;
 - `EXPLAIN SEXPR` 走与 `EXPLAIN` 相同的折叠、下推、列裁剪、绑定和估算路径，但不执行查询；它只把同一棵 `PlanNode` 树用只读括号化形式输出。
 - `SEXPR` 只在 `EXPLAIN` 后按普通单词识别，不是全局关键字；`EXPLAIN ANALYZE SEXPR SELECT ...` 明确拒绝。
 - 返回单列 `plan`、单行文本；文本内部保留换行和缩进，便于直接作为机器可读的计划值保存。
-- 节点形如：
-  - `(scan "a" :filtered #t :est-rows 3 :cols ("id"))`；没有列裁剪时省略 `:cols`，零列显示 `:cols ()`；
-  - `(join hash inner :details ("keys=(a.id = b.id)") :est-rows 2 child child)`；算法为 `hash` 或 `nested-loop`；`details` 暂按历史文本保留键/残余片段，由 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 结构化字段渲染，输出不变；
-  - `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :est-groups N child)`；
+- join 节点形如：
+  - `ON` hash join：`(join hash inner :keys (("a.id" "b.id")) :est-rows 2 child child)`；每个键是 `("左列" "右列")` 二元列表；
+  - `USING` / `NATURAL`：`(join hash left :keys ("id" "code") child child)`；键是共享列名列表；
+  - `ON` 有等值键之外的谓词时追加 `:residual #t`；强制 nested loop 时显示 `:on-expr #t`；
+  - 没有键、残余或 `on=expr` 时省略对应字段；不再输出 `:details` 字符串列表。
+- 算法为 `hash` 或 `nested-loop`；键、残余标志和 `on-expr` 直接来自 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 字段，输出格式见 ADR-019。
+- `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :est-groups N child)`；
   - `(project ("v" "n") :est-rows N child)`、`(sort :keys 1 :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
 - 只有静态计划，因此不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。
-- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md) 与 [`ADR-018`](../ADR/018-structured-join-keys.md)。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md) 与 [`ADR-019`](../ADR/019-structured-join-sexpr.md)。
 
 ### EXPLAIN ANALYZE SELECT
 

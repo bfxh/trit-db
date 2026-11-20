@@ -1943,13 +1943,13 @@ fn explain_sexpr_reports_structured_plan() {
     assert_eq!(
         plan,
         "(limit :limit 1\n  (sort :keys 1\n    (project (\"v\")\n      \
-         (join hash inner :details (\"keys=(a.id = b.id)\")\n        \
+         (join hash inner :keys ((\"a.id\" \"b.id\"))\n        \
          (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
     );
 }
 
 #[test]
-fn explain_sexpr_preserves_join_key_and_residual_details() {
+fn explain_sexpr_reports_structured_join_keys() {
     fn plan_text(engine: &mut SqlEngine, sql: &str) -> String {
         let result = engine.execute_script(sql).expect("explain sexpr");
         let (_, rows) = as_rows(&result[0]);
@@ -1959,7 +1959,7 @@ fn explain_sexpr_preserves_join_key_and_residual_details() {
         }
     }
 
-    let dir = TempDir::new("sql-explain-sexpr-join-details");
+    let dir = TempDir::new("sql-explain-sexpr-join-keys");
     let db = dir.join("sql.db");
     let mut engine = SqlEngine::open(&db).expect("open");
     engine
@@ -1971,16 +1971,21 @@ fn explain_sexpr_preserves_join_key_and_residual_details() {
         "EXPLAIN SEXPR SELECT * FROM a LEFT JOIN b USING (id);",
     );
     assert!(
-        using.contains("(join hash left :details (\"keys=(id)\")"),
+        using.contains("(join hash left :keys (\"id\")"),
         "unexpected plan: {using}"
     );
+    assert!(!using.contains(":details"), "unexpected plan: {using}");
 
     let residual = plan_text(
         &mut engine,
         "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id AND b.code <> 0;",
     );
     assert!(
-        residual.contains(":details (\"keys=(a.id = b.id)\" \"residual=yes\")"),
+        residual.contains(":keys ((\"a.id\" \"b.id\")) :residual #t"),
+        "unexpected plan: {residual}"
+    );
+    assert!(
+        !residual.contains(":details"),
         "unexpected plan: {residual}"
     );
 
@@ -1990,9 +1995,10 @@ fn explain_sexpr_preserves_join_key_and_residual_details() {
         "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;",
     );
     assert!(
-        nested.contains("(join nested-loop inner :details (\"on=expr\")"),
+        nested.contains("(join nested-loop inner :on-expr #t"),
         "unexpected plan: {nested}"
     );
+    assert!(!nested.contains(":details"), "unexpected plan: {nested}");
 }
 
 #[test]

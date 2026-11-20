@@ -275,10 +275,15 @@ impl PlanNode {
                 });
                 out.push(' ');
                 out.push_str(join_kind_name(join.kind));
-                let fragments = join.detail_fragments();
-                if !fragments.is_empty() {
-                    out.push_str(" :details ");
-                    push_string_list(out, &fragments);
+                if let Some(keys) = &join.keys {
+                    out.push_str(" :keys ");
+                    push_join_keys(out, keys);
+                }
+                if join.residual {
+                    out.push_str(" :residual #t");
+                }
+                if join.on_expr {
+                    out.push_str(" :on-expr #t");
                 }
                 push_sexpr_metrics(out, &join.metrics, "rows");
                 self.write_sexpr_children(out, indent);
@@ -418,6 +423,26 @@ fn push_string_list(out: &mut String, values: &[String]) {
         push_string(out, value);
     }
     out.push(')');
+}
+
+fn push_join_keys(out: &mut String, keys: &JoinKeys) {
+    match keys {
+        JoinKeys::Names(names) => push_string_list(out, names),
+        JoinKeys::Pairs(pairs) => {
+            out.push('(');
+            for (index, key) in pairs.iter().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                out.push('(');
+                push_string(out, &key.left);
+                out.push(' ');
+                push_string(out, &key.right);
+                out.push(')');
+            }
+            out.push(')');
+        }
+    }
 }
 
 fn join_kind_name(kind: JoinKind) -> &'static str {
