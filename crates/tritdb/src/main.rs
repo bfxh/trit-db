@@ -40,6 +40,8 @@ fn run() -> Result<(), String> {
         Some("txn") => run_txn(&args),
         Some("pstore") => run_pstore(&args),
         Some("sql") => run_sql(&args),
+        Some("models") => run_models(&args),
+        Some("repair") => run_repair(&args),
         Some("crosscheck") => run_crosscheck(),
         Some("help") | Some("--help") | None => {
             print_help();
@@ -72,6 +74,8 @@ fn print_help() {
     println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
     println!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
     println!("  sql --db sql.db --file script.sql");
+    println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
+    println!("  repair --facts 2 --denial 0,1 --query 0");
     println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
 
@@ -702,6 +706,235 @@ fn pstore_writer(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn run_models(args: &[String]) -> Result<(), String> {
+    let vars = arg_usize(args, "--vars", 0);
+    let expr_text = required_arg(args, "--expr")?;
+    let expr = parse_bool_expr(&expr_text, vars)?;
+    let models = tritdb_exec::ann::count_models(&expr, vars).map_err(|error| error.to_string())?;
+    println!("vars={vars} models={models}");
+    Ok(())
+}
+
+fn run_repair(args: &[String]) -> Result<(), String> {
+    let facts = arg_usize(args, "--facts", 0);
+    let denials = arg_groups(args, "--denial")?;
+    let query = arg_indices(args, "--query")?;
+    let answer = tritdb_exec::ann::under_repair(facts, &denials, &query)
+        .map_err(|error| error.to_string())?;
+    let answer = match answer {
+        tritdb_exec::ann::RepairAnswer::Certain => "certain",
+        tritdb_exec::ann::RepairAnswer::Impossible => "impossible",
+        tritdb_exec::ann::RepairAnswer::Contingent => "contingent",
+    };
+    println!(
+        "facts={} denials={} query={} answer={answer}",
+        facts,
+        denials.len(),
+        join_indices(&query)
+    );
+    Ok(())
+}
+
+fn arg_groups(args: &[String], flag: &str) -> Result<Vec<Vec<usize>>, String> {
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index + 1 < args.len() {
+        if args[index] == flag {
+            groups.push(parse_indices(&args[index + 1])?);
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(groups)
+}
+
+fn arg_indices(args: &[String], flag: &str) -> Result<Vec<usize>, String> {
+    match arg_value(args, flag) {
+        Some(value) => parse_indices(&value),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn parse_indices(value: &str) -> Result<Vec<usize>, String> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid index: {part}"))
+        })
+        .collect()
+}
+
+fn join_indices(indices: &[usize]) -> String {
+    if indices.is_empty() {
+        return "-".to_string();
+    }
+    indices
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct BoolParser<'a> {
+    input: &'a [u8],
+    position: usize,
+    vars: usize,
+}
+
+impl<'a> BoolParser<'a> {
+    fn new(input: &'a str, vars: usize) -> Self {
+        Self {
+            input: input.as_bytes(),
+            position: 0,
+            vars,
+        }
+    }
+
+    fn parse(mut self) -> Result<tritdb_exec::ann::BoolExpr, String> {
+        let expr = self.parse_or()?;
+        self.skip_ws();
+        if self.position < self.input.len() {
+            return Err(format!("unexpected input at byte {}", self.position));
+        }
+        Ok(expr)
+    }
+
+    fn parse_or(&mut self) -> Result<tritdb_exec::ann::BoolExpr, String> {
+        let mut items = vec![self.parse_and()?];
+        loop {
+            self.skip_ws();
+            if self.eat_word("OR") || self.eat("||") {
+                items.push(self.parse_and()?);
+            } else {
+                break;
+            }
+        }
+        if items.len() == 1 {
+            Ok(items.pop().expect("one item"))
+        } else {
+            Ok(tritdb_exec::ann::BoolExpr::Or(items))
+        }
+    }
+
+    fn parse_and(&mut self) -> Result<tritdb_exec::ann::BoolExpr, String> {
+        let mut items = vec![self.parse_not()?];
+        loop {
+            self.skip_ws();
+            if self.eat_word("AND") || self.eat("&&") {
+                items.push(self.parse_not()?);
+            } else {
+                break;
+            }
+        }
+        if items.len() == 1 {
+            Ok(items.pop().expect("one item"))
+        } else {
+            Ok(tritdb_exec::ann::BoolExpr::And(items))
+        }
+    }
+
+    fn parse_not(&mut self) -> Result<tritdb_exec::ann::BoolExpr, String> {
+        self.skip_ws();
+        if self.eat_word("NOT") || self.eat("!") {
+            return Ok(tritdb_exec::ann::BoolExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_atom()
+    }
+
+    fn parse_atom(&mut self) -> Result<tritdb_exec::ann::BoolExpr, String> {
+        self.skip_ws();
+        if self.eat("(") {
+            let expr = self.parse_or()?;
+            self.skip_ws();
+            if !self.eat(")") {
+                return Err("missing ')'".to_string());
+            }
+            return Ok(expr);
+        }
+        if self.eat_word("TRUE") {
+            return Ok(tritdb_exec::ann::BoolExpr::Const(true));
+        }
+        if self.eat_word("FALSE") {
+            return Ok(tritdb_exec::ann::BoolExpr::Const(false));
+        }
+        let name = self.ident()?;
+        let index = parse_var_name(&name, self.vars)?;
+        Ok(tritdb_exec::ann::BoolExpr::Var(index))
+    }
+
+    fn ident(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        let start = self.position;
+        while self.position < self.input.len()
+            && (self.input[self.position].is_ascii_alphanumeric()
+                || self.input[self.position] == b'_')
+        {
+            self.position += 1;
+        }
+        if start == self.position {
+            return Err(format!("expected a variable at byte {start}"));
+        }
+        Ok(String::from_utf8_lossy(&self.input[start..self.position]).into_owned())
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        let bytes = token.as_bytes();
+        if self.input[self.position..].starts_with(bytes) {
+            self.position += bytes.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        self.skip_ws();
+        let bytes = word.as_bytes();
+        if !self.input[self.position..].starts_with(bytes) {
+            return false;
+        }
+        let end = self.position + bytes.len();
+        if end < self.input.len()
+            && (self.input[end].is_ascii_alphanumeric() || self.input[end] == b'_')
+        {
+            return false;
+        }
+        self.position = end;
+        true
+    }
+
+    fn skip_ws(&mut self) {
+        while self.position < self.input.len() && self.input[self.position].is_ascii_whitespace() {
+            self.position += 1;
+        }
+    }
+}
+
+fn parse_var_name(name: &str, vars: usize) -> Result<usize, String> {
+    let index = if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() {
+        usize::from(name.as_bytes()[0] - b'a')
+    } else if let Some(rest) = name.strip_prefix('v') {
+        rest.parse::<usize>()
+            .map_err(|_| format!("invalid variable: {name}"))?
+    } else {
+        name.parse::<usize>()
+            .map_err(|_| format!("invalid variable: {name}"))?
+    };
+    if index >= vars {
+        return Err(format!("variable {name} is outside 0..{vars}"));
+    }
+    Ok(index)
+}
+
+fn parse_bool_expr(text: &str, vars: usize) -> Result<tritdb_exec::ann::BoolExpr, String> {
+    BoolParser::new(text, vars).parse()
 }
 
 fn run_sql(args: &[String]) -> Result<(), String> {
