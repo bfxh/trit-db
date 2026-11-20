@@ -116,6 +116,11 @@ impl RecordKind {
 pub enum WalError {
     /// Underlying I/O error.
     Io(std::io::Error),
+    /// Another process holds `<wal>.lock`.
+    Locked {
+        /// PID recorded in the lock file; `0` when the file could not be read.
+        pid: u32,
+    },
     /// Segment magic is not `TRWS`.
     BadSegmentMagic {
         /// Bytes that were found.
@@ -188,6 +193,7 @@ impl fmt::Display for WalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WalError::Io(error) => write!(f, "wal io error: {error}"),
+            WalError::Locked { pid } => write!(f, "wal is locked by process {pid}"),
             WalError::BadSegmentMagic { found } => write!(
                 f,
                 "bad wal segment magic: found {found:?}, expected {SEGMENT_MAGIC:?}"
@@ -521,9 +527,78 @@ fn now_ms() -> u64 {
 /// A writer holds an exclusive OS handle only in the sense that it is the
 /// intended single writer; there is no cross-process lock in M0. Opening a
 /// second writer on the same path is undefined.
+fn lock_path(wal_path: &Path) -> PathBuf {
+    let mut name = wal_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Cross-process writer lock: `<wal>.lock` holds the owner PID.
+///
+/// `create_new` makes acquisition atomic. A stale file (owner no longer alive)
+/// is removed and retried once.
+struct ProcessLock {
+    path: PathBuf,
+}
+
+impl ProcessLock {
+    fn acquire(wal_path: &Path) -> Result<Self, WalError> {
+        let path = lock_path(wal_path);
+        for attempt in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let owner = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|text| text.trim().parse::<u32>().ok());
+                    if let Some(owner) = owner {
+                        if process_alive(owner) {
+                            return Err(WalError::Locked { pid: owner });
+                        }
+                    }
+                    let _ = std::fs::remove_file(&path);
+                    if attempt == 1 {
+                        return Err(WalError::Locked { pid: 0 });
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(WalError::Locked { pid: 0 })
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub struct WalWriter {
     path: PathBuf,
     file: Option<File>,
+    _lock: Option<ProcessLock>,
     next_lsn: u64,
     segment_first_lsn: u64,
     segment_bytes: u64,
@@ -717,6 +792,7 @@ impl WalWriter {
     /// Opens or creates a WAL with an explicit segment size.
     pub fn open_with_limit(path: &Path, segment_limit: u64) -> Result<(Self, WalScan), WalError> {
         let segment_limit = segment_limit.max(MIN_SEGMENT_LIMIT);
+        let lock = ProcessLock::acquire(path)?;
         let merged = match scan_segments(path, true) {
             Ok(merged) => merged,
             Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -742,6 +818,7 @@ impl WalWriter {
                     Self {
                         path: path.to_path_buf(),
                         file: Some(file),
+                        _lock: Some(lock),
                         next_lsn: 1,
                         segment_first_lsn: 1,
                         segment_bytes: SEGMENT_HEADER_SIZE as u64,
@@ -793,6 +870,7 @@ impl WalWriter {
             Self {
                 path: path.to_path_buf(),
                 file: Some(file),
+                _lock: Some(lock),
                 next_lsn,
                 segment_first_lsn: active_first_lsn,
                 segment_bytes: active_bytes,
