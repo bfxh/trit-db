@@ -11,7 +11,9 @@ use crate::TruthValue;
 /// Maximum variables accepted by [`count_models`].
 pub const MAX_MODEL_VARS: usize = 20;
 /// Maximum facts accepted by [`under_repair`].
-pub const MAX_REPAIR_FACTS: usize = 16;
+pub const MAX_REPAIR_FACTS: usize = 64;
+/// Maximum facts inside one connected component of the denial graph.
+pub const MAX_COMPONENT_FACTS: usize = 16;
 
 /// Belnap four-valued truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,6 +309,56 @@ pub fn under_repair(
         }
     }
 
+    // Denials only connect facts inside one component. Answers compose
+    // independently, so each component is enumerated on its own.
+    let mut any_impossible = false;
+    let mut any_contingent = false;
+    for component in components(facts, denials) {
+        let position: std::collections::BTreeMap<usize, usize> = component
+            .iter()
+            .enumerate()
+            .map(|(local, &fact)| (fact, local))
+            .collect();
+        let local_denials: Vec<Vec<usize>> = denials
+            .iter()
+            .filter(|denial| {
+                denial
+                    .first()
+                    .is_some_and(|first| position.contains_key(first))
+            })
+            .map(|denial| denial.iter().map(|fact| position[fact]).collect())
+            .collect();
+        let local_query: Vec<usize> = query
+            .iter()
+            .filter_map(|fact| position.get(fact).copied())
+            .collect();
+        match component_answer(component.len(), &local_denials, &local_query)? {
+            RepairAnswer::Impossible => any_impossible = true,
+            RepairAnswer::Contingent => any_contingent = true,
+            RepairAnswer::Certain => {}
+        }
+    }
+
+    Ok(if any_impossible {
+        RepairAnswer::Impossible
+    } else if any_contingent {
+        RepairAnswer::Contingent
+    } else {
+        RepairAnswer::Certain
+    })
+}
+
+fn component_answer(
+    facts: usize,
+    denials: &[Vec<usize>],
+    query: &[usize],
+) -> Result<RepairAnswer, AnnError> {
+    if facts > MAX_COMPONENT_FACTS {
+        return Err(AnnError::TooManyFacts {
+            facts,
+            max: MAX_COMPONENT_FACTS,
+        });
+    }
     let mut certain = true;
     let mut possible = false;
     for mask in 0..(1u64 << facts) {
@@ -320,7 +372,6 @@ pub fn under_repair(
             certain = false;
         }
     }
-
     Ok(if certain {
         RepairAnswer::Certain
     } else if possible {
@@ -328,6 +379,37 @@ pub fn under_repair(
     } else {
         RepairAnswer::Impossible
     })
+}
+
+fn components(facts: usize, denials: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn find(parent: &mut [usize], mut value: usize) -> usize {
+        while parent[value] != value {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        value
+    }
+
+    let mut parent: Vec<usize> = (0..facts).collect();
+    for denial in denials {
+        if let Some(&first) = denial.first() {
+            for &other in &denial[1..] {
+                let left = find(&mut parent, first);
+                let right = find(&mut parent, other);
+                if left != right {
+                    parent[left] = right;
+                }
+            }
+        }
+    }
+
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for fact in 0..facts {
+        let root = find(&mut parent, fact);
+        groups.entry(root).or_default().push(fact);
+    }
+    groups.into_values().collect()
 }
 
 fn consistent(mask: u64, denials: &[Vec<usize>]) -> bool {
@@ -632,6 +714,38 @@ mod tests {
         assert_eq!(
             under_repair(3, &[vec![0, 1], vec![1, 2]], &[0, 1]).unwrap(),
             RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn repairs_decompose_into_connected_components() {
+        // 20 facts, two independent conflicts. Only the first component is
+        // contested; the second one is irrelevant to these queries.
+        let denials = vec![vec![0, 1], vec![10, 11]];
+        assert_eq!(
+            under_repair(20, &denials, &[0]).unwrap(),
+            RepairAnswer::Contingent
+        );
+        assert_eq!(
+            under_repair(20, &denials, &[2]).unwrap(),
+            RepairAnswer::Certain
+        );
+        assert_eq!(
+            under_repair(20, &denials, &[0, 1]).unwrap(),
+            RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn repairs_reject_an_oversized_component() {
+        let facts = MAX_COMPONENT_FACTS + 1;
+        let denials: Vec<Vec<usize>> = (0..facts - 1).map(|i| vec![i, i + 1]).collect();
+        assert_eq!(
+            under_repair(facts, &denials, &[0]),
+            Err(AnnError::TooManyFacts {
+                facts,
+                max: MAX_COMPONENT_FACTS
+            })
         );
     }
 
