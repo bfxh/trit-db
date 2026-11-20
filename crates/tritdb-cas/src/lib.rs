@@ -346,6 +346,149 @@ impl Manifest {
     }
 }
 
+/// Result of a garbage-collection pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcReport {
+    /// Chunks reachable from the given manifest roots.
+    pub reachable: usize,
+    /// Chunk files removed.
+    pub removed: usize,
+    /// Bytes removed.
+    pub bytes_removed: u64,
+}
+
+/// Result of copying a manifest chain to another store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaInfo {
+    /// Copied head manifest.
+    pub head: Hash,
+    /// Manifests copied.
+    pub manifests: usize,
+    /// Non-manifest chunks copied.
+    pub chunks: usize,
+    /// Bytes copied.
+    pub bytes: u64,
+}
+
+impl ChunkStore {
+    /// Removes chunks that are not reachable from `roots`.
+    ///
+    /// `roots` must be manifest hashes. Each root is walked back through its
+    /// parent chain; every manifest and every entry chunk is kept.
+    pub fn gc(&self, roots: &[Hash]) -> Result<GcReport, CasError> {
+        let mut reachable = HashSet::new();
+        for root in roots {
+            self.collect_reachable(root, &mut reachable)?;
+        }
+
+        let chunks_dir = self.root.join("chunks");
+        let mut removed = 0usize;
+        let mut bytes_removed = 0u64;
+        if !chunks_dir.is_dir() {
+            return Ok(GcReport {
+                reachable: reachable.len(),
+                removed,
+                bytes_removed,
+            });
+        }
+        for prefix_entry in fs::read_dir(&chunks_dir)? {
+            let prefix_entry = prefix_entry?;
+            if !prefix_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let prefix = prefix_entry.file_name().to_string_lossy().to_string();
+            let mut empty = true;
+            for file in fs::read_dir(prefix_entry.path())? {
+                let file = file?;
+                if !file.file_type()?.is_file() {
+                    continue;
+                }
+                empty = false;
+                let rest = file.file_name().to_string_lossy().to_string();
+                let Ok(hash) = Hash::from_hex(&format!("{prefix}{rest}")) else {
+                    continue;
+                };
+                if reachable.contains(&hash) {
+                    continue;
+                }
+                let len = file.metadata()?.len();
+                fs::remove_file(file.path())?;
+                removed += 1;
+                bytes_removed += len;
+            }
+            if empty {
+                let _ = fs::remove_dir(prefix_entry.path());
+            }
+        }
+        Ok(GcReport {
+            reachable: reachable.len(),
+            removed,
+            bytes_removed,
+        })
+    }
+
+    fn collect_reachable(&self, head: &Hash, out: &mut HashSet<Hash>) -> Result<(), CasError> {
+        let mut current = Some(*head);
+        while let Some(hash) = current {
+            if !out.insert(hash) {
+                break;
+            }
+            let manifest = Manifest::load(self, &hash)?;
+            for entry in manifest.entries.values() {
+                out.insert(*entry);
+            }
+            current = manifest.parent;
+        }
+        Ok(())
+    }
+}
+
+/// Copies a manifest chain and its entry chunks into another store.
+///
+/// The target is verified with [`verify_chain`] after the copy, so a partial
+/// or tampered replica fails immediately. A read-only replica is simply a
+/// target directory that the caller mounts/uses read-only afterwards.
+pub fn replicate(
+    source: &ChunkStore,
+    target: &ChunkStore,
+    head: &Hash,
+) -> Result<ReplicaInfo, CasError> {
+    let mut manifests = 0usize;
+    let mut chunks = 0usize;
+    let mut bytes = 0u64;
+    let mut seen = HashSet::new();
+    let mut current = Some(*head);
+
+    while let Some(hash) = current {
+        if !seen.insert(hash) {
+            break;
+        }
+        let data = source.get(&hash)?;
+        bytes += data.len() as u64;
+        target.put(&data)?;
+        manifests += 1;
+        let manifest = Manifest::decode(&data)?;
+        for entry in manifest.entries.values() {
+            if !seen.insert(*entry) {
+                continue;
+            }
+            let data = source.get(entry)?;
+            bytes += data.len() as u64;
+            target.put(&data)?;
+            chunks += 1;
+        }
+        current = manifest.parent;
+    }
+
+    verify_chain(target, head)?;
+    Ok(ReplicaInfo {
+        head: *head,
+        manifests,
+        chunks,
+        bytes,
+    })
+}
+
 /// Result of walking a manifest hash chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainInfo {
@@ -553,6 +696,59 @@ mod tests {
         assert_eq!(Manifest::decode(&encoded).expect("decode"), loaded);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_keeps_reachable_chunks_and_removes_orphans() {
+        let dir = tempfile_dir("cas-gc");
+        let store = ChunkStore::open(&dir).expect("open");
+        let blob = store.put(b"payload").expect("put blob");
+        let orphan = store.put(b"orphan").expect("put orphan");
+
+        let mut entries = BTreeMap::new();
+        entries.insert("blob".to_string(), blob);
+        let root = Manifest::new(None, entries)
+            .store(&store)
+            .expect("store root");
+
+        let report = store.gc(&[root]).expect("gc");
+        assert_eq!(report.removed, 1);
+        assert!(store.has(&root));
+        assert!(store.has(&blob));
+        assert!(!store.has(&orphan));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replicate_copies_the_chain_to_a_read_only_target() {
+        let source_dir = tempfile_dir("cas-source");
+        let target_dir = tempfile_dir("cas-target");
+        let source = ChunkStore::open(&source_dir).expect("open source");
+        let target = ChunkStore::open(&target_dir).expect("open target");
+
+        let blob = source.put(b"payload").expect("put blob");
+        let mut entries = BTreeMap::new();
+        entries.insert("blob".to_string(), blob);
+        let root = Manifest::new(None, entries.clone())
+            .store(&source)
+            .expect("store root");
+        let head = Manifest::new(Some(root), entries)
+            .store(&source)
+            .expect("store head");
+
+        let info = replicate(&source, &target, &head).expect("replicate");
+        assert_eq!(info.manifests, 2);
+        assert_eq!(info.chunks, 1);
+        verify_chain(&target, &head).expect("target verifies");
+
+        // Source GC must not affect the replica.
+        source.gc(&[head]).expect("gc source");
+        assert!(target.has(&blob));
+        verify_chain(&target, &head).expect("replica still verifies");
+
+        let _ = fs::remove_dir_all(&source_dir);
+        let _ = fs::remove_dir_all(&target_dir);
     }
 
     #[test]

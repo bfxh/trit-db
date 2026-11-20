@@ -94,3 +94,76 @@ fn manifest_verify_rejects_a_tampered_manifest() {
     ]);
     assert!(!output.status.success(), "tampered manifest must fail");
 }
+
+#[test]
+fn cas_gc_removes_orphans_and_replicate_copies_the_chain() {
+    let dir = TempDir::new("cas-gc-cli");
+    let store = dir.join("store");
+    let store_text = store.to_str().expect("store path");
+
+    let blob = dir.join("blob.bin");
+    std::fs::write(&blob, b"payload").expect("write blob");
+    let output = run([
+        "cas",
+        "put",
+        "--store",
+        store_text,
+        "--file",
+        blob.to_str().expect("blob path"),
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let blob_hash = field(&stdout(&output), "hash").to_string();
+
+    let orphan = dir.join("orphan.bin");
+    std::fs::write(&orphan, b"orphan").expect("write orphan");
+    let output = run([
+        "cas",
+        "put",
+        "--store",
+        store_text,
+        "--file",
+        orphan.to_str().expect("orphan path"),
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let orphan_hash = field(&stdout(&output), "hash").to_string();
+
+    let entry = format!("blob={blob_hash}");
+    let output = run([
+        "manifest", "commit", "--store", store_text, "--entry", &entry,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let manifest = field(&stdout(&output), "manifest").to_string();
+
+    let output = run(["cas", "gc", "--store", store_text, "--root", &manifest]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("removed=1"));
+
+    let output = run(["cas", "has", "--store", store_text, "--hash", &orphan_hash]);
+    assert!(stdout(&output).contains("present=false"));
+    let output = run(["cas", "has", "--store", store_text, "--hash", &blob_hash]);
+    assert!(stdout(&output).contains("present=true"));
+
+    let replica = dir.join("replica");
+    let output = run([
+        "manifest",
+        "replicate",
+        "--from",
+        store_text,
+        "--to",
+        replica.to_str().expect("replica path"),
+        "--head",
+        &manifest,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("manifests=1"));
+
+    let output = run([
+        "manifest",
+        "verify",
+        "--store",
+        replica.to_str().expect("replica path"),
+        "--head",
+        &manifest,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+}
