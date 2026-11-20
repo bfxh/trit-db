@@ -230,3 +230,153 @@ fn manifest_snapshot_and_restore_roundtrip() {
     assert!(text.contains("1	a"), "out: {text}");
     assert!(text.contains("2	b"), "out: {text}");
 }
+
+#[test]
+fn manifest_replicate_subset_and_anchor_roundtrip() {
+    let dir = TempDir::new("cas-anchor-cli");
+    let store = dir.join("store");
+    let store_text = store.to_str().expect("store path");
+
+    let mut hashes = Vec::new();
+    for (name, body) in [("keep", b"keep-payload"), ("drop", b"drop-payload")] {
+        let blob = dir.join(&format!("{name}.bin"));
+        std::fs::write(&blob, body).expect("write blob");
+        let output = run([
+            "cas",
+            "put",
+            "--store",
+            store_text,
+            "--file",
+            blob.to_str().expect("blob path"),
+        ]);
+        assert!(output.status.success(), "stderr: {:?}", output);
+        hashes.push((
+            name.to_string(),
+            field(&stdout(&output), "hash").to_string(),
+        ));
+    }
+
+    let output = run([
+        "manifest",
+        "commit",
+        "--store",
+        store_text,
+        "--entry",
+        &format!("{}={}", hashes[0].0, hashes[0].1),
+        "--entry",
+        &format!("{}={}", hashes[1].0, hashes[1].1),
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let manifest = field(&stdout(&output), "manifest").to_string();
+
+    // Partial pull: only `keep` lands in the replica, the chain still verifies.
+    let replica = dir.join("replica");
+    let replica_text = replica.to_str().expect("replica path");
+    let output = run([
+        "manifest",
+        "replicate",
+        "--from",
+        store_text,
+        "--to",
+        replica_text,
+        "--head",
+        &manifest,
+        "--entry",
+        "keep",
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(
+        stdout(&output).contains("chunks=1"),
+        "out: {:?}",
+        stdout(&output)
+    );
+
+    let output = run([
+        "cas",
+        "has",
+        "--store",
+        replica_text,
+        "--hash",
+        &hashes[0].1,
+    ]);
+    assert!(stdout(&output).contains("present=true"));
+    let output = run([
+        "cas",
+        "has",
+        "--store",
+        replica_text,
+        "--hash",
+        &hashes[1].1,
+    ]);
+    assert!(stdout(&output).contains("present=false"));
+    let output = run([
+        "manifest",
+        "verify",
+        "--store",
+        replica_text,
+        "--head",
+        &manifest,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+
+    // Anchor: signed head, verified against the chain in the source store.
+    let key = dir.join("secret.key");
+    std::fs::write(&key, b"secret-key").expect("write key");
+    let anchor = dir.join("head.anchor");
+    let anchor_text = anchor.to_str().expect("anchor path");
+    let output = run([
+        "anchor",
+        "write",
+        "--out",
+        anchor_text,
+        "--head",
+        &manifest,
+        "--key-file",
+        key.to_str().expect("key path"),
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("signed=true"));
+
+    let output = run([
+        "anchor",
+        "verify",
+        "--file",
+        anchor_text,
+        "--store",
+        store_text,
+        "--head",
+        &manifest,
+        "--key-file",
+        key.to_str().expect("key path"),
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("chain_length=1"));
+
+    // Wrong key is rejected.
+    let wrong = dir.join("wrong.key");
+    std::fs::write(&wrong, b"other-key").expect("write wrong key");
+    let output = run([
+        "anchor",
+        "verify",
+        "--file",
+        anchor_text,
+        "--key-file",
+        wrong.to_str().expect("wrong path"),
+    ]);
+    assert!(!output.status.success(), "wrong key must fail");
+
+    // A tampered head no longer matches the HMAC.
+    let mut bytes = std::fs::read(&anchor).expect("read anchor");
+    bytes[8] ^= 1;
+    let tampered = dir.join("tampered.anchor");
+    std::fs::write(&tampered, &bytes).expect("write tampered anchor");
+    let output = run([
+        "anchor",
+        "verify",
+        "--file",
+        tampered.to_str().expect("tampered path"),
+        "--key-file",
+        key.to_str().expect("key path"),
+    ]);
+    assert!(!output.status.success(), "tampered anchor must fail");
+}

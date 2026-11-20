@@ -44,6 +44,7 @@ fn run() -> Result<(), String> {
         Some("repair") => run_repair(&args),
         Some("cas") => run_cas(&args),
         Some("manifest") => run_manifest(&args),
+        Some("anchor") => run_anchor(&args),
         Some("crosscheck") => run_crosscheck(),
         Some("help") | Some("--help") | None => {
             print_help();
@@ -85,8 +86,10 @@ fn print_help() {
     println!("  manifest verify --store dir --head <hex>");
     println!("  manifest snapshot --store dir --db sql.db [--parent <hex>]");
     println!("  manifest restore --store dir --head <hex> --db restored.db");
-    println!("  manifest replicate --from src --to dst --head <hex>");
+    println!("  manifest replicate --from src --to dst --head <hex> [--entry name]");
     println!("  manifest show --store dir --hash <hex>");
+    println!("  anchor write --out anchor.bin --head <hex> [--key-file secret]");
+    println!("  anchor verify --file anchor.bin [--store dir] [--head <hex>] [--key-file secret]");
     println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
 
@@ -786,7 +789,7 @@ fn run_cas(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some(other) => Err(format!("unknown cas subcommand: {other}")),
-        None => Err("cas requires `put`, `get`, or `has`".to_string()),
+        None => Err("cas requires `put`, `get`, `has`, or `gc`".to_string()),
     }
 }
 
@@ -862,8 +865,13 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             let target = tritdb_cas::ChunkStore::open(std::path::Path::new(&to))
                 .map_err(|error| error.to_string())?;
             let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
-            let info = tritdb_cas::replicate(&source, &target, &head)
-                .map_err(|error| error.to_string())?;
+            let names = arg_values(args, "--entry");
+            let info = if names.is_empty() {
+                tritdb_cas::replicate(&source, &target, &head)
+            } else {
+                tritdb_cas::replicate_subset(&source, &target, &head, &names)
+            }
+            .map_err(|error| error.to_string())?;
             println!(
                 "head={} manifests={} chunks={} bytes={}",
                 info.head, info.manifests, info.chunks, info.bytes
@@ -921,7 +929,73 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some(other) => Err(format!("unknown manifest subcommand: {other}")),
-        None => Err("manifest requires `commit`, `verify`, or `show`".to_string()),
+        None => Err(
+            "manifest requires `commit`, `verify`, `show`, `replicate`, `snapshot`, or `restore`"
+                .to_string(),
+        ),
+    }
+}
+
+fn run_anchor(args: &[String]) -> Result<(), String> {
+    match args.get(1).map(String::as_str) {
+        Some("write") => {
+            let out = required_arg(args, "--out")?;
+            let head = required_arg(args, "--head")?;
+            let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
+            let mut anchor = tritdb_cas::Anchor::new(head);
+            if let Some(key_file) = arg_value(args, "--key-file") {
+                let key = std::fs::read(&key_file)
+                    .map_err(|error| format!("read {key_file}: {error}"))?;
+                anchor.sign(&key);
+            }
+            let bytes = anchor.encode();
+            std::fs::write(&out, &bytes).map_err(|error| format!("write {out}: {error}"))?;
+            println!(
+                "anchor={out} head={} signed={}",
+                anchor.head,
+                anchor.hmac.is_some()
+            );
+            Ok(())
+        }
+        Some("verify") => {
+            let file = required_arg(args, "--file")?;
+            let bytes = std::fs::read(&file).map_err(|error| format!("read {file}: {error}"))?;
+            let anchor = tritdb_cas::Anchor::decode(&bytes).map_err(|error| error.to_string())?;
+            if let Some(expected) = arg_value(args, "--head") {
+                let expected =
+                    tritdb_cas::Hash::from_hex(&expected).map_err(|error| error.to_string())?;
+                if expected != anchor.head {
+                    return Err(format!(
+                        "anchor head {} does not match expected {expected}",
+                        anchor.head
+                    ));
+                }
+            }
+            if let Some(key_file) = arg_value(args, "--key-file") {
+                let key = std::fs::read(&key_file)
+                    .map_err(|error| format!("read {key_file}: {error}"))?;
+                if !anchor.verify(&key) {
+                    return Err(format!("anchor {file} signature mismatch"));
+                }
+            }
+            let mut chain_length = None;
+            if let Some(root) = arg_value(args, "--store") {
+                let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                    .map_err(|error| error.to_string())?;
+                let info = tritdb_cas::verify_chain(&store, &anchor.head)
+                    .map_err(|error| error.to_string())?;
+                chain_length = Some(info.length);
+            }
+            println!(
+                "anchor={file} head={} signed={} chain_length={}",
+                anchor.head,
+                anchor.hmac.is_some(),
+                chain_length.map_or("-".to_string(), |length| length.to_string())
+            );
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown anchor subcommand: {other}")),
+        None => Err("anchor requires `write` or `verify`".to_string()),
     }
 }
 

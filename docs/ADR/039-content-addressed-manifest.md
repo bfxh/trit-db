@@ -32,6 +32,12 @@ tritdb cas get --store dir --hash <hex> --out blob
 tritdb manifest commit --store dir [--parent <hex>] --entry name=<hex>
 tritdb manifest verify --store dir --head <hex>
 tritdb manifest show --store dir --hash <hex>
+tritdb cas gc --store dir --root <hex>
+tritdb manifest replicate --from src --to dst --head <hex> [--entry name]
+tritdb manifest snapshot --store dir --db sql.db [--parent <hex>]
+tritdb manifest restore --store dir --head <hex> --db restored.db
+tritdb anchor write --out anchor.bin --head <hex> [--key-file secret]
+tritdb anchor verify --file anchor.bin [--store dir] [--head <hex>] [--key-file secret]
 ```
 
 ## 理由
@@ -43,8 +49,8 @@ tritdb manifest show --store dir --hash <hex>
 ## 后果 / 限制
 
 - **GC 是显式操作**：`gc(roots)` 只保留从给定 manifest 头可达的 chunk；调用方必须先确认 roots 完整。
-- **没有签名**：哈希链只能证明「没被改写」，不能证明「谁写的」；链头需要外部锚点。
-- **只读副本是最小闭环**：`replicate` 复制 manifest 链与 entry chunk，复制后重新 `verify_chain`；目标目录由调用方按只读方式使用。部分拉取/增量同步未做。
+- **锚点是共享密钥**：`Anchor` 记录链头与创建时间，用 HMAC-SHA256 签名；它证明「持有密钥的人签过这个链头」，不是公开密钥的作者身份。锚点文件必须存在 CAS 目录之外，否则攻击者可以连同数据一起替换。
+- **只读副本是最小闭环**：`replicate` 复制 manifest 链与 entry chunk，复制后重新 `verify_chain`；目标目录由调用方按只读方式使用。`replicate_subset` / `--entry` 可以只拉指定 entry（部分拉取），增量同步未做。
 - **SQL 快照**：`manifest snapshot --db` 把 `TxnStore` 的每个 key/value 写成 manifest entry；`manifest restore --db` 读回并提交。它备份的是 key/value 层，不是页文件。
 - SHA-256 而非 BLAKE3；替换只影响 `Hash` 实现。
 - `created_ms` 只是本地时间，不是可信时间戳。

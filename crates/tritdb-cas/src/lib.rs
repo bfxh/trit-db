@@ -489,6 +489,179 @@ pub fn replicate(
     })
 }
 
+/// Copies only the named entries of a manifest chain.
+///
+/// An empty `names` copies every entry. Missing entries on the target are
+/// expected: `verify_chain` only needs the manifest chain itself.
+pub fn replicate_subset(
+    source: &ChunkStore,
+    target: &ChunkStore,
+    head: &Hash,
+    names: &[String],
+) -> Result<ReplicaInfo, CasError> {
+    let mut manifests = 0usize;
+    let mut chunks = 0usize;
+    let mut bytes = 0u64;
+    let mut seen = HashSet::new();
+    let mut current = Some(*head);
+
+    while let Some(hash) = current {
+        if !seen.insert(hash) {
+            break;
+        }
+        let data = source.get(&hash)?;
+        bytes += data.len() as u64;
+        target.put(&data)?;
+        manifests += 1;
+        let manifest = Manifest::decode(&data)?;
+        for (name, entry) in &manifest.entries {
+            if !names.is_empty() && !names.iter().any(|wanted| wanted == name) {
+                continue;
+            }
+            if !seen.insert(*entry) {
+                continue;
+            }
+            let data = source.get(entry)?;
+            bytes += data.len() as u64;
+            target.put(&data)?;
+            chunks += 1;
+        }
+        current = manifest.parent;
+    }
+
+    verify_chain(target, head)?;
+    Ok(ReplicaInfo {
+        head: *head,
+        manifests,
+        chunks,
+        bytes,
+    })
+}
+
+/// External anchor for a manifest chain head.
+///
+/// The anchor is stored outside the CAS directory; it records the head hash and
+/// an optional HMAC-SHA256 over the anchor bytes. HMAC is symmetric: it proves
+/// "someone who knows the key signed this head", not public-key authorship.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// Anchored manifest head.
+    pub head: Hash,
+    /// Creation time in Unix milliseconds.
+    pub created_ms: u64,
+    /// Optional HMAC-SHA256 tag.
+    pub hmac: Option<[u8; 32]>,
+}
+
+impl Anchor {
+    /// Creates an unsigned anchor.
+    pub fn new(head: Hash) -> Self {
+        Self {
+            head,
+            created_ms: now_ms(),
+            hmac: None,
+        }
+    }
+
+    fn encode_unsigned(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(48);
+        out.extend_from_slice(b"TRAN");
+        out.push(0);
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(self.head.as_bytes());
+        out.extend_from_slice(&self.created_ms.to_le_bytes());
+        out
+    }
+
+    /// Encodes the anchor (with HMAC when present).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(80);
+        out.extend_from_slice(b"TRAN");
+        out.push(u8::from(self.hmac.is_some()));
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(self.head.as_bytes());
+        out.extend_from_slice(&self.created_ms.to_le_bytes());
+        if let Some(tag) = &self.hmac {
+            out.extend_from_slice(tag);
+        }
+        out
+    }
+
+    /// Parses an anchor.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CasError> {
+        if bytes.len() < 48 || &bytes[0..4] != b"TRAN" {
+            return Err(CasError::BadManifest {
+                reason: "bad anchor header",
+            });
+        }
+        if bytes[5..8] != [0, 0, 0] {
+            return Err(CasError::BadManifest {
+                reason: "anchor reserved bytes must be zero",
+            });
+        }
+        let mut head = [0u8; 32];
+        head.copy_from_slice(&bytes[8..40]);
+        let mut created = [0u8; 8];
+        created.copy_from_slice(&bytes[40..48]);
+        let created_ms = u64::from_le_bytes(created);
+        let hmac = if bytes[4] & 1 == 1 {
+            if bytes.len() != 80 {
+                return Err(CasError::BadManifest {
+                    reason: "anchor hmac length",
+                });
+            }
+            let mut tag = [0u8; 32];
+            tag.copy_from_slice(&bytes[48..80]);
+            Some(tag)
+        } else {
+            if bytes.len() != 48 {
+                return Err(CasError::BadManifest {
+                    reason: "anchor trailing bytes",
+                });
+            }
+            None
+        };
+        Ok(Self {
+            head: Hash(head),
+            created_ms,
+            hmac,
+        })
+    }
+
+    /// Signs the anchor with HMAC-SHA256.
+    pub fn sign(&mut self, key: &[u8]) {
+        self.hmac = Some(hmac_sha256(key, &self.encode_unsigned()));
+    }
+
+    /// Verifies the HMAC tag.
+    pub fn verify(&self, key: &[u8]) -> bool {
+        match self.hmac {
+            Some(tag) => hmac_sha256(key, &self.encode_unsigned()) == tag,
+            None => false,
+        }
+    }
+}
+
+/// HMAC-SHA256 (FIPS 198-1) over the in-crate SHA-256.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&sha256(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend(block.iter().map(|byte| byte ^ 0x36));
+    inner.extend_from_slice(message);
+    let inner_hash = sha256(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend(block.iter().map(|byte| byte ^ 0x5c));
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
 /// Result of walking a manifest hash chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainInfo {
@@ -749,6 +922,60 @@ mod tests {
 
         let _ = fs::remove_dir_all(&source_dir);
         let _ = fs::remove_dir_all(&target_dir);
+    }
+
+    #[test]
+    fn subset_replication_copies_only_selected_entries() {
+        let source_dir = tempfile_dir("cas-subset-source");
+        let target_dir = tempfile_dir("cas-subset-target");
+        let source = ChunkStore::open(&source_dir).expect("open source");
+        let target = ChunkStore::open(&target_dir).expect("open target");
+
+        let first = source.put(b"first").expect("put first");
+        let second = source.put(b"second").expect("put second");
+        let mut entries = BTreeMap::new();
+        entries.insert("first".to_string(), first);
+        entries.insert("second".to_string(), second);
+        let head = Manifest::new(None, entries)
+            .store(&source)
+            .expect("store manifest");
+
+        let info = replicate_subset(&source, &target, &head, &["first".to_string()])
+            .expect("subset replicate");
+        assert_eq!(info.chunks, 1);
+        assert!(target.has(&first));
+        assert!(!target.has(&second));
+        verify_chain(&target, &head).expect("manifest chain copied");
+
+        let _ = fs::remove_dir_all(&source_dir);
+        let _ = fs::remove_dir_all(&target_dir);
+    }
+
+    #[test]
+    fn anchor_signs_and_detects_tampering() {
+        let head = Hash::of(b"head");
+        let mut anchor = Anchor::new(head);
+        anchor.sign(b"secret-key");
+        let bytes = anchor.encode();
+        let decoded = Anchor::decode(&bytes).expect("decode");
+        assert!(decoded.verify(b"secret-key"));
+        assert!(!decoded.verify(b"wrong-key"));
+
+        let mut tampered = bytes.clone();
+        tampered[8] ^= 1;
+        let tampered = Anchor::decode(&tampered).expect("decode tampered");
+        assert!(!tampered.verify(b"secret-key"));
+    }
+
+    #[test]
+    fn hmac_matches_rfc4231_vector_2() {
+        let tag = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            tag.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 
     #[test]
