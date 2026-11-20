@@ -9,7 +9,7 @@ pub const TABLE_KEY_PREFIX: &str = "sql/table/";
 pub const STATS_KEY_PREFIX: &str = "sql/stats/";
 
 const TABLE_MAGIC: [u8; 4] = *b"TRSQ";
-const TABLE_VERSION: u8 = 1;
+const TABLE_VERSION: u8 = 2;
 const STATS_MAGIC: [u8; 4] = *b"TRSS";
 const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
@@ -93,6 +93,13 @@ pub fn encode_table(table: &Table) -> Result<Vec<u8>, SqlError> {
         out.push(u8::from(column.not_null));
         out.push(u8::from(column.unique));
         put_text(&mut out, &column.name)?;
+    }
+    put_u32(&mut out, table.schema.unique_sets.len())?;
+    for set in &table.schema.unique_sets {
+        put_u32(&mut out, set.len())?;
+        for &index in set {
+            put_u32(&mut out, index)?;
+        }
     }
     out.extend_from_slice(&(table.rows.len() as u64).to_le_bytes());
     for row in &table.rows {
@@ -285,6 +292,33 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
             unique,
         });
     }
+    let unique_sets = if version >= 2 {
+        let set_count = reader
+            .u32()
+            .ok_or_else(|| corrupt("missing unique set count"))? as usize;
+        let mut sets = Vec::with_capacity(set_count);
+        for _ in 0..set_count {
+            let count = reader
+                .u32()
+                .ok_or_else(|| corrupt("missing unique column count"))?
+                as usize;
+            let mut indices = Vec::with_capacity(count);
+            for _ in 0..count {
+                let index = reader
+                    .u32()
+                    .ok_or_else(|| corrupt("missing unique column index"))?
+                    as usize;
+                if index >= column_count {
+                    return Err(corrupt("unique column index out of range"));
+                }
+                indices.push(index);
+            }
+            sets.push(indices);
+        }
+        sets
+    } else {
+        Vec::new()
+    };
     let row_count = reader.u64().ok_or_else(|| corrupt("missing row count"))?;
     let mut rows = Vec::new();
     for _ in 0..row_count {
@@ -331,9 +365,11 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
     if reader.pos != bytes.len() {
         return Err(corrupt("trailing bytes"));
     }
+    let mut schema = Schema::new(columns);
+    schema.unique_sets = unique_sets;
     Ok(Table {
         name: name.to_string(),
-        schema: Schema::new(columns),
+        schema,
         rows,
     })
 }

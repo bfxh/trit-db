@@ -367,3 +367,73 @@ fn under_repair_accepts_multiple_key_columns() {
     assert!(!text.contains("1	1	10"), "out: {text}");
     assert!(!text.contains("1	1	20"), "out: {text}");
 }
+
+#[test]
+fn update_checks_unique_columns() {
+    let dir = TempDir::new("sql-update-unique");
+    let db = dir.join("u.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, name TEXT);          INSERT INTO t VALUES (1,'a'),(2,'b');",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "UPDATE t SET id = 1 WHERE name = 'b';",
+    ]);
+    assert!(!output.status.success(), "duplicate update must fail");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "UPDATE t SET id = 3 WHERE name = 'b'; SELECT * FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1	a"), "out: {text}");
+    assert!(text.contains("3	b"), "out: {text}");
+}
+
+#[test]
+fn table_level_unique_group_survives_reopen() {
+    let dir = TempDir::new("sql-table-unique");
+    let db = dir.join("u.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (a INT, b INT, x INT, UNIQUE (a, b));          INSERT INTO t VALUES (1,1,10),(1,2,20);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run(["sql", "--db", db, "--sql", "INSERT INTO t VALUES (1,1,30);"]);
+    assert!(!output.status.success(), "duplicate tuple must fail");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "UPDATE t SET b = 2 WHERE a = 1 AND b = 1;",
+    ]);
+    assert!(!output.status.success(), "duplicate update must fail");
+
+    // Reopen: the v2 TRSQ schema must still know the unique group.
+    let output = run(["sql", "--db", db, "--sql", "INSERT INTO t VALUES (1,1,40);"]);
+    assert!(
+        !output.status.success(),
+        "duplicate tuple must fail after reopen"
+    );
+}

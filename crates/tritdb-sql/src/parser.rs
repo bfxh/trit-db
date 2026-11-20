@@ -63,6 +63,13 @@ impl Parser {
         self.tokens.get(self.pos + offset)
     }
 
+    fn peek_word(&self, word: &str) -> bool {
+        matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::Word(name)) if name.eq_ignore_ascii_case(word)
+        )
+    }
+
     fn expect_word(&mut self, word: &str) -> Result<(), SqlError> {
         if self.eat_word(word) {
             Ok(())
@@ -204,7 +211,27 @@ impl Parser {
         let name = self.parse_ident()?;
         self.expect_symbol(Symbol::LParen)?;
         let mut columns = Vec::new();
+        let mut unique_sets = Vec::new();
         loop {
+            if self.peek_word("unique")
+                && matches!(
+                    self.peek_at(1).map(|token| &token.kind),
+                    Some(TokenKind::Symbol(Symbol::LParen))
+                )
+            {
+                self.bump(); // unique
+                self.expect_symbol(Symbol::LParen)?;
+                let mut set = vec![self.parse_ident()?];
+                while self.eat_symbol(Symbol::Comma) {
+                    set.push(self.parse_ident()?);
+                }
+                self.expect_symbol(Symbol::RParen)?;
+                unique_sets.push(set);
+                if self.eat_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break;
+            }
             let column_name = self.parse_ident()?;
             let data_type = self.parse_type()?;
             let not_null = if self.eat_keyword(Keyword::Not) {
@@ -230,6 +257,7 @@ impl Parser {
             name,
             if_not_exists,
             columns,
+            unique: unique_sets,
         })
     }
 

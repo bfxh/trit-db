@@ -235,6 +235,8 @@ pub enum Statement {
         if_not_exists: bool,
         /// Columns.
         columns: Vec<ColumnDef>,
+        /// Table-level `UNIQUE (a, b, ...)` groups.
+        unique: Vec<Vec<String>>,
     },
     /// `DROP TABLE`.
     DropTable {

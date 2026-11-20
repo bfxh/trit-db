@@ -181,6 +181,8 @@ pub struct Schema {
     /// and `NATURAL JOIN` expose one merged output column through both input
     /// qualifiers, while `SELECT *` must still see it only once.
     aliases: BTreeMap<String, usize>,
+    /// Table-level `UNIQUE (a, b, ...)` groups, as column indices.
+    pub unique_sets: Vec<Vec<usize>>,
 }
 
 impl Schema {
@@ -189,6 +191,7 @@ impl Schema {
         Self {
             columns,
             aliases: BTreeMap::new(),
+            unique_sets: Vec::new(),
         }
     }
 

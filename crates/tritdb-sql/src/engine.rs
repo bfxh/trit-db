@@ -237,7 +237,8 @@ impl SqlEngine {
                 name,
                 if_not_exists,
                 columns,
-            } => self.create_table(name, *if_not_exists, columns),
+                unique,
+            } => self.create_table(name, *if_not_exists, columns, unique),
             Statement::AlterTableAddColumn {
                 name,
                 if_not_exists,
@@ -272,6 +273,7 @@ impl SqlEngine {
         name: &str,
         if_not_exists: bool,
         definitions: &[crate::ast::ColumnDef],
+        unique_sets: &[Vec<String>],
     ) -> Result<QueryResult, SqlError> {
         if self.tables.contains_key(name) {
             if if_not_exists {
@@ -297,9 +299,23 @@ impl SqlEngine {
                 unique: definition.unique,
             });
         }
+        let mut unique_indices = Vec::with_capacity(unique_sets.len());
+        for set in unique_sets {
+            let mut indices = Vec::with_capacity(set.len());
+            for column in set {
+                let index = columns
+                    .iter()
+                    .position(|candidate| candidate.name == *column)
+                    .ok_or_else(|| SqlError::UnknownColumn(column.clone()))?;
+                indices.push(index);
+            }
+            unique_indices.push(indices);
+        }
+        let mut schema = Schema::new(columns);
+        schema.unique_sets = unique_indices;
         let table = Table {
             name: name.to_string(),
-            schema: Schema::new(columns),
+            schema,
             rows: Vec::new(),
         };
         self.put_table(table)?;
@@ -433,42 +449,14 @@ impl SqlEngine {
             new_rows.push(row);
         }
 
-        // UNIQUE: collect existing non-NULL values per unique column, then
-        // reject duplicates inside the incoming batch as well.
-        for (column_index, column) in table.schema.columns.iter().enumerate() {
-            if !column.unique {
-                continue;
-            }
-            let mut seen = std::collections::HashSet::new();
-            for row in &table.rows {
-                let value = &row[column_index];
-                if !value.is_null() {
-                    seen.insert(value.clone());
-                }
-            }
-            for row in &new_rows {
-                let value = &row[column_index];
-                if value.is_null() {
-                    continue;
-                }
-                if !seen.insert(value.clone()) {
-                    return Err(SqlError::DuplicateKey {
-                        table: name.to_string(),
-                        column: column.name.clone(),
-                        value: value.display(),
-                    });
-                }
-            }
-        }
-
         let inserted = new_rows.len();
         table.rows.extend(new_rows);
+        check_unique(&table)?;
         self.put_table(table)?;
         Ok(QueryResult::Message(format!(
             "inserted {inserted} row(s) into {name}"
         )))
     }
-
     fn delete(
         &mut self,
         name: &str,
@@ -553,6 +541,7 @@ impl SqlEngine {
             updated += 1;
         }
         if updated > 0 {
+            check_unique(&table)?;
             self.put_table(table)?;
         }
         Ok(QueryResult::Message(format!(
@@ -1664,6 +1653,58 @@ fn collect_expr_columns(
 /// terms. `x AND TRUE`, `TRUE AND x`, `x OR FALSE`, and `FALSE OR x` are exact
 /// in SQL three-valued logic. Expressions with columns or aggregates are left
 /// for the binder; evaluation errors are preserved by the fallback.
+/// Rejects duplicate non-`NULL` values in every `UNIQUE` column.
+fn check_unique(table: &Table) -> Result<(), SqlError> {
+    for (index, column) in table.schema.columns.iter().enumerate() {
+        if !column.unique {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for row in &table.rows {
+            let value = &row[index];
+            if value.is_null() {
+                continue;
+            }
+            if !seen.insert(value.clone()) {
+                return Err(SqlError::DuplicateKey {
+                    table: table.name.clone(),
+                    column: column.name.clone(),
+                    value: value.display(),
+                });
+            }
+        }
+    }
+
+    for set in &table.schema.unique_sets {
+        let mut seen = std::collections::HashSet::new();
+        for row in &table.rows {
+            let values: Vec<Value> = set.iter().map(|&index| row[index].clone()).collect();
+            // SQL: a tuple with any NULL does not participate in UNIQUE.
+            if values.iter().any(Value::is_null) {
+                continue;
+            }
+            if !seen.insert(values.clone()) {
+                let column = set
+                    .iter()
+                    .map(|&index| table.schema.columns[index].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let value = values
+                    .iter()
+                    .map(Value::display)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(SqlError::DuplicateKey {
+                    table: table.name.clone(),
+                    column,
+                    value,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Certain rows under the functional dependency `keys -> other columns`.
 ///
 /// A group with conflicting non-key values is discarded entirely: every row in
