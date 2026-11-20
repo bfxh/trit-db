@@ -84,7 +84,7 @@ leader：
 - 同 key 两事务：按 WAL 顺序最后提交者获胜。
 - 活跃事务下 checkpoint 返回 `ActiveTxns`。
 - 1,024 事务 × 4 key、16 线程、3 轮：写总时间 median 867.780 ms，fsync 260 次（0.254 次/事务）。
-- 全工作区 M0 基线 158 个测试通过（M1 SQL/GROUP BY/INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN/等值 hash join/EXPLAIN/EXPLAIN ANALYZE/ANALYZE 统计/Auto join 代价/WHERE 合取项拆分与单源下推/源表列裁剪（含无歧义未限定列与零列源表投影）/常量折叠与恒真条件简化/投影常量折叠/加法 schema 迁移/逗号 FROM/UPDATE/谓词/CASE 切片后当前全量 248，见 README）。
+- 全工作区 M0 基线 158 个测试通过（M1 SQL/GROUP BY/INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN/等值 hash join/EXPLAIN/EXPLAIN SEXPR/EXPLAIN ANALYZE/ANALYZE 统计/Auto join 代价/WHERE 合取项拆分与单源下推/源表列裁剪（含无歧义未限定列与零列源表投影）/常量折叠与恒真条件简化/投影常量折叠/结构化计划/加法 schema 迁移/逗号 FROM/UPDATE/谓词/CASE 切片后当前全量 251，见 README）。
 
 ## 9. 未做
 

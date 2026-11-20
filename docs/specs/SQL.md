@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、计划入口的常量折叠、投影常量折叠与恒真条件简化、加法 schema 迁移（`ALTER TABLE ... ADD [COLUMN]`）、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN SEXPR` 只读括号化计划、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、计划入口的常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`、加法 schema 迁移（`ALTER TABLE ... ADD [COLUMN]`）、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
 
 ## 1. 范围
 
@@ -40,7 +40,7 @@ DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；列引用可唯一归属且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪，某源表不需要任何列时投影为零列并保留行数；计划入口会折叠不含列/聚合的常量表达式（含 `SELECT` 项），并移除恒真的 `WHERE` / `HAVING`；`ALTER TABLE ... ADD [COLUMN]` 只做加法迁移，只允许可空列并整表原子重写；不支持子查询。
+- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN SEXPR SELECT` 输出同一计划树的只读括号化表示，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；列引用可唯一归属且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪，某源表不需要任何列时投影为零列并保留行数；计划入口会折叠不含列/聚合的常量表达式（含 `SELECT` 项），并移除恒真的 `WHERE` / `HAVING`；`ALTER TABLE ... ADD [COLUMN]` 只做加法迁移，只允许可空列并整表原子重写；不支持子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE/ALTER 重写整张表。
@@ -166,6 +166,23 @@ EXPLAIN SELECT ...;
 - 估算规则是启发式的：等值 join 用 `left_rows * right_rows / max(left_ndv, right_ndv)`（复合键逐键相乘），有残余谓词再乘 0.5；非等值 join 乘 0.1；外连接至少保留被保留侧的行数。过滤 `=` 用 `1/NDV`、`IS NULL` 用 0.1、范围用 0.33、`LIKE` 用 0.1，`AND` 相乘、`OR` 取并集概率，其他谓词默认 0.5；字面 `TRUE` 为 1，字面 `FALSE` / `NULL` 为 0。下推的单源扫描过滤复用同一套选择率规则；分组数用分组列 NDV 乘积并受输入行数上限约束，`HAVING` 再乘 0.5。所有基数向上取整。
 - 没有统计时退回不带数字的静态计划；有统计时，`Auto` 的局部 join 选择、估算展示和真实执行使用同一套统计输入。下推后的扫描行数会先按 `WHERE` 谓词选择率调整，再参与 join 基数和成本选择，因此计划可能从 `HashJoin` 变为 `NestedLoop`（或相反）；估算显示所选算法，但不重排 join 顺序。
 - 该计划仍是当前执行路径的静态文本，不是全局优化器；没有统计采样、直方图、候选计划枚举、join 顺序重排、表达式级列下推或跨 join 列需求传播；也不拆分 `OR` 分支、`NOT` 内部条件或外连接谓词。顶层 `AND` 的单源合取项已按 ADR-010 分别下推，单源列需求按 ADR-011/ADR-015 裁剪（含可唯一归属的未限定列），零列源表按 ADR-016 只保留行数，常量折叠按 ADR-012/ADR-014 处理不含列/聚合的子表达式（含 `SELECT` 项）和四个安全布尔恒等。`FALSE AND x`、`TRUE OR x`、`NOT NOT x`、常量传播与投影下推均不做。
+
+### EXPLAIN SEXPR SELECT
+
+```sql
+EXPLAIN SEXPR SELECT ...;
+```
+
+- `EXPLAIN SEXPR` 走与 `EXPLAIN` 相同的折叠、下推、列裁剪、绑定和估算路径，但不执行查询；它只把同一棵 `PlanNode` 树用只读括号化形式输出。
+- `SEXPR` 只在 `EXPLAIN` 后按普通单词识别，不是全局关键字；`EXPLAIN ANALYZE SEXPR SELECT ...` 明确拒绝。
+- 返回单列 `plan`、单行文本；文本内部保留换行和缩进，便于直接作为机器可读的计划值保存。
+- 节点形如：
+  - `(scan "a" :filtered #t :est-rows 3 :cols ("id"))`；没有列裁剪时省略 `:cols`，零列显示 `:cols ()`；
+  - `(join hash inner :details ("keys=(a.id = b.id)") :est-rows 2 child child)`；算法为 `hash` 或 `nested-loop`，`details` 保留键/残余片段；
+  - `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :est-groups N child)`；
+  - `(project ("v" "n") :est-rows N child)`、`(sort :keys 1 :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
+- 只有静态计划，因此不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -333,7 +350,7 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、常量折叠、投影常量折叠与恒真条件简化、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode` 与 `EXPLAIN SEXPR`、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
 - Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）；`ANALYZE`/计划输出不做 SQLite 对拍。
 - `tritdb-bench sql-join` 提供可复现的规模基准；本机 1024 行时 hash 中位 0.688ms、nested 67.560ms。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

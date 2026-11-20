@@ -1920,6 +1920,63 @@ fn hash_join_handles_composite_null_and_residual_predicates() {
 }
 
 #[test]
+fn explain_sexpr_reports_structured_plan() {
+    let dir = TempDir::new("sql-explain-sexpr");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script("CREATE TABLE a (id INT, v TEXT); CREATE TABLE b (id INT, w TEXT);")
+        .expect("seed");
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain sexpr");
+    assert_eq!(as_rows(&explained[0]).0, ["plan"]);
+    assert_eq!(as_rows(&explained[0]).1.len(), 1);
+    let plan = match &as_rows(&explained[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        "(limit :limit 1\n  (sort :keys 1\n    (project (\"v\")\n      \
+         (join hash inner :details (\"keys=(a.id = b.id)\")\n        \
+         (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
+    );
+}
+
+#[test]
+fn explain_sexpr_includes_estimates_and_zero_columns() {
+    let dir = TempDir::new("sql-explain-sexpr-est");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, spare TEXT); \
+             INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+    let explained = engine
+        .execute_script("EXPLAIN SEXPR SELECT 1 AS one FROM a;")
+        .expect("explain sexpr estimates");
+    let (columns, rows) = as_rows(&explained[0]);
+    assert_eq!(columns, ["plan"]);
+    assert_eq!(rows.len(), 1);
+    let plan = match &rows[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        "(project (\"one\") :est-rows 3\n  (scan \"a\" :est-rows 3 :cols ()))"
+    );
+}
+
+#[test]
 fn explain_reports_hash_and_nested_loop_join_plans() {
     let dir = TempDir::new("sql-explain");
     let db = dir.join("sql.db");

@@ -16,6 +16,7 @@ use crate::ast::{
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
+use crate::plan::{JoinPlan, Metrics, PlanKind, PlanNode};
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
     decode_stats, decode_table, encode_stats, encode_table, stats_key, table_key, STATS_KEY_PREFIX,
@@ -48,6 +49,12 @@ pub enum JoinStrategy {
     Hash,
     /// Always use nested loop, for benchmarks and differential tests.
     NestedLoop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExplainFormat {
+    Text,
+    Sexpr,
 }
 
 /// Runtime counters attached to an `EXPLAIN ANALYZE` plan.
@@ -240,8 +247,9 @@ impl SqlEngine {
                 rows,
             } => self.insert(table, columns.as_deref(), rows),
             Statement::Select(select) => self.select(select),
-            Statement::Explain(select) => self.explain(select, false),
-            Statement::ExplainAnalyze(select) => self.explain(select, true),
+            Statement::Explain(select) => self.explain(select, false, ExplainFormat::Text),
+            Statement::ExplainSexpr(select) => self.explain(select, false, ExplainFormat::Sexpr),
+            Statement::ExplainAnalyze(select) => self.explain(select, true, ExplainFormat::Text),
             Statement::Analyze { table } => self.analyze(table.as_deref()),
             Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
             Statement::Update {
@@ -564,7 +572,12 @@ impl SqlEngine {
         )))
     }
 
-    fn explain(&self, select: &Select, analyze: bool) -> Result<QueryResult, SqlError> {
+    fn explain(
+        &self,
+        select: &Select,
+        analyze: bool,
+        format: ExplainFormat,
+    ) -> Result<QueryResult, SqlError> {
         let folded = fold_select(select);
         let pushdown = plan_filter_pushdown(&folded);
         let projection = self.plan_scan_projection(&folded)?;
@@ -592,7 +605,10 @@ impl SqlEngine {
                 None,
             )
         };
-        let mut plan = plan;
+        let mut plan = match format {
+            ExplainFormat::Text => plan.to_text(),
+            ExplainFormat::Sexpr => plan.to_sexpr(),
+        };
         if let Some(stats) = stats {
             plan.push_str(&format!(
                 "\nExecution: rows={} time={:.3}ms",
@@ -601,10 +617,13 @@ impl SqlEngine {
         }
         Ok(QueryResult::Rows {
             columns: vec!["plan".to_string()],
-            rows: plan
-                .lines()
-                .map(|line| vec![Value::Text(line.to_string())])
-                .collect(),
+            rows: match format {
+                ExplainFormat::Text => plan
+                    .lines()
+                    .map(|line| vec![Value::Text(line.to_string())])
+                    .collect(),
+                ExplainFormat::Sexpr => vec![vec![Value::Text(plan)]],
+            },
         })
     }
 
@@ -952,7 +971,7 @@ impl SqlEngine {
         projection: &ScanProjection,
         stats: Option<&ExecutionStats>,
         estimates: Option<&PlanEstimate>,
-    ) -> Result<String, SqlError> {
+    ) -> Result<PlanNode, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
         let mut left_table = qualify_table_schema(left, &left_qualifier);
@@ -960,13 +979,16 @@ impl SqlEngine {
         let left_filtered = stats
             .and_then(|stats| stats.scan_filters.get(scan_index).copied())
             .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
-        let mut plan = scan_plan(
-            &source_label(left.name.as_str(), &left_qualifier),
-            stats,
-            estimates,
-            scan_index,
+        let mut plan = PlanNode::scan(
+            source_label(left.name.as_str(), &left_qualifier),
             left_filtered,
-            projection.columns(scan_index),
+            stats
+                .and_then(|stats| stats.scan_rows.get(scan_index).copied())
+                .map(|rows| rows as u64),
+            estimates.and_then(|estimate| estimate.scan_rows.get(scan_index).copied()),
+            projection
+                .columns(scan_index)
+                .map(|columns| columns.to_vec()),
         );
         scan_index += 1;
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
@@ -1007,7 +1029,7 @@ impl SqlEngine {
                     estimates.and_then(|estimate| estimate.join_uses_hash.get(join_index).copied())
                 })
                 .unwrap_or_else(|| use_hash_join(self.join_strategy, &hash_pairs));
-            let mut header = join_plan_header(
+            let mut join_plan = join_plan(
                 join,
                 uses_hash,
                 &hash_pairs,
@@ -1017,33 +1039,33 @@ impl SqlEngine {
             );
             if let Some(stats) = stats {
                 if let (Some(rows), Some(ms)) = (
-                    stats.join_rows.get(join_index),
-                    stats.join_ms.get(join_index),
+                    stats.join_rows.get(join_index).copied(),
+                    stats.join_ms.get(join_index).copied(),
                 ) {
-                    header.push_str(&format!(" actual rows={rows} time={ms:.3}ms"));
+                    join_plan.metrics.actual = Some(rows as u64);
+                    join_plan.metrics.actual_ms = Some(ms);
                 }
             } else if let Some(rows) =
                 estimates.and_then(|estimate| estimate.join_rows.get(join_index).copied())
             {
-                header.push_str(&format!(" est rows={rows}"));
+                join_plan.metrics.est = Some(rows);
             }
             let right_filtered = stats
                 .and_then(|stats| stats.scan_filters.get(scan_index).copied())
                 .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
-            let right_plan = scan_plan(
-                &source_label(right.name.as_str(), &qualifier),
-                stats,
-                estimates,
-                scan_index,
+            let right_plan = PlanNode::scan(
+                source_label(right.name.as_str(), &qualifier),
                 right_filtered,
-                projection.columns(scan_index),
+                stats
+                    .and_then(|stats| stats.scan_rows.get(scan_index).copied())
+                    .map(|rows| rows as u64),
+                estimates.and_then(|estimate| estimate.scan_rows.get(scan_index).copied()),
+                projection
+                    .columns(scan_index)
+                    .map(|columns| columns.to_vec()),
             );
             scan_index += 1;
-            plan = format!(
-                "{header}\n{}\n{}",
-                indent_plan(&plan, 2),
-                indent_plan(&right_plan, 2)
-            );
+            plan = PlanNode::join(join_plan, plan, right_plan);
             let (schema, _) = build_join_layout(&left_table, &right_table, &pairs, join.kind);
             left_table = Table {
                 name: left_table.name,
@@ -1055,89 +1077,121 @@ impl SqlEngine {
         let filtered_select = select_with_filter(select, pushdown.residual.clone());
         let bound = bind_select(&filtered_select, &left_table)?;
         if bound.filter.is_some() {
-            let label = if let Some(stats) = stats {
-                format!(
-                    "Filter actual rows={} time={:.3}ms",
-                    stats.filter_rows, stats.filter_ms
-                )
+            let metrics = if let Some(stats) = stats {
+                Metrics {
+                    actual: Some(stats.filter_rows as u64),
+                    actual_ms: Some(stats.filter_ms),
+                    est: None,
+                }
             } else if let Some(estimate) = estimates {
-                format!("Filter est rows={}", estimate.filter_rows)
+                Metrics {
+                    actual: None,
+                    actual_ms: None,
+                    est: Some(estimate.filter_rows),
+                }
             } else {
-                "Filter".to_string()
+                Metrics::default()
             };
-            plan = format!("{label}\n{}", indent_plan(&plan, 2));
+            plan = PlanNode::unary(PlanKind::Filter(metrics), plan);
         }
         if bound.is_grouped() {
-            let label = if let Some(stats) = stats {
-                format!(
-                    "Aggregate actual groups={} time={:.3}ms",
-                    stats.aggregate_groups, stats.aggregate_ms
-                )
+            let metrics = if let Some(stats) = stats {
+                Metrics {
+                    actual: Some(stats.aggregate_groups as u64),
+                    actual_ms: Some(stats.aggregate_ms),
+                    est: None,
+                }
             } else if let Some(estimate) = estimates {
-                format!("Aggregate est groups={}", estimate.aggregate_groups)
+                Metrics {
+                    actual: None,
+                    actual_ms: None,
+                    est: Some(estimate.aggregate_groups),
+                }
             } else {
-                "Aggregate".to_string()
+                Metrics::default()
             };
-            plan = format!("{label}\n{}", indent_plan(&plan, 2));
+            plan = PlanNode::unary(PlanKind::Aggregate(metrics), plan);
             if bound.having.is_some() {
-                let label = if let Some(stats) = stats {
-                    format!(
-                        "Having actual groups={} time={:.3}ms",
-                        stats.having_groups, stats.having_ms
-                    )
+                let metrics = if let Some(stats) = stats {
+                    Metrics {
+                        actual: Some(stats.having_groups as u64),
+                        actual_ms: Some(stats.having_ms),
+                        est: None,
+                    }
                 } else if let Some(estimate) = estimates {
-                    format!("Having est groups={}", estimate.having_groups)
+                    Metrics {
+                        actual: None,
+                        actual_ms: None,
+                        est: Some(estimate.having_groups),
+                    }
                 } else {
-                    "Having".to_string()
+                    Metrics::default()
                 };
-                plan = format!("{label}\n{}", indent_plan(&plan, 2));
+                plan = PlanNode::unary(PlanKind::Having(metrics), plan);
             }
         }
-        let projection = bound
+        let projection_names = bound
             .items
             .iter()
             .map(|item| item.name().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let label = if let Some(stats) = stats {
-            format!(
-                "Project [{projection}] actual rows={} time={:.3}ms",
-                stats.project_rows, stats.project_ms
-            )
+            .collect::<Vec<_>>();
+        let metrics = if let Some(stats) = stats {
+            Metrics {
+                actual: Some(stats.project_rows as u64),
+                actual_ms: Some(stats.project_ms),
+                est: None,
+            }
         } else if let Some(estimate) = estimates {
-            format!("Project [{projection}] est rows={}", estimate.project_rows)
+            Metrics {
+                actual: None,
+                actual_ms: None,
+                est: Some(estimate.project_rows),
+            }
         } else {
-            format!("Project [{projection}]")
+            Metrics::default()
         };
-        plan = format!("{label}\n{}", indent_plan(&plan, 2));
+        plan = PlanNode::unary(
+            PlanKind::Project {
+                columns: projection_names,
+                metrics,
+            },
+            plan,
+        );
         if !bound.order_by.is_empty() {
-            let label = if let Some(stats) = stats {
-                format!(
-                    "Sort ({} key(s)) actual rows={} time={:.3}ms",
-                    bound.order_by.len(),
-                    stats.sort_rows,
-                    stats.sort_ms
-                )
+            let metrics = if let Some(stats) = stats {
+                Metrics {
+                    actual: Some(stats.sort_rows as u64),
+                    actual_ms: Some(stats.sort_ms),
+                    est: None,
+                }
             } else if let Some(estimate) = estimates {
-                format!(
-                    "Sort ({} key(s)) est rows={}",
-                    bound.order_by.len(),
-                    estimate.sort_rows
-                )
+                Metrics {
+                    actual: None,
+                    actual_ms: None,
+                    est: Some(estimate.sort_rows),
+                }
             } else {
-                format!("Sort ({} key(s))", bound.order_by.len())
+                Metrics::default()
             };
-            plan = format!("{label}\n{}", indent_plan(&plan, 2));
+            plan = PlanNode::unary(
+                PlanKind::Sort {
+                    keys: bound.order_by.len(),
+                    metrics,
+                },
+                plan,
+            );
         }
         if let Some(limit) = bound.limit {
-            let label = if let Some(stats) = stats {
-                format!("Limit {limit} actual rows={}", stats.output_rows)
-            } else if let Some(estimate) = estimates {
-                format!("Limit {limit} est rows={}", estimate.output_rows)
-            } else {
-                format!("Limit {limit}")
-            };
-            plan = format!("{label}\n{}", indent_plan(&plan, 2));
+            let actual_rows = stats.map(|stats| stats.output_rows as u64);
+            let est_rows = estimates.map(|estimate| estimate.output_rows);
+            plan = PlanNode::unary(
+                PlanKind::Limit {
+                    limit,
+                    actual_rows,
+                    est_rows,
+                },
+                plan,
+            );
         }
         Ok(plan)
     }
@@ -2269,51 +2323,6 @@ fn source_label(table: &str, qualifier: &str) -> String {
     }
 }
 
-fn scan_plan(
-    label: &str,
-    stats: Option<&ExecutionStats>,
-    estimates: Option<&PlanEstimate>,
-    index: usize,
-    filtered: bool,
-    columns: Option<&[String]>,
-) -> String {
-    let mut node = format!("Scan {label}");
-    if filtered {
-        node.push_str(" filtered");
-    }
-    if let Some(rows) = stats.and_then(|stats| stats.scan_rows.get(index)) {
-        node.push_str(&format!(" actual rows={rows}"));
-    } else if let Some(rows) = estimates.and_then(|estimate| estimate.scan_rows.get(index)) {
-        node.push_str(&format!(" est rows={rows}"));
-    }
-    if let Some(columns) = columns {
-        if columns.is_empty() {
-            node.push_str(" cols=()");
-        } else {
-            node.push_str(&format!(" cols={}", columns.join(",")));
-        }
-    }
-    node
-}
-
-fn indent_plan(plan: &str, spaces: usize) -> String {
-    let prefix = " ".repeat(spaces);
-    plan.lines()
-        .map(|line| format!("{prefix}{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn join_kind_name(kind: JoinKind) -> &'static str {
-    match kind {
-        JoinKind::Inner => "inner",
-        JoinKind::Cross => "cross",
-        JoinKind::Left => "left",
-        JoinKind::Right => "right",
-        JoinKind::Full => "full",
-    }
-}
-
 fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {
     match expr {
         ExecExpr::Binary {
@@ -2333,19 +2342,14 @@ fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {
     }
 }
 
-fn join_plan_header(
+fn join_plan(
     join: &Join,
     uses_hash: bool,
     hash_pairs: &[(usize, usize)],
     left: &Table,
     right: &Table,
     predicate: Option<&ExecExpr>,
-) -> String {
-    let mut header = format!(
-        "{} ({})",
-        if uses_hash { "HashJoin" } else { "NestedLoop" },
-        join_kind_name(join.kind)
-    );
+) -> JoinPlan {
     let mut details = Vec::new();
     match &join.condition {
         JoinCondition::Using(names) => {
@@ -2386,11 +2390,12 @@ fn join_plan_header(
         }
         JoinCondition::None => {}
     }
-    if !details.is_empty() {
-        header.push(' ');
-        header.push_str(&details.join(" "));
+    JoinPlan {
+        uses_hash,
+        kind: join.kind,
+        details,
+        metrics: Metrics::default(),
     }
-    header
 }
 
 fn join_tables(

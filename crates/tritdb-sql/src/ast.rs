@@ -260,6 +260,8 @@ pub enum Statement {
     Select(Select),
     /// `EXPLAIN SELECT`.
     Explain(Select),
+    /// `EXPLAIN SEXPR SELECT`: read-only parenthesized plan output.
+    ExplainSexpr(Select),
     /// `EXPLAIN ANALYZE SELECT`.
     ExplainAnalyze(Select),
     /// `ANALYZE [table]`: recompute exact table statistics.

@@ -1,6 +1,6 @@
 # M1 SQL 3VL：最小纵向切片读数
 
-状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / 等值 JOIN 的 hash join / `ANALYZE` 表/列统计 / 基于统计的 `Auto` join 代价选择 / 内连接/交叉连接的 `WHERE` 合取项拆分与单源下推 / 源表列裁剪（含无歧义未限定列与零列源表投影）/ 常量折叠与恒真条件简化 / 投影常量折叠 / 加法 schema 迁移 `ALTER TABLE ADD COLUMN` / `EXPLAIN SELECT` 统计估算 / `EXPLAIN ANALYZE` / JOIN 策略开关 / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
+状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / 等值 JOIN 的 hash join / `ANALYZE` 表/列统计 / 基于统计的 `Auto` join 代价选择 / 内连接/交叉连接的 `WHERE` 合取项拆分与单源下推 / 源表列裁剪（含无歧义未限定列与零列源表投影）/ 常量折叠与恒真条件简化 / 投影常量折叠 / 结构化计划树与只读 `EXPLAIN SEXPR` / 加法 schema 迁移 `ALTER TABLE ADD COLUMN` / `EXPLAIN SELECT` 统计估算 / `EXPLAIN ANALYZE` / JOIN 策略开关 / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
 日期：2026-11-20
 
 ## 1. 交付
@@ -31,6 +31,7 @@ docs/specs/SQL.md
 - 源表列裁剪：`SELECT` 不含 `*`、每个列引用都能静态归属到唯一源表、join 链不含 `USING`/`NATURAL` 时，收集 `SELECT`/`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`ON` 所需列，在源表限定阶段只保留严格子集；显式限定列直接归属，未限定列只在全源唯一时归属，匹配零个或多个源表都退回完整 schema。某源表不需要任何列时投影为零列并保留行数；`CROSS JOIN` / `ON TRUE` 仍按行数乘积构造，外连接走既有 NULL 行路径。源表仍完整加载，只缩小 join 前副本和中间行宽。`EXPLAIN`/`EXPLAIN ANALYZE` 的 `Scan` 节点显示 `cols=<col,...>`，零列显示 `cols=()`。含 `*`、`USING` 或 `NATURAL` 时整条查询不裁剪；歧义/未知未限定列交给 binder 按原错误路径处理
 - 常量折叠与恒真条件简化：计划入口折叠 `SELECT` 项、`WHERE`/`HAVING`/`GROUP BY`/`ORDER BY`/`JOIN ... ON` 中不含列或聚合的常量表达式；成功求值替换为字面量，求值失败保留原表达式。有 alias 的投影保留 alias，裸列保留列名，无 alias 的非列/聚合投影仍命名为 `colN`，折叠不改变输出标签。只做 `TRUE AND x`、`x AND TRUE`、`FALSE OR x`、`x OR FALSE` 四个安全恒等；`WHERE`/`HAVING` 折叠为 `TRUE` 时移除对应节点，`FALSE`/`NULL` 保留。`EXPLAIN` 中不再出现恒真 `Filter`/`Having`；字面 `FALSE`/`NULL` 的过滤估算为 0。`FALSE AND x`、`TRUE OR x` 不简化，避免改变错误/短路时机
 - `EXPLAIN SELECT`：绑定但不执行，输出 `Scan` / `Join` / `Filter` / `Aggregate` / `Having` / `Project` / `Sort` / `Limit` 文本计划；Join 节点标出 `HashJoin` 或 `NestedLoop`、键和残余谓词；发生谓词下推的源表显示 `Scan ... filtered`，发生列裁剪的源表显示 `cols=...`；恒真 `WHERE`/`HAVING` 不生成对应节点，字面 `FALSE`/`NULL` 仍保留并估算为 0；有 `ANALYZE` 统计时节点追加 `est rows` / `est groups`，并按同一成本规则决定显示的 join 路径
+- `EXPLAIN SEXPR SELECT`：同一 `PlanNode` 树的只读括号化输出，返回一列 `plan`、一行文本；节点携带扫描标签/过滤标记/估算行数/裁剪列，join 携带算法、连接类型和键/残余片段，投影携带列名，排序携带键数，limit 携带上限；零列显示 `:cols ()`。不支持 `EXPLAIN ANALYZE SEXPR`；不改变执行路径、结果行集或错误语义
 - `ANALYZE [table]`：扫描表并持久化精确行数、每列 `NULL` 数和 NDV；DML 在同一事务删除旧统计，重开后可继续供 `EXPLAIN` 和 `Auto` join 选择使用
 - `EXPLAIN ANALYZE SELECT`：执行一次查询，在计划节点上追加 `actual rows`（聚合节点为 `actual groups`）和墙钟耗时；谓词下推的扫描显示过滤后的 `actual rows`，列裁剪的扫描显示 `cols=...`；末行给出 `Execution: rows=N time=Xms`，不返回查询结果行；join 节点显示本次实际选择的算法
 - JOIN 策略开关：`JoinStrategy::{Auto, Hash, NestedLoop}`，`Auto` 有统计时比较成本，`Hash` / `NestedLoop` 强制指定执行路径，供基准和差分测试使用
@@ -93,12 +94,12 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 | 层 | 新增 |
 |---|---:|
 | `tritdb-exec` 单元测试 | 12 |
-| `tritdb-sql` 单元测试 | 27 |
-| `tritdb-sql` 引擎集成测试 | 49 |
+| `tritdb-sql` 单元测试 | 28 |
+| `tritdb-sql` 引擎集成测试 | 51 |
 | `tritdb` SQL CLI 集成测试 | 2 |
-| **合计** | **90** |
+| **合计** | **93** |
 
-其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4），1 个来自 hash join 切片（复合键/NULL 键/残余谓词/非等值回退），2 个来自 EXPLAIN 切片（1 个 parser + 1 个 engine），1 个来自 EXPLAIN ANALYZE 切片（计划实际行数/分组数/耗时），3 个来自 ANALYZE 统计切片（1 个 parser + 1 个 stats 单元 + 1 个 storage 编解码），2 个来自 EXPLAIN 估算切片（统计持久化/重开与 DML 失效），1 个来自 Auto join 代价切片（小表选 nested loop、静态与实测计划一致），2 个来自谓词下推切片（单表整体下推、跨源合取项拆分与残余条件），1 个来自源表列裁剪切片（宽表 join 裁剪、`EXPLAIN`/`EXPLAIN ANALYZE` 的 `cols=`、`*`/`USING` 回退；后续无歧义未限定列扩展只改既有断言，不新增计数），1 个来自常量折叠切片（恒真 `WHERE`/`HAVING` 移除、字面 `FALSE` 估算为 0、`AND TRUE`/`OR FALSE` 后继续下推、除零错误保留），2 个来自加法 schema 迁移切片（1 个 parser + 1 个 engine：旧行 `NULL` 回填、列顺序、重开持久化、统计失效、`IF NOT EXISTS` 幂等、`NOT NULL`/重复列/未知表拒绝、空表迁移），1 个来自投影常量折叠切片（`fold_select` 内部单测；集成测试扩展既有常量折叠用例，验证 `col1`/alias 标签和投影除零错误保留，不新增 engine 测试），1 个来自零列源表投影切片（常量投影/`COUNT(*)`/`CROSS JOIN`/`FULL JOIN` 行数保持与 `cols=()`）。工作区测试从 158 增至 **248 个正常测试 + 4 个 ignored 压力测试**。
+其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4），1 个来自 hash join 切片（复合键/NULL 键/残余谓词/非等值回退），2 个来自 EXPLAIN 切片（1 个 parser + 1 个 engine），1 个来自 EXPLAIN ANALYZE 切片（计划实际行数/分组数/耗时），3 个来自 ANALYZE 统计切片（1 个 parser + 1 个 stats 单元 + 1 个 storage 编解码），2 个来自 EXPLAIN 估算切片（统计持久化/重开与 DML 失效），1 个来自 Auto join 代价切片（小表选 nested loop、静态与实测计划一致），2 个来自谓词下推切片（单表整体下推、跨源合取项拆分与残余条件），1 个来自源表列裁剪切片（宽表 join 裁剪、`EXPLAIN`/`EXPLAIN ANALYZE` 的 `cols=`、`*`/`USING` 回退；后续无歧义未限定列扩展只改既有断言，不新增计数），1 个来自常量折叠切片（恒真 `WHERE`/`HAVING` 移除、字面 `FALSE` 估算为 0、`AND TRUE`/`OR FALSE` 后继续下推、除零错误保留），2 个来自加法 schema 迁移切片（1 个 parser + 1 个 engine：旧行 `NULL` 回填、列顺序、重开持久化、统计失效、`IF NOT EXISTS` 幂等、`NOT NULL`/重复列/未知表拒绝、空表迁移），1 个来自投影常量折叠切片（`fold_select` 内部单测；集成测试扩展既有常量折叠用例，验证 `col1`/alias 标签和投影除零错误保留，不新增 engine 测试），1 个来自零列源表投影切片（常量投影/`COUNT(*)`/`CROSS JOIN`/`FULL JOIN` 行数保持与 `cols=()`），3 个来自结构化计划切片（1 个 parser：`EXPLAIN SEXPR` 语法；2 个 engine：连接树/估算/零列的括号化输出与单值返回）。工作区测试从 158 增至 **251 个正常测试 + 4 个 ignored 压力测试**。
 
 ## 4. 负结果 / 边界
 
@@ -121,12 +122,12 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 
 - CROSS JOIN/逗号 FROM 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44639115915>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
 - NATURAL JOIN/USING 切片：本地 `sql_oracle.py` 133/133（127 SELECT + 6 UPDATE 行数）；等值 hash join 切片当前为 **138/138**（132 SELECT + 6 UPDATE 行数）。三平台 CI 待推送后补。上一轮 CROSS JOIN CI 的三平台对拍为 118/118。
-- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 5766/7646 = 75.41%，RIGHT/FULL JOIN 后 5814/7692 = 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；NATURAL/USING、hash join、EXPLAIN、EXPLAIN ANALYZE、ANALYZE 统计与估算、谓词下推、合取项拆分、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠、投影常量折叠与加法 schema 迁移切片尚未重跑覆盖率，65% 门禁仍有余量。
+- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 5766/7646 = 75.41%，RIGHT/FULL JOIN 后 5814/7692 = 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；NATURAL/USING、hash join、EXPLAIN、EXPLAIN ANALYZE、ANALYZE 统计与估算、谓词下推、合取项拆分、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠、投影常量折叠、结构化计划/`EXPLAIN SEXPR` 与加法 schema 迁移切片尚未重跑覆盖率，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
 
-- 等值 hash join、可复现 `sql-join` 基准、`EXPLAIN SELECT`、`EXPLAIN ANALYZE`、`ANALYZE` 统计、`Auto` 局部代价选择、`WHERE` 合取项下推、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠与投影常量折叠已做：右表建桶、左表探测，`USING`/`NATURAL` 与 `ON` 顶层 `AND` 的列等值可命中；非等值/OR/表达式键只能 nested loop；`JoinStrategy` 可强制路径，`EXPLAIN` 直接显示 `HashJoin` / `NestedLoop`、键与启发式 `est rows`，`EXPLAIN ANALYZE` 显示实际行数/分组数、实际算法与耗时；内连接/交叉连接的顶层 `AND` 会按来源拆分并把单源合取项下推到扫描；无 `*` / `USING` / `NATURAL` 且列引用可唯一归属时，会在源表限定阶段裁剪未引用列（包括全源唯一的未限定列），零列源表只保留行数并在 `Scan` 节点显示 `cols=...` / `cols=()`；不含列/聚合的常量会折叠（含 `SELECT` 项），恒真 `WHERE`/`HAVING` 被移除。下一步是逻辑计划、表达式级列下推与投影下推；join 顺序搜索、全局代价模型和索引仍不做。子查询需要新的作用域和计划层，成本更高。
+- 等值 hash join、可复现 `sql-join` 基准、`EXPLAIN SELECT`、`EXPLAIN SEXPR`、`EXPLAIN ANALYZE`、`ANALYZE` 统计、`Auto` 局部代价选择、`WHERE` 合取项下推、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠与投影常量折叠、结构化 `PlanNode` 已做：右表建桶、左表探测，`USING`/`NATURAL` 与 `ON` 顶层 `AND` 的列等值可命中；非等值/OR/表达式键只能 nested loop；`JoinStrategy` 可强制路径，`EXPLAIN` 直接显示 `HashJoin` / `NestedLoop`、键与启发式 `est rows`，`EXPLAIN ANALYZE` 显示实际行数/分组数、实际算法与耗时；内连接/交叉连接的顶层 `AND` 会按来源拆分并把单源合取项下推到扫描；无 `*` / `USING` / `NATURAL` 且列引用可唯一归属时，会在源表限定阶段裁剪未引用列（包括全源唯一的未限定列），零列源表只保留行数并在 `Scan` 节点显示 `cols=...` / `cols=()`；不含列/聚合的常量会折叠（含 `SELECT` 项），恒真 `WHERE`/`HAVING` 被移除；`EXPLAIN SEXPR` 把同一棵树输出为只读括号化计划。下一步是在 `PlanNode` 上做规则化重写、逻辑/物理计划分层、表达式级列下推与投影下推；join 顺序搜索、全局代价模型和索引仍不做。子查询需要新的作用域和计划层，成本更高。
 - `tritdb-plan`：逻辑计划、表达式级列下推、投影下推与更完整的残余谓词分析。
 - `tritdb-proto`：pgwire v3 simple query + extended query，先让 `psql` 能连。
 - 表存储从整表重写改成页/行格式，接 `tritdb-page`。

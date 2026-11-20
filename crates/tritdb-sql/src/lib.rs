@@ -7,6 +7,7 @@ mod engine;
 mod error;
 mod lexer;
 mod parser;
+mod plan;
 mod stats;
 mod storage;
 

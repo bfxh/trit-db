@@ -276,12 +276,18 @@ impl Parser {
     fn parse_explain(&mut self) -> Result<Statement, SqlError> {
         self.expect_keyword(Keyword::Explain)?;
         let analyze = self.eat_keyword(Keyword::Analyze);
+        let sexpr = self.eat_word("sexpr");
+        if analyze && sexpr {
+            return Err(self.error("EXPLAIN ANALYZE SEXPR is not supported"));
+        }
         let select = match self.parse_select()? {
             Statement::Select(select) => select,
             _ => unreachable!("parse_select always returns SELECT"),
         };
         Ok(if analyze {
             Statement::ExplainAnalyze(select)
+        } else if sexpr {
+            Statement::ExplainSexpr(select)
         } else {
             Statement::Explain(select)
         })
@@ -933,6 +939,21 @@ mod tests {
                 }
                 other => panic!("unexpected {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn parses_explain_sexpr_select() {
+        let statements = parse_script("EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;")
+            .expect("parse explain sexpr");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::ExplainSexpr(select) => {
+                assert_eq!(select.table, "a");
+                assert_eq!(select.joins.len(), 1);
+                assert_eq!(select.joins[0].table, "b");
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 
