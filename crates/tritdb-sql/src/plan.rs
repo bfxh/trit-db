@@ -98,8 +98,9 @@ pub(crate) enum PlanExpr {
     },
 }
 
-/// Join-specific fields. Keys and residual flags are data; the historical
-/// `keys=...` / `residual=yes` / `on=expr` fragments are rendered on demand.
+/// Join-specific fields. Keys, residual flags, and the residual predicate are
+/// data; the historical `keys=...` / `residual=yes` / `on=expr` fragments are
+/// rendered on demand.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JoinPlan {
     pub(crate) uses_hash: bool,
@@ -107,6 +108,10 @@ pub(crate) struct JoinPlan {
     pub(crate) keys: Option<JoinKeys>,
     /// `true` when an `ON` hash join has a predicate beyond its equi-keys.
     pub(crate) residual: bool,
+    /// The non-key conjuncts of the join predicate, when `residual` is true.
+    /// Equi-key conjuncts are removed; the remaining tree is still a bound
+    /// expression over the combined schema.
+    pub(crate) residual_pred: Option<PlanExpr>,
     /// `true` when a nested-loop `ON` join shows the whole predicate as
     /// `on=expr`.
     pub(crate) on_expr: bool,
@@ -401,6 +406,10 @@ impl PlanNode {
                 }
                 if join.residual {
                     out.push_str(" :residual #t");
+                }
+                if let Some(residual_pred) = &join.residual_pred {
+                    out.push_str(" :residual-pred ");
+                    residual_pred.write_sexpr(out);
                 }
                 if join.on_expr {
                     out.push_str(" :on-expr #t");

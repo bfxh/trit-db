@@ -2110,6 +2110,7 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     assert!(
         plan.contains(
             "(join hash inner :keys ((\"a.id\" \"b.id\")) :residual #t \
+             :residual-pred (<> (col \"b.w\") \"b2x\") \
              :pred (and (= (col \"a.id\") (col \"b.id\")) \
              (<> (col \"b.w\") \"b2x\")) :actual-rows 2 :time-ms "
         ),
@@ -2203,6 +2204,10 @@ fn explain_sexpr_reports_structured_join_keys() {
         "unexpected plan: {using}"
     );
     assert!(!using.contains(":details"), "unexpected plan: {using}");
+    assert!(
+        !using.contains(":residual-pred"),
+        "USING join must not invent a residual predicate: {using}"
+    );
 
     let residual = plan_text(
         &mut engine,
@@ -2211,6 +2216,7 @@ fn explain_sexpr_reports_structured_join_keys() {
     assert!(
         residual.contains(
             ":keys ((\"a.id\" \"b.id\")) :residual #t \
+             :residual-pred (<> (col \"b.code\") 0) \
              :pred (and (= (col \"a.id\") (col \"b.id\")) (<> (col \"b.code\") 0))"
         ),
         "unexpected plan: {residual}"
@@ -2218,6 +2224,42 @@ fn explain_sexpr_reports_structured_join_keys() {
     assert!(
         !residual.contains(":details"),
         "unexpected plan: {residual}"
+    );
+
+    let composite = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND a.code = b.code AND b.code <> 0;",
+    );
+    assert!(
+        composite.contains(
+            ":keys ((\"a.id\" \"b.id\") (\"a.code\" \"b.code\")) :residual #t \
+             :residual-pred (<> (col \"b.code\") 0)"
+        ),
+        "unexpected plan: {composite}"
+    );
+
+    let or_residual = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND (b.code <> 0 OR a.code <> 1);",
+    );
+    assert!(
+        or_residual.contains(
+            ":residual #t :residual-pred (or (<> (col \"b.code\") 0) \
+             (<> (col \"a.code\") 1))"
+        ),
+        "unexpected plan: {or_residual}"
+    );
+
+    let pure = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND a.code = b.code;",
+    );
+    assert!(
+        !pure.contains(":residual-pred"),
+        "pure equi join must not carry a residual predicate: {pure}"
     );
 
     engine.set_join_strategy(JoinStrategy::NestedLoop);
@@ -2233,6 +2275,10 @@ fn explain_sexpr_reports_structured_join_keys() {
         "unexpected plan: {nested}"
     );
     assert!(!nested.contains(":details"), "unexpected plan: {nested}");
+    assert!(
+        !nested.contains(":residual-pred"),
+        "nested-loop join must not carry a residual predicate: {nested}"
+    );
 }
 
 #[test]

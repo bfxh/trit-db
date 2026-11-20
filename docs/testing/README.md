@@ -1,6 +1,6 @@
 # trit-db 测试矩阵与 CI/CD
 
-M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/执行汇总/加法 schema 迁移语义拆开验证。当前工作区有 **255 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/执行汇总/加法 schema 迁移语义拆开验证。当前工作区有 **255 个正常测试 + 4 个 `#[ignore]` 压力测试**。
 
 ## 1. 分层与计数
 
@@ -90,7 +90,7 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 | `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
 | `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
 | `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge）、`sql_oracle.py`（SQLite 3VL 对拍） |
-| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 73.19%，UPDATE 后 73.65%，谓词后 74.48%，CASE 后 75.41%，RIGHT/FULL JOIN 后 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；后续 NATURAL/USING、hash join、EXPLAIN、EXPLAIN SEXPR、EXPLAIN ANALYZE、ANALYZE、谓词下推、合取拆分、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠、投影常量折叠、结构化计划、结构化 join 键、结构化过滤谓词与 join 谓词、结构化 HAVING 谓词、结构化 Aggregate 分组键与聚合项、结构化 Sort 键与方向、结构化 Project 项与表达式、加法 schema 迁移未重跑 |
+| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 73.19%，UPDATE 后 73.65%，谓词后 74.48%，CASE 后 75.41%，RIGHT/FULL JOIN 后 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；后续 NATURAL/USING、hash join、EXPLAIN、EXPLAIN SEXPR、EXPLAIN ANALYZE、ANALYZE、谓词下推、合取拆分、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠、投影常量折叠、结构化计划、结构化 join 键、结构化过滤谓词与 join 谓词、结构化 join 残余谓词、结构化 HAVING 谓词、结构化 Aggregate 分组键与聚合项、结构化 Sort 键与方向、结构化 Project 项与表达式、加法 schema 迁移未重跑 |
 | `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。

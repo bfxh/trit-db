@@ -2435,6 +2435,44 @@ fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {
     }
 }
 
+/// Remove the top-level conjuncts already represented by hash keys. The
+/// remaining tree keeps its original conjunction shape and is cloned only at
+/// the leaves that survive.
+fn residual_join_predicate(
+    expr: &ExecExpr,
+    left_len: usize,
+    keys: &[(usize, usize)],
+) -> Option<ExecExpr> {
+    match expr {
+        ExecExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => match (
+            residual_join_predicate(left, left_len, keys),
+            residual_join_predicate(right, left_len, keys),
+        ) {
+            (None, None) => None,
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (Some(left), Some(right)) => Some(ExecExpr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+        },
+        ExecExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => match equi_pair(left, right, left_len) {
+            Some(pair) if keys.contains(&pair) => None,
+            _ => Some(expr.clone()),
+        },
+        _ => Some(expr.clone()),
+    }
+}
+
 fn join_plan(
     join: &Join,
     uses_hash: bool,
@@ -2496,11 +2534,20 @@ fn join_plan(
     let pred = predicate
         .map(|expr| PlanExpr::from_exec(expr, &pair_schema))
         .transpose()?;
+    let residual_pred = if residual {
+        predicate
+            .and_then(|expr| residual_join_predicate(expr, left.schema.len(), hash_pairs))
+            .map(|expr| PlanExpr::from_exec(&expr, &pair_schema))
+            .transpose()?
+    } else {
+        None
+    };
     Ok(JoinPlan {
         uses_hash,
         kind: join.kind,
         keys,
         residual,
+        residual_pred,
         on_expr,
         pred,
         metrics: Metrics::default(),
