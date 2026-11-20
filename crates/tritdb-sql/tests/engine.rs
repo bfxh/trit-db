@@ -1529,6 +1529,250 @@ fn cross_join_and_comma_from_produce_cartesian_product() {
 }
 
 #[test]
+fn natural_and_using_joins_merge_columns_through_outer_joins() {
+    let dir = TempDir::new("sql-natural-using");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE l (id INT NOT NULL, code INT, lv TEXT); \
+             CREATE TABLE r (id INT, code INT, rv TEXT); \
+             CREATE TABLE s (id INT, sv TEXT); \
+             INSERT INTO l VALUES (1, 10, 'l1'), (2, 20, 'l2'), (3, 30, 'l3'); \
+             INSERT INTO r VALUES (1, 10, 'r1'), (2, 20, 'r2'), (4, 40, 'r4'); \
+             INSERT INTO s VALUES (1, 's1'), (5, 's5');",
+        )
+        .expect("seed");
+
+    let natural = engine
+        .execute_script("SELECT * FROM l NATURAL JOIN r ORDER BY id;")
+        .expect("natural join");
+    let (columns, rows) = as_rows(&natural[0]);
+    assert_eq!(columns, ["id", "code", "lv", "rv"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Text("r2".to_string()),
+            ],
+        ]
+    );
+
+    let using = engine
+        .execute_script("SELECT * FROM l JOIN r USING (id) ORDER BY id;")
+        .expect("using join");
+    let (columns, rows) = as_rows(&using[0]);
+    assert_eq!(columns, ["id", "code", "lv", "code", "rv"]);
+    assert_eq!(
+        rows,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+        ]
+    );
+
+    let qualified = engine
+        .execute_script(
+            "SELECT l.id AS lid, r.id AS rid \
+             FROM l RIGHT JOIN r USING (id) ORDER BY rid;",
+        )
+        .expect("qualified merged columns");
+    assert_eq!(
+        as_rows(&qualified[0]).1,
+        [
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(4), Value::Int(4)],
+        ]
+    );
+
+    let left = engine
+        .execute_script("SELECT * FROM l LEFT JOIN r USING (id) ORDER BY id;")
+        .expect("left using");
+    assert_eq!(
+        as_rows(&left[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(30),
+                Value::Text("l3".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+
+    let right = engine
+        .execute_script("SELECT * FROM l RIGHT JOIN r USING (id) ORDER BY id;")
+        .expect("right using");
+    assert_eq!(
+        as_rows(&right[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+            vec![
+                Value::Int(4),
+                Value::Null,
+                Value::Null,
+                Value::Int(40),
+                Value::Text("r4".to_string()),
+            ],
+        ]
+    );
+
+    let full = engine
+        .execute_script("SELECT * FROM l FULL JOIN r USING (id) ORDER BY id;")
+        .expect("full using");
+    assert_eq!(
+        as_rows(&full[0]).1,
+        [
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Text("l1".to_string()),
+                Value::Int(10),
+                Value::Text("r1".to_string()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Int(20),
+                Value::Text("l2".to_string()),
+                Value::Int(20),
+                Value::Text("r2".to_string()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(30),
+                Value::Text("l3".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Int(4),
+                Value::Null,
+                Value::Null,
+                Value::Int(40),
+                Value::Text("r4".to_string()),
+            ],
+        ]
+    );
+
+    let chained = engine
+        .execute_script("SELECT * FROM l NATURAL JOIN r NATURAL JOIN s ORDER BY id;")
+        .expect("chained natural joins");
+    let (columns, rows) = as_rows(&chained[0]);
+    assert_eq!(columns, ["id", "code", "lv", "rv", "sv"]);
+    assert_eq!(
+        rows,
+        [vec![
+            Value::Int(1),
+            Value::Int(10),
+            Value::Text("l1".to_string()),
+            Value::Text("r1".to_string()),
+            Value::Text("s1".to_string()),
+        ]]
+    );
+
+    let chained_qualified = engine
+        .execute_script("SELECT l.id, r.id, s.id FROM l NATURAL JOIN r NATURAL JOIN s;")
+        .expect("chained natural qualified columns");
+    assert_eq!(
+        as_rows(&chained_qualified[0]).1,
+        [vec![Value::Int(1), Value::Int(1), Value::Int(1)]]
+    );
+}
+
+#[test]
+fn natural_join_without_common_columns_is_cross_join_and_validates_using() {
+    let dir = TempDir::new("sql-natural-using-errors");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE l (id INT NOT NULL, code INT); \
+             CREATE TABLE x (v TEXT); \
+             CREATE TABLE s (id TEXT); \
+             INSERT INTO l VALUES (1, 10), (2, 20); \
+             INSERT INTO x VALUES ('a'), ('b'); \
+             INSERT INTO s VALUES ('1');",
+        )
+        .expect("seed");
+
+    let crossed = engine
+        .execute_script("SELECT COUNT(*) FROM l NATURAL JOIN x;")
+        .expect("natural cross");
+    assert_eq!(as_rows(&crossed[0]).1, [vec![Value::Int(4)]]);
+
+    let missing = engine
+        .execute_script("SELECT * FROM l JOIN x USING (missing);")
+        .expect_err("missing using column")
+        .to_string();
+    assert!(missing.contains("unknown column: missing"), "{missing}");
+
+    let duplicate = engine
+        .execute_script("SELECT * FROM l JOIN l AS l2 USING (id, id);")
+        .expect_err("duplicate using column")
+        .to_string();
+    assert!(
+        duplicate.contains("duplicate USING column: id"),
+        "{duplicate}"
+    );
+
+    let mismatch = engine
+        .execute_script("SELECT * FROM l JOIN s USING (id);")
+        .expect_err("using type mismatch")
+        .to_string();
+    assert!(mismatch.contains("type mismatch"), "{mismatch}");
+}
+
+#[test]
 fn cross_join_composes_with_other_joins_and_group_by() {
     let dir = TempDir::new("sql-cross-compose");
     let db = dir.join("sql.db");

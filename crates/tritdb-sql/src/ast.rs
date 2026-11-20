@@ -161,6 +161,19 @@ pub enum JoinKind {
     Full,
 }
 
+/// Join condition.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JoinCondition {
+    /// No condition: `CROSS JOIN` and comma-separated sources.
+    None,
+    /// Explicit `ON` predicate.
+    On(Expr),
+    /// `USING (column, ...)`.
+    Using(Vec<String>),
+    /// `NATURAL JOIN`.
+    Natural,
+}
+
 /// A join clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Join {
@@ -170,8 +183,8 @@ pub struct Join {
     pub table: String,
     /// Optional alias.
     pub alias: Option<String>,
-    /// Join predicate; absent for `CROSS JOIN` and comma-separated sources.
-    pub on: Option<Expr>,
+    /// Join condition.
+    pub condition: JoinCondition,
 }
 
 /// Parsed `SELECT`.

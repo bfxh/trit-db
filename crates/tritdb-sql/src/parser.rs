@@ -1,8 +1,8 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
-    AggregateKind, Assignment, ColumnDef, Expr, Join, JoinKind, OrderBy, Select, SelectItem,
-    Statement,
+    AggregateKind, Assignment, ColumnDef, Expr, Join, JoinCondition, JoinKind, OrderBy, Select,
+    SelectItem, Statement,
 };
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -258,10 +258,10 @@ impl Parser {
         loop {
             if matches!(
                 self.peek().map(|token| &token.kind),
-                Some(TokenKind::Keyword(Keyword::Natural | Keyword::Outer))
+                Some(TokenKind::Keyword(Keyword::Outer))
             ) {
                 return Err(SqlError::Unsupported(
-                    "only INNER, LEFT, RIGHT, FULL, and CROSS JOIN are supported".to_string(),
+                    "OUTER must follow LEFT, RIGHT, or FULL".to_string(),
                 ));
             }
 
@@ -271,11 +271,12 @@ impl Parser {
                     kind: JoinKind::Cross,
                     table: join_table,
                     alias,
-                    on: None,
+                    condition: JoinCondition::None,
                 });
                 continue;
             }
 
+            let natural = self.eat_keyword(Keyword::Natural);
             let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Inner
@@ -296,26 +297,55 @@ impl Parser {
                 JoinKind::Full
             } else if self.eat_keyword(Keyword::Join) {
                 JoinKind::Inner
+            } else if natural {
+                return Err(self.error("expected JOIN after NATURAL"));
             } else {
                 break;
             };
+
+            if natural && kind == JoinKind::Cross {
+                return Err(SqlError::Unsupported(
+                    "NATURAL CROSS JOIN is not supported".to_string(),
+                ));
+            }
+
             let (join_table, alias) = self.parse_table_ref()?;
-            let on = if kind == JoinKind::Cross {
-                if self.eat_keyword(Keyword::On) {
+            let condition = if natural {
+                if self.eat_keyword(Keyword::On) || self.eat_keyword(Keyword::Using) {
+                    return Err(self.error("NATURAL JOIN cannot take ON or USING"));
+                }
+                JoinCondition::Natural
+            } else if kind == JoinKind::Cross {
+                if self.eat_keyword(Keyword::On) || self.eat_keyword(Keyword::Using) {
                     return Err(SqlError::Unsupported(
-                        "CROSS JOIN does not take an ON clause".to_string(),
+                        "CROSS JOIN does not take ON or USING".to_string(),
                     ));
                 }
-                None
+                JoinCondition::None
+            } else if self.eat_keyword(Keyword::Using) {
+                self.expect_symbol(Symbol::LParen)?;
+                let mut columns = Vec::new();
+                loop {
+                    columns.push(self.parse_ident()?);
+                    if self.eat_symbol(Symbol::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_symbol(Symbol::RParen)?;
+                if self.eat_keyword(Keyword::On) {
+                    return Err(self.error("JOIN USING cannot take ON"));
+                }
+                JoinCondition::Using(columns)
             } else {
                 self.expect_keyword(Keyword::On)?;
-                Some(self.parse_expr()?)
+                JoinCondition::On(self.parse_expr()?)
             };
             joins.push(Join {
                 kind,
                 table: join_table,
                 alias,
-                on,
+                condition,
             });
         }
 
@@ -928,7 +958,7 @@ mod tests {
                     assert_eq!(select.joins.len(), expected_joins, "{sql}");
                     for join in &select.joins {
                         assert_eq!(join.kind, JoinKind::Cross, "{sql}");
-                        assert!(join.on.is_none(), "{sql}");
+                        assert_eq!(join.condition, JoinCondition::None, "{sql}");
                     }
                 }
                 other => panic!("unexpected {other:?}"),
@@ -947,16 +977,78 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_join() {
+    fn parses_natural_joins() {
+        for (sql, expected) in [
+            ("SELECT * FROM a NATURAL JOIN b;", JoinKind::Inner),
+            ("SELECT * FROM a NATURAL INNER JOIN b;", JoinKind::Inner),
+            ("SELECT * FROM a NATURAL LEFT JOIN b;", JoinKind::Left),
+            ("SELECT * FROM a NATURAL LEFT OUTER JOIN b;", JoinKind::Left),
+            ("SELECT * FROM a NATURAL RIGHT JOIN b;", JoinKind::Right),
+            ("SELECT * FROM a NATURAL FULL OUTER JOIN b;", JoinKind::Full),
+        ] {
+            let statements = parse_script(sql).expect("parse natural join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), 1, "{sql}");
+                    assert_eq!(select.joins[0].kind, expected, "{sql}");
+                    assert_eq!(select.joins[0].condition, JoinCondition::Natural, "{sql}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_using_joins() {
+        for (sql, expected_kind, expected_columns) in [
+            (
+                "SELECT * FROM a JOIN b USING (id);",
+                JoinKind::Inner,
+                vec!["id"],
+            ),
+            (
+                "SELECT * FROM a LEFT JOIN b USING (id, code);",
+                JoinKind::Left,
+                vec!["id", "code"],
+            ),
+            (
+                "SELECT * FROM a FULL OUTER JOIN b USING (id);",
+                JoinKind::Full,
+                vec!["id"],
+            ),
+        ] {
+            let statements = parse_script(sql).expect("parse using join");
+            match &statements[0] {
+                Statement::Select(select) => {
+                    assert_eq!(select.joins.len(), 1, "{sql}");
+                    assert_eq!(select.joins[0].kind, expected_kind, "{sql}");
+                    assert_eq!(
+                        select.joins[0].condition,
+                        JoinCondition::Using(
+                            expected_columns.iter().map(ToString::to_string).collect()
+                        ),
+                        "{sql}"
+                    );
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_join_conditions() {
         for sql in [
-            "SELECT * FROM a NATURAL JOIN b;",
+            "SELECT * FROM a NATURAL JOIN b ON a.id = b.id;",
+            "SELECT * FROM a NATURAL JOIN b USING (id);",
+            "SELECT * FROM a NATURAL CROSS JOIN b;",
+            "SELECT * FROM a CROSS JOIN b USING (id);",
+            "SELECT * FROM a JOIN b USING (id) ON a.id = b.id;",
             "SELECT * FROM a OUTER JOIN b ON a.id = b.id;",
-            "SELECT * FROM a, b NATURAL JOIN c;",
             "SELECT * FROM a, b OUTER JOIN c ON b.id = c.id;",
         ] {
-            let error = parse_script(sql).expect_err("unsupported join");
+            let error = parse_script(sql).expect_err("conflicting join");
             assert!(
-                matches!(error, SqlError::Unsupported(_)),
+                matches!(error, SqlError::Unsupported(_) | SqlError::Parse { .. }),
                 "{sql} returned {error:?}"
             );
         }

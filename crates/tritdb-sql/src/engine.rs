@@ -4,12 +4,12 @@ use std::path::Path;
 use std::str;
 
 use tritdb_exec::{
-    compare_values, eval, truth_of, Column, ExecError, Expr as ExecExpr, Row, Schema, Table,
-    TruthValue, Value,
+    compare_values, eval, truth_of, BinaryOp, Column, ExecError, Expr as ExecExpr, Row, Schema,
+    Table, TruthValue, Value,
 };
 use tritdb_txn::TxnStore;
 
-use crate::ast::{AggregateKind, Assignment, JoinKind, Select, Statement};
+use crate::ast::{AggregateKind, Assignment, JoinCondition, JoinKind, Select, Statement};
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
@@ -349,7 +349,7 @@ impl SqlEngine {
         let mut joined = qualify_table(table, left_qualifier);
         for (join, (right, qualifier)) in select.joins.iter().zip(sources.into_iter().skip(1)) {
             let right = qualify_table(right, qualifier);
-            joined = join_tables(&joined, &right, join.on.as_ref(), join.kind)?;
+            joined = join_tables(&joined, &right, &join.condition, join.kind)?;
         }
         Ok(joined)
     }
@@ -383,44 +383,266 @@ fn qualify_table(table: &Table, qualifier: &str) -> Table {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum JoinSource {
+    Left(usize),
+    Right(usize),
+    Coalesced { left: usize, right: usize },
+}
+
+fn unqualified_name(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, column)| column)
+}
+
+fn find_join_column(schema: &Schema, name: &str) -> Result<usize, SqlError> {
+    if let Some(index) = schema.index_of(name) {
+        return Ok(index);
+    }
+    let mut matches = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| (unqualified_name(&column.name) == name).then_some(index));
+    let Some(index) = matches.next() else {
+        return Err(SqlError::UnknownColumn(name.to_string()));
+    };
+    if matches.next().is_some() {
+        return Err(SqlError::AmbiguousColumn(name.to_string()));
+    }
+    Ok(index)
+}
+
+fn check_join_types(left: &Column, right: &Column) -> Result<(), SqlError> {
+    if left.data_type != right.data_type {
+        return Err(ExecError::TypeMismatch {
+            expected: left.data_type.name(),
+            actual: right.data_type.name(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn using_pairs(
+    left: &Table,
+    right: &Table,
+    names: &[String],
+) -> Result<Vec<(usize, usize)>, SqlError> {
+    let mut seen = BTreeSet::new();
+    let mut pairs = Vec::with_capacity(names.len());
+    for name in names {
+        if !seen.insert(name.clone()) {
+            return Err(SqlError::Unsupported(format!(
+                "duplicate USING column: {name}"
+            )));
+        }
+        let left_index = find_join_column(&left.schema, name)?;
+        let right_index = find_join_column(&right.schema, name)?;
+        check_join_types(
+            &left.schema.columns[left_index],
+            &right.schema.columns[right_index],
+        )?;
+        pairs.push((left_index, right_index));
+    }
+    Ok(pairs)
+}
+
+fn natural_pairs(left: &Table, right: &Table) -> Result<Vec<(usize, usize)>, SqlError> {
+    let mut seen = BTreeSet::new();
+    let mut pairs = Vec::new();
+    for (left_index, left_column) in left.schema.columns.iter().enumerate() {
+        let name = unqualified_name(&left_column.name);
+        if !seen.insert(name.to_string()) {
+            return Err(SqlError::AmbiguousColumn(name.to_string()));
+        }
+        let right_index = match find_join_column(&right.schema, name) {
+            Ok(index) => index,
+            Err(SqlError::UnknownColumn(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        check_join_types(left_column, &right.schema.columns[right_index])?;
+        pairs.push((left_index, right_index));
+    }
+    Ok(pairs)
+}
+
+fn build_join_layout(
+    left: &Table,
+    right: &Table,
+    pairs: &[(usize, usize)],
+    kind: JoinKind,
+) -> (Schema, Vec<JoinSource>) {
+    let mut columns = Vec::new();
+    let mut sources = Vec::new();
+    let mut aliases = BTreeMap::new();
+    let mut used_left = BTreeSet::new();
+    let mut used_right = BTreeSet::new();
+
+    for &(left_index, right_index) in pairs {
+        used_left.insert(left_index);
+        used_right.insert(right_index);
+        let left_column = &left.schema.columns[left_index];
+        let right_column = &right.schema.columns[right_index];
+        let name = unqualified_name(&left_column.name).to_string();
+        let not_null = match kind {
+            JoinKind::Inner => left_column.not_null || right_column.not_null,
+            JoinKind::Left => left_column.not_null,
+            JoinKind::Right => right_column.not_null,
+            JoinKind::Full | JoinKind::Cross => false,
+        };
+        let output_index = columns.len();
+        columns.push(Column {
+            name: name.clone(),
+            data_type: left_column.data_type,
+            not_null,
+        });
+        sources.push(JoinSource::Coalesced {
+            left: left_index,
+            right: right_index,
+        });
+        aliases.insert(left_column.name.clone(), output_index);
+        aliases.insert(right_column.name.clone(), output_index);
+        for (alias, index) in left.schema.aliases() {
+            if *index == left_index {
+                aliases.insert(alias.clone(), output_index);
+            }
+        }
+        for (alias, index) in right.schema.aliases() {
+            if *index == right_index {
+                aliases.insert(alias.clone(), output_index);
+            }
+        }
+    }
+
+    for (index, column) in left.schema.columns.iter().enumerate() {
+        if used_left.contains(&index) {
+            continue;
+        }
+        let not_null = match kind {
+            JoinKind::Right | JoinKind::Full => false,
+            _ => column.not_null,
+        };
+        let output_index = columns.len();
+        columns.push(Column {
+            name: column.name.clone(),
+            data_type: column.data_type,
+            not_null,
+        });
+        sources.push(JoinSource::Left(index));
+        aliases.insert(column.name.clone(), output_index);
+        for (alias, alias_index) in left.schema.aliases() {
+            if *alias_index == index {
+                aliases.insert(alias.clone(), output_index);
+            }
+        }
+    }
+
+    for (index, column) in right.schema.columns.iter().enumerate() {
+        if used_right.contains(&index) {
+            continue;
+        }
+        let not_null = match kind {
+            JoinKind::Left | JoinKind::Full => false,
+            _ => column.not_null,
+        };
+        let output_index = columns.len();
+        columns.push(Column {
+            name: column.name.clone(),
+            data_type: column.data_type,
+            not_null,
+        });
+        sources.push(JoinSource::Right(index));
+        aliases.insert(column.name.clone(), output_index);
+        for (alias, alias_index) in right.schema.aliases() {
+            if *alias_index == index {
+                aliases.insert(alias.clone(), output_index);
+            }
+        }
+    }
+
+    (Schema::new(columns).with_aliases(aliases), sources)
+}
+
+fn using_predicate(pairs: &[(usize, usize)], left_len: usize) -> Option<ExecExpr> {
+    let mut expressions = pairs
+        .iter()
+        .map(|&(left_index, right_index)| ExecExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ExecExpr::Column(left_index)),
+            right: Box::new(ExecExpr::Column(left_len + right_index)),
+        });
+    let first = expressions.next()?;
+    Some(expressions.fold(first, |left, right| ExecExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+    }))
+}
+
+fn project_join_row(left: &Row, right: &Row, sources: &[JoinSource]) -> Row {
+    sources
+        .iter()
+        .map(|source| match source {
+            JoinSource::Left(index) => left[*index].clone(),
+            JoinSource::Right(index) => right[*index].clone(),
+            JoinSource::Coalesced {
+                left: left_index,
+                right: right_index,
+            } => {
+                if left[*left_index].is_null() {
+                    right[*right_index].clone()
+                } else {
+                    left[*left_index].clone()
+                }
+            }
+        })
+        .collect()
+}
+
 fn join_tables(
     left: &Table,
     right: &Table,
-    on: Option<&crate::ast::Expr>,
+    condition: &JoinCondition,
     kind: JoinKind,
 ) -> Result<Table, SqlError> {
-    let mut columns = left.schema.columns.clone();
-    let mut right_columns = right.schema.columns.clone();
-    if matches!(kind, JoinKind::Right | JoinKind::Full) {
-        for column in &mut columns {
-            column.not_null = false;
+    let pairs = match condition {
+        JoinCondition::Using(names) => using_pairs(left, right, names)?,
+        JoinCondition::Natural => natural_pairs(left, right)?,
+        JoinCondition::None | JoinCondition::On(_) => Vec::new(),
+    };
+    let (schema, sources) = build_join_layout(left, right, &pairs, kind);
+    let pair_schema = Schema::new(
+        left.schema
+            .columns
+            .iter()
+            .chain(right.schema.columns.iter())
+            .cloned()
+            .collect(),
+    );
+    let predicate = match condition {
+        JoinCondition::On(expr) => Some(bind_expr(expr, &pair_schema)?),
+        JoinCondition::Using(_) | JoinCondition::Natural => {
+            using_predicate(&pairs, left.schema.len())
         }
-    }
-    if matches!(kind, JoinKind::Left | JoinKind::Full) {
-        for column in &mut right_columns {
-            column.not_null = false;
-        }
-    }
-    columns.extend(right_columns);
-    let schema = Schema::new(columns);
-    let predicate = on.map(|expr| bind_expr(expr, &schema)).transpose()?;
+        JoinCondition::None => None,
+    };
     let mut rows = Vec::new();
     let mut right_matched = vec![false; right.rows.len()];
+    let null_left = vec![Value::Null; left.schema.len()];
+    let null_right = vec![Value::Null; right.schema.len()];
     for left_row in &left.rows {
         let mut matched = false;
         for (index, right_row) in right.rows.iter().enumerate() {
-            let mut row = left_row.clone();
-            row.extend(right_row.iter().cloned());
-            if passes_filter(predicate.as_ref(), &schema, &row)? {
+            let mut pair = left_row.clone();
+            pair.extend(right_row.iter().cloned());
+            if passes_filter(predicate.as_ref(), &pair_schema, &pair)? {
                 matched = true;
                 right_matched[index] = true;
-                rows.push(row);
+                rows.push(project_join_row(left_row, right_row, &sources));
             }
         }
         if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
-            let mut row = left_row.clone();
-            row.extend(std::iter::repeat_n(Value::Null, right.schema.columns.len()));
-            rows.push(row);
+            rows.push(project_join_row(left_row, &null_right, &sources));
         }
     }
     if matches!(kind, JoinKind::Right | JoinKind::Full) {
@@ -428,9 +650,7 @@ fn join_tables(
             if right_matched[index] {
                 continue;
             }
-            let mut row = vec![Value::Null; left.schema.columns.len()];
-            row.extend(right_row.iter().cloned());
-            rows.push(row);
+            rows.push(project_join_row(&null_left, right_row, &sources));
         }
     }
     Ok(Table {

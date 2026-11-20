@@ -34,6 +34,18 @@ INSERT INTO u VALUES
   (40, 99, 'idle'),
   (50, NULL, 'nil');
 CREATE TABLE e (id INT);
+CREATE TABLE l (id INT NOT NULL, code INT, lv TEXT);
+INSERT INTO l VALUES
+  (1, 10, 'l1'),
+  (2, 20, 'l2'),
+  (3, 30, 'l3');
+CREATE TABLE r (id INT, code INT, rv TEXT);
+INSERT INTO r VALUES
+  (1, 10, 'r1'),
+  (2, 20, 'r2'),
+  (4, 40, 'r4');
+CREATE TABLE x (v TEXT);
+INSERT INTO x VALUES ('a'), ('b');
 """
 
 CASES = [
@@ -119,6 +131,21 @@ CASES = [
     "SELECT COUNT(*) FROM t, u, e;",
     "SELECT t.id, e.id FROM t CROSS JOIN e ORDER BY t.id;",
     "SELECT t.id, u.label FROM t, u JOIN e ON u.id = e.id ORDER BY t.id;",
+    "SELECT * FROM l NATURAL JOIN r ORDER BY id;",
+    "SELECT COUNT(*) FROM l NATURAL JOIN r;",
+    "SELECT COUNT(*) FROM l NATURAL LEFT JOIN r;",
+    "SELECT * FROM l NATURAL LEFT JOIN r ORDER BY id;",
+    "SELECT * FROM l NATURAL RIGHT JOIN r ORDER BY id;",
+    "SELECT * FROM l NATURAL FULL JOIN r ORDER BY id;",
+    "SELECT * FROM l JOIN r USING (id) ORDER BY id;",
+    "SELECT l.id, r.id FROM l JOIN r USING (id) ORDER BY l.id;",
+    "SELECT l.code, r.code FROM l JOIN r USING (id) ORDER BY l.id;",
+    "SELECT * FROM l LEFT JOIN r USING (id) ORDER BY id;",
+    "SELECT * FROM l RIGHT JOIN r USING (id) ORDER BY id;",
+    "SELECT * FROM l FULL JOIN r USING (id) ORDER BY id;",
+    "SELECT * FROM l JOIN l AS l2 USING (id) ORDER BY id;",
+    "SELECT COUNT(*) FROM l JOIN r USING (id, code);",
+    "SELECT COUNT(*) FROM l NATURAL JOIN x;",
     "SELECT id FROM t WHERE id IN (1, 3, 5) ORDER BY id;",
     "SELECT id FROM t WHERE id NOT IN (1, 3, 5) ORDER BY id;",
     "SELECT id FROM t WHERE score IN (10, 20) ORDER BY id;",

@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`（表别名 + 限定列）、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；`NATURAL JOIN`、`USING`、子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -39,7 +39,7 @@ DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN` 和 `FULL [OUTER] JOIN`；不支持 `NATURAL JOIN`、`USING` 或子查询。
+- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；不支持子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE 重写整张表。
@@ -84,7 +84,11 @@ INSERT INTO name [(column, ...)] VALUES (expr, ...) [, (expr, ...)];
 SELECT * | expr [AS alias], ...
 FROM name [AS alias]
   [ , name [AS alias]
-  | { INNER | CROSS | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] } JOIN name [AS alias] [ON predicate] ]...
+  | CROSS JOIN name [AS alias]
+  | { INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] } JOIN name [AS alias]
+      ( ON predicate | USING (column, ...) )
+  | NATURAL [INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]] JOIN name [AS alias]
+  ]...
 [WHERE predicate]
 [GROUP BY column, ...]
 [HAVING predicate]
@@ -93,18 +97,21 @@ FROM name [AS alias]
 ```
 
 - `FROM` 后可带 `AS alias` 或裸别名；别名定义限定名命名空间。
-- `JOIN` 支持 `INNER`（`JOIN` 等价于 `INNER JOIN`）、`CROSS`、`LEFT [OUTER]`、`RIGHT [OUTER]` 和 `FULL [OUTER]`，可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
-- `CROSS JOIN` 与逗号分隔的源不写 `ON`，输出左右两侧所有行组合；任一侧为空时结果为空；不补 `NULL`，也不放宽列的可空标记。`CROSS JOIN ... ON` 会报错。
-- 逗号源等价于 `CROSS JOIN`，可以和显式 JOIN 混用；`ON` 只属于显式 JOIN。混合时按书写顺序左到右累积。
+- `JOIN` 支持 `INNER`（`JOIN` 等价于 `INNER JOIN`）、`CROSS`、`LEFT [OUTER]`、`RIGHT [OUTER]`、`FULL [OUTER]`、`NATURAL` 和 `USING`，可连续多个，按左到右累积；每个 `ON` 看到当前已连接的全部列。
+- `CROSS JOIN` 与逗号分隔的源不写 `ON`/`USING`，输出左右两侧所有行组合；任一侧为空时结果为空；不补 `NULL`，也不放宽列的可空标记。`CROSS JOIN ... ON` / `USING` 会报错。
+- 逗号源等价于 `CROSS JOIN`，可以和显式 JOIN 混用；`ON`/`USING` 只属于显式 JOIN。混合时按书写顺序左到右累积。
 - `ON` 是逐行谓词，只保留结果为 `TRUE` 的组合；`FALSE` 和 `UNKNOWN` 都不产生匹配行。`ON` 中不接受聚合或子查询。
+- `USING (col, ...)` 只接受不带限定的列名；每个列必须在左右两侧各存在且类型一致，重复列名报错。条件等价于对这些列逐列做 `=` 再用 `AND` 连接。
+- `NATURAL JOIN` 自动使用左右两侧所有同名（去掉限定前缀后）列；同名公共列按左表顺序处理，两侧无公共列时退化为 `CROSS JOIN`。`NATURAL` 不能再带 `ON` 或 `USING`。
+- `USING`/`NATURAL` 的合并列在输出 schema 中只出现一次，排在非合并左列之前；其余左列随后，其余右列最后。合并列可同时用左右两侧的限定名访问，`SELECT *` 只输出一次；未合并的同名列仍必须限定，否则报 `ambiguous column`。
 - `INNER JOIN` 只输出匹配组合；`LEFT JOIN` 对每个左行，若没有任何 `ON=TRUE` 的右行，就输出该左行并把右侧所有列置为 `NULL`。右表为空时，左表每一行都以右侧全 `NULL` 输出。
 - `RIGHT JOIN` 对每个右行，若没有任何 `ON=TRUE` 的左行，就输出该右行并把左侧所有列置为 `NULL`；左表为空时，右表每一行都以左侧全 `NULL` 输出。
 - `FULL JOIN` 先输出所有匹配组合，再补未匹配左行（右侧全 `NULL`）和未匹配右行（左侧全 `NULL`）；左右任一为空时，另一侧每一行都会被保留。
-- `LEFT`/`FULL JOIN` 的右侧列、`RIGHT`/`FULL JOIN` 的左侧列在输出 schema 中一律标记为可空；`WHERE` 在 join 之后执行，因此 `WHERE right.col IS NULL` / `WHERE left.col IS NULL` 可筛出未匹配行。
+- `LEFT`/`FULL JOIN` 的右侧非合并列、`RIGHT`/`FULL JOIN` 的左侧非合并列在输出 schema 中一律标记为可空；`USING`/`NATURAL` 合并列在 `LEFT` 保留左值、`RIGHT` 保留右值、`FULL` 两侧取非 `NULL` 值。`WHERE` 在 join 之后执行，因此 `WHERE right.col IS NULL` / `WHERE left.col IS NULL` 可筛出未匹配行。
 - 限定列写作 `alias.column`；非限定列先精确匹配，再按唯一列名解析，多表同名列必须限定，否则报 `ambiguous column`。
 - 别名/表名在同一 `FROM` 子句内必须唯一；自连接必须给同一张表分配不同别名，否则报 `duplicate table name or alias`。
 - JOIN 使用嵌套循环实现，不引入 hash join 或优化器；`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果，内存随行数乘积增长。
-- 输出列标签去掉限定前缀；`SELECT *` 在多表 join 中遇到同名列会产生重复标签。
+- 输出列标签去掉限定前缀；普通多表 join 遇到同名列会产生重复标签，`USING`/`NATURAL` 的合并列不会重复输出。
 
 - `WHERE` 在 join 之后执行，只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
 - `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
@@ -231,6 +238,6 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 118/118 项通过（112 条 SELECT + 6 条 UPDATE 行数）。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 133/133 项通过（127 条 SELECT + 6 条 UPDATE 行数）。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

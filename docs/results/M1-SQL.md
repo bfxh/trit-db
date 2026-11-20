@@ -1,6 +1,6 @@
 # M1 SQL 3VL：最小纵向切片读数
 
-状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
+状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
 日期：2026-11-20
 
 ## 1. 交付
@@ -23,6 +23,8 @@ docs/specs/SQL.md
 - `CROSS JOIN` / 逗号分隔 `FROM`：左右行笛卡尔积、空表、与显式 JOIN 混用、`WHERE/GROUP BY`
 - `LEFT [OUTER] JOIN`：未匹配左行保留、右侧列补 `NULL`、空右表、LEFT JOIN 后 `WHERE/GROUP BY`
 - `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`：未匹配右行/双侧行保留、另一侧补 `NULL`、空表、`WHERE/GROUP BY`
+- `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN`：公共列自动匹配、合并列只输出一次、双限定名访问、连续链式合并、无公共列退化为 `CROSS JOIN`
+- `JOIN ... USING (col, ...)`：指定列匹配、合并列排序、重复/缺失/类型不一致校验、`LEFT/RIGHT/FULL` 的非 `NULL` 侧合并
 - `UPDATE ... SET column = expr [, ...] [WHERE ...]`：旧行求值、多列赋值、类型/NOT NULL 校验
 - `IN` / `NOT IN`、`BETWEEN` / `NOT BETWEEN`、`LIKE` / `NOT LIKE`：三值逻辑、NULL 传播、ASCII 大小写不敏感
 - `CASE WHEN` 搜索式与 `CASE operand WHEN` 简单式、`ELSE`/缺省 `NULL`、分支短路、聚合/分组内使用
@@ -44,7 +46,7 @@ python tools/crosscheck/sql_oracle.py --tritdb target/debug/tritdb
 本机结果：
 
 ```text
-sql oracle: 118/118 passed (112 SELECT, 6 UPDATE row counts)
+sql oracle: 133/133 passed (127 SELECT, 6 UPDATE row counts)
 ```
 
 对拍口径：
@@ -59,17 +61,17 @@ sql oracle: 118/118 passed (112 SELECT, 6 UPDATE row counts)
 | 层 | 新增 |
 |---|---:|
 | `tritdb-exec` 单元测试 | 12 |
-| `tritdb-sql` 单元测试 | 19 |
-| `tritdb-sql` 引擎集成测试 | 35 |
+| `tritdb-sql` 单元测试 | 21 |
+| `tritdb-sql` 引擎集成测试 | 37 |
 | `tritdb` SQL CLI 集成测试 | 2 |
-| **合计** | **68** |
+| **合计** | **72** |
 
-其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine）。工作区测试从 158 增至 **226 个正常测试 + 4 个 ignored 压力测试**。
+其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4）。工作区测试从 158 增至 **230 个正常测试 + 4 个 ignored 压力测试**。
 
 ## 4. 负结果 / 边界
 
 1. **整表重写**：每次 INSERT/DELETE/UPDATE 都把整张表重新编码成一个 KV value。数据量增大后写放大和内存峰值会先撞墙，M1 不解决。
-2. **JOIN 只做 INNER/CROSS/LEFT/RIGHT/FULL，且是嵌套循环**：不支持 `NATURAL JOIN`、`USING`、子查询；`CROSS JOIN`/逗号 `FROM` 直接产生行数乘积，所有连接都物化临时表，后续再引入 hash join/优化器。`GROUP BY` 只支持列引用，不支持分组表达式、位置序号、GROUPING SETS/CUBE/ROLLUP。SQLite 对拍已覆盖单表表达式、分组聚合、`HAVING`、INNER/CROSS/LEFT/RIGHT/FULL JOIN、逗号 `FROM`、空表、UPDATE、IN/BETWEEN/LIKE 谓词和 CASE。
+2. **JOIN 只做 INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING，且是嵌套循环**：不支持子查询；`CROSS JOIN`/逗号 `FROM` 直接产生行数乘积，所有连接都物化临时表，后续再引入 hash join/优化器。`USING` 只接受不带限定的直接列名，`NATURAL` 只按同名公共列匹配；两者不能与 `ON` 混用，`CROSS JOIN` 不能带 `ON`/`USING`。`GROUP BY` 只支持列引用，不支持分组表达式、位置序号、GROUPING SETS/CUBE/ROLLUP。SQLite 对拍已覆盖单表表达式、分组聚合、`HAVING`、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、逗号 `FROM`、空表、UPDATE、IN/BETWEEN/LIKE 谓词和 CASE。
 3. **没有 pgwire**：`psql` 还连不上；CLI 是当前唯一入口。
 4. **每个语句自动提交**：脚本不是一个大事务；`INSERT` 多行在一个事务内，但 `CREATE`/`INSERT`/`SELECT` 之间不共享事务。
 5. **没有跨进程锁**：两个进程写同一个 SQL WAL 仍是未定义行为，和 M0 一致。
@@ -84,15 +86,15 @@ sql oracle: 118/118 passed (112 SELECT, 6 UPDATE row counts)
 ## 5. CI 与覆盖
 
 - CROSS JOIN/逗号 FROM 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44639115915>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
-- 三平台 `python-crosscheck` 均执行 `sql_oracle.py`，均为 **118/118**（112 SELECT + 6 UPDATE 行数，含 macOS）。
-- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 5766/7646 = 75.41%，RIGHT/FULL JOIN 后 5814/7692 = 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**，65% 门禁仍有余量。
+- NATURAL JOIN/USING 切片：本地 `sql_oracle.py` **133/133**（127 SELECT + 6 UPDATE 行数）；三平台 CI 待推送后补。上一轮 CROSS JOIN CI 的三平台对拍为 118/118。
+- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 5766/7646 = 75.41%，RIGHT/FULL JOIN 后 5814/7692 = 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；NATURAL/USING 切片尚未重跑覆盖率，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
 
-- INNER/CROSS/LEFT/RIGHT/FULL JOIN 已做嵌套循环，CROSS/逗号源直接走行对笛卡尔积。下一步做 `NATURAL JOIN`/`USING`，或引入 hash join；子查询需要新的作用域和计划层，成本更高。
+- INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN 已做嵌套循环，CROSS/逗号源直接走行对笛卡尔积。下一步引入 hash join，或做子查询（需要新的作用域和计划层，成本更高）。
 - `tritdb-plan`：逻辑计划、列裁剪、谓词下推、常量折叠。
 - `tritdb-proto`：pgwire v3 simple query + extended query，先让 `psql` 能连。
 - 表存储从整表重写改成页/行格式，接 `tritdb-page`。
-- SQL 3VL + GROUP BY + JOIN + DML + 谓词 + CASE 套件扩到 `trit-clean` 的完整原始语义用例（当前 112 条 SELECT + 6 条 UPDATE 行数对拍为本仓自定义对拍集）。
+- SQL 3VL + GROUP BY + JOIN + DML + 谓词 + CASE 套件扩到 `trit-clean` 的完整原始语义用例（当前 127 条 SELECT + 6 条 UPDATE 行数对拍为本仓自定义对拍集）。
 - 并发 SQL 压力测试：多连接 SELECT + 单写者 INSERT，测读者 P99。
