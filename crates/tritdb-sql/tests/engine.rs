@@ -1943,7 +1943,8 @@ fn explain_sexpr_reports_structured_plan() {
     assert_eq!(
         plan,
         "(limit :limit 1\n  (sort :keys 1\n    (project (\"v\")\n      \
-         (join hash inner :keys ((\"a.id\" \"b.id\"))\n        \
+         (join hash inner :keys ((\"a.id\" \"b.id\")) \
+         :pred (= (col \"a.id\") (col \"b.id\"))\n        \
          (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
     );
 }
@@ -2002,7 +2003,8 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     assert!(
         plan.contains(
             "(join hash inner :keys ((\"a.id\" \"b.id\")) :residual #t \
-             :actual-rows 2 :time-ms "
+             :pred (and (= (col \"a.id\") (col \"b.id\")) \
+             (<> (col \"b.w\") \"b2x\")) :actual-rows 2 :time-ms "
         ),
         "unexpected plan: {plan}"
     );
@@ -2045,7 +2047,8 @@ fn explain_sexpr_reports_structured_filter_predicate() {
     assert_eq!(
         plan,
         "(project (\"v\")\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
-         (like (col \"b.w\") \"b%\"))\n    (join hash inner :keys ((\"a.id\" \"b.id\"))\n      \
+         (like (col \"b.w\") \"b%\"))\n    (join hash inner :keys ((\"a.id\" \"b.id\")) \
+         :pred (= (col \"a.id\") (col \"b.id\"))\n      \
          (scan \"a\")\n      (scan \"b\"))))"
     );
 }
@@ -2073,7 +2076,7 @@ fn explain_sexpr_reports_structured_join_keys() {
         "EXPLAIN SEXPR SELECT * FROM a LEFT JOIN b USING (id);",
     );
     assert!(
-        using.contains("(join hash left :keys (\"id\")"),
+        using.contains("(join hash left :keys (\"id\") :pred (= (col \"a.id\") (col \"b.id\"))"),
         "unexpected plan: {using}"
     );
     assert!(!using.contains(":details"), "unexpected plan: {using}");
@@ -2083,7 +2086,10 @@ fn explain_sexpr_reports_structured_join_keys() {
         "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id AND b.code <> 0;",
     );
     assert!(
-        residual.contains(":keys ((\"a.id\" \"b.id\")) :residual #t"),
+        residual.contains(
+            ":keys ((\"a.id\" \"b.id\")) :residual #t \
+             :pred (and (= (col \"a.id\") (col \"b.id\")) (<> (col \"b.code\") 0))"
+        ),
         "unexpected plan: {residual}"
     );
     assert!(
@@ -2097,7 +2103,10 @@ fn explain_sexpr_reports_structured_join_keys() {
         "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;",
     );
     assert!(
-        nested.contains("(join nested-loop inner :on-expr #t"),
+        nested.contains(
+            "(join nested-loop inner :on-expr #t \
+             :pred (= (col \"a.id\") (col \"b.id\"))"
+        ),
         "unexpected plan: {nested}"
     );
     assert!(!nested.contains(":details"), "unexpected plan: {nested}");

@@ -180,14 +180,15 @@ EXPLAIN SEXPR SELECT ...;
   - `ON` hash join：`(join hash inner :keys (("a.id" "b.id")) :est-rows 2 child child)`；每个键是 `("左列" "右列")` 二元列表；
   - `USING` / `NATURAL`：`(join hash left :keys ("id" "code") child child)`；键是共享列名列表；
   - `ON` 有等值键之外的谓词时追加 `:residual #t`；强制 nested loop 时显示 `:on-expr #t`；
-  - 没有键、残余或 `on=expr` 时省略对应字段；不再输出 `:details` 字符串列表。
+  - 有绑定谓词时追加 `:pred <PlanExpr>`，表示完整的 `ON` / `USING` / `NATURAL` 连接条件；`ON` hash 的等值键会同时出现在 `:keys` 与 `:pred` 中；
+  - 没有键、残余、`on=expr` 或谓词时省略对应字段；不再输出 `:details` 字符串列表。
 - `filter` 节点形如 `(filter :pred (or (= (col "a.id") 1) (like (col "b.w") "b%")) :est-rows N child)`。谓词是嵌套列表：`(col "name")`、字面量（整数、`"text"`、`#t` / `#f` / `null`）、`(<op> left right)`、`(not expr)`、`(is-null expr)` / `(is-not-null expr)`、`(is-truth expr true|false|unknown)` / `(is-not-truth ...)`、`(in expr (value ...))` / `(not-in ...)`、`(between expr low high)` / `(not-between ...)`、`(like expr pattern)` / `(not-like ...)`、`(case [:operand expr] (when cond then) ... [:else expr])`。运算符使用 `and` / `or` / `=` / `<>` / `<` / `<=` / `>` / `>=` / `+` / `-` / `*` / `/`。
 - 谓词的列索引在绑定后转回 schema 列名；`EXPLAIN` 文本仍不显示谓词，文本格式不变。
-- 算法为 `hash` 或 `nested-loop`；键、残余标志和 `on-expr` 直接来自 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 字段，输出格式见 ADR-019。
+- 算法为 `hash` 或 `nested-loop`；键、残余标志和 `on-expr` 直接来自 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 字段，输出格式见 ADR-019；`:pred` 来自 ADR-022，按左右表拼接 schema 绑定，列索引还原为列名。
 - `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :est-groups N child)`；
   - `(project ("v" "n") :est-rows N child)`、`(sort :keys 1 :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
 - 静态模式只输出估算，不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。`EXPLAIN ANALYZE SEXPR` 在同一个树外增加 `(execution ...)` 汇总，节点改用 actual 字段，见下节。
-- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md) 与 [`ADR-021`](../ADR/021-structured-filter-predicate.md)。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md)、[`ADR-021`](../ADR/021-structured-filter-predicate.md) 与 [`ADR-022`](../ADR/022-structured-join-predicate.md)。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -215,7 +216,7 @@ EXPLAIN ANALYZE SEXPR SELECT ...;
 - 与 `EXPLAIN ANALYZE` 走同一次真实执行、同一套节点统计和同一棵 `PlanNode` 树，但不返回查询结果行，只返回单列 `plan`、单行文本。
 - 顶层增加执行汇总：`(execution :rows N :time-ms X`，其中 `N` 是最终输出行数，`X` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间；汇总字段与文本格式末行 `Execution:` 同源。
 - 节点只输出实际字段：`Scan` 为 `:actual-rows`，`HashJoin` / `NestedLoop` 为 `:actual-rows` 和 `:time-ms`，`Filter` / `Project` / `Sort` 为 `:actual-rows` 和 `:time-ms`，`Aggregate` / `Having` 为 `:actual-groups` 和 `:time-ms`，`Limit` 只有 `:actual-rows`；`Scan` 不单独计时。
-- 不再输出 `:est-rows` / `:est-groups`，避免估算与实际混在同一棵树；join 的 `:keys` / `:residual` / `:on-expr` 仍按 ADR-019 输出。
+- 不再输出 `:est-rows` / `:est-groups`，避免估算与实际混在同一棵树；join 的 `:keys` / `:residual` / `:on-expr` / `:pred` 仍按 ADR-019 / ADR-022 输出。
 - 格式和边界见 [`ADR-020`](../ADR/020-explain-analyze-sexpr.md)。
 
 ### 查询语义

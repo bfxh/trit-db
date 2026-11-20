@@ -1044,7 +1044,7 @@ impl SqlEngine {
                 &left_table,
                 &right_table,
                 predicate.as_ref(),
-            );
+            )?;
             if let Some(stats) = stats {
                 if let (Some(rows), Some(ms)) = (
                     stats.join_rows.get(join_index).copied(),
@@ -2358,7 +2358,7 @@ fn join_plan(
     left: &Table,
     right: &Table,
     predicate: Option<&ExecExpr>,
-) -> JoinPlan {
+) -> Result<JoinPlan, SqlError> {
     let (keys, residual, on_expr) = match &join.condition {
         JoinCondition::Using(names) => {
             let keys = if names.is_empty() {
@@ -2401,14 +2401,26 @@ fn join_plan(
         }
         JoinCondition::None => (None, false, false),
     };
-    JoinPlan {
+    let pair_schema = Schema::new(
+        left.schema
+            .columns
+            .iter()
+            .chain(right.schema.columns.iter())
+            .cloned()
+            .collect(),
+    );
+    let pred = predicate
+        .map(|expr| PlanExpr::from_exec(expr, &pair_schema))
+        .transpose()?;
+    Ok(JoinPlan {
         uses_hash,
         kind: join.kind,
         keys,
         residual,
         on_expr,
+        pred,
         metrics: Metrics::default(),
-    }
+    })
 }
 
 fn join_tables(

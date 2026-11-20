@@ -106,6 +106,8 @@ pub(crate) struct JoinPlan {
     /// `true` when a nested-loop `ON` join shows the whole predicate as
     /// `on=expr`.
     pub(crate) on_expr: bool,
+    /// Complete bound `ON` / `USING` / `NATURAL` predicate, when one exists.
+    pub(crate) pred: Option<PlanExpr>,
     pub(crate) metrics: Metrics,
 }
 
@@ -350,6 +352,10 @@ impl PlanNode {
                 }
                 if join.on_expr {
                     out.push_str(" :on-expr #t");
+                }
+                if let Some(pred) = &join.pred {
+                    out.push_str(" :pred ");
+                    pred.write_sexpr(out);
                 }
                 push_sexpr_metrics(out, &join.metrics, "rows");
                 self.write_sexpr_children(out, indent);
