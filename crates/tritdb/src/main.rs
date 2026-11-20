@@ -83,6 +83,8 @@ fn print_help() {
     println!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
     println!("  cas gc --store dir --root <hex>");
     println!("  manifest verify --store dir --head <hex>");
+    println!("  manifest snapshot --store dir --db sql.db [--parent <hex>]");
+    println!("  manifest restore --store dir --head <hex> --db restored.db");
     println!("  manifest replicate --from src --to dst --head <hex>");
     println!("  manifest show --store dir --hash <hex>");
     println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
@@ -866,6 +868,56 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
                 "head={} manifests={} chunks={} bytes={}",
                 info.head, info.manifests, info.chunks, info.bytes
             );
+            Ok(())
+        }
+        Some("snapshot") => {
+            let root = required_arg(args, "--store")?;
+            let db = required_arg(args, "--db")?;
+            let parent = arg_value(args, "--parent")
+                .map(|text| tritdb_cas::Hash::from_hex(&text))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let txn = tritdb_txn::TxnStore::open(std::path::Path::new(&db))
+                .map_err(|error| error.to_string())?;
+            let entries = txn.iter().map_err(|error| error.to_string())?;
+            let mut manifest_entries = std::collections::BTreeMap::new();
+            for (key, value) in entries {
+                let name =
+                    String::from_utf8(key).map_err(|error| format!("non-utf8 key: {error}"))?;
+                let hash = store.put(&value).map_err(|error| error.to_string())?;
+                manifest_entries.insert(name, hash);
+            }
+            drop(txn);
+            let manifest = tritdb_cas::Manifest::new(parent, manifest_entries);
+            let hash = manifest.store(&store).map_err(|error| error.to_string())?;
+            println!(
+                "manifest={hash} parent={} entries={}",
+                parent.map_or("-".to_string(), |hash| hash.to_hex()),
+                manifest.entries.len()
+            );
+            Ok(())
+        }
+        Some("restore") => {
+            let root = required_arg(args, "--store")?;
+            let db = required_arg(args, "--db")?;
+            let head = required_arg(args, "--head")?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
+            let manifest =
+                tritdb_cas::Manifest::load(&store, &head).map_err(|error| error.to_string())?;
+            let txn_store = tritdb_txn::TxnStore::open(std::path::Path::new(&db))
+                .map_err(|error| error.to_string())?;
+            let mut txn = txn_store.begin().map_err(|error| error.to_string())?;
+            for (name, hash) in &manifest.entries {
+                let value = store.get(hash).map_err(|error| error.to_string())?;
+                txn.put(name.as_bytes(), &value)
+                    .map_err(|error| error.to_string())?;
+            }
+            txn.commit().map_err(|error| error.to_string())?;
+            println!("restored={} db={db}", manifest.entries.len());
             Ok(())
         }
         Some(other) => Err(format!("unknown manifest subcommand: {other}")),

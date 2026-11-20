@@ -167,3 +167,66 @@ fn cas_gc_removes_orphans_and_replicate_copies_the_chain() {
     ]);
     assert!(output.status.success(), "stderr: {:?}", output);
 }
+
+#[test]
+fn manifest_snapshot_and_restore_roundtrip() {
+    let dir = TempDir::new("cas-snapshot");
+    let db = dir.join("sql.db");
+    let db_text = db.to_str().expect("db path");
+    let store = dir.join("cas");
+    let store_text = store.to_str().expect("store path");
+
+    let output = run([
+        "sql",
+        "--db",
+        db_text,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, name TEXT);          INSERT INTO t VALUES (1,'a'),(2,'b');",
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+
+    let output = run([
+        "manifest", "snapshot", "--store", store_text, "--db", db_text,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let head = field(&stdout(&output), "manifest").to_string();
+
+    // A second snapshot links to the first.
+    let output = run([
+        "manifest", "snapshot", "--store", store_text, "--db", db_text, "--parent", &head,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let head2 = field(&stdout(&output), "manifest").to_string();
+    let output = run([
+        "manifest", "verify", "--store", store_text, "--head", &head2,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    assert!(stdout(&output).contains("length=2"));
+
+    std::fs::remove_file(&db).expect("remove original db");
+    let restored = dir.join("restored.db");
+    let restored_text = restored.to_str().expect("restored path");
+    let output = run([
+        "manifest",
+        "restore",
+        "--store",
+        store_text,
+        "--head",
+        &head,
+        "--db",
+        restored_text,
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+
+    let output = run([
+        "sql",
+        "--db",
+        restored_text,
+        "--sql",
+        "SELECT id, name FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("1	a"), "out: {text}");
+    assert!(text.contains("2	b"), "out: {text}");
+}

@@ -42,4 +42,4 @@ cargo test -p tritdb --test cas_cli  # 2 passed
 - chunk GC 已提供（`ChunkStore::gc` / `cas gc`，按 manifest 链回收无引用 chunk）；
 - manifest 签名与外部链头锚点；
 - 只读副本已提供最小闭环（`replicate` / `manifest replicate`，复制后重新 `verify_chain`）；部分拉取、增量同步仍未做；
-- 把 SQL 表快照写进 manifest（当前只存任意字节）。
+- SQL 快照/恢复已提供：`manifest snapshot --db` 把 `TxnStore` 的 key/value 写成 manifest，`manifest restore --db` 重建。
