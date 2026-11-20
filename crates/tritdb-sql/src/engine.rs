@@ -16,7 +16,7 @@ use crate::ast::{
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
-use crate::plan::{JoinKey, JoinKeys, JoinPlan, Metrics, PlanKind, PlanNode};
+use crate::plan::{JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode};
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
     decode_stats, decode_table, encode_stats, encode_table, stats_key, table_key, STATS_KEY_PREFIX,
@@ -1084,7 +1084,7 @@ impl SqlEngine {
 
         let filtered_select = select_with_filter(select, pushdown.residual.clone());
         let bound = bind_select(&filtered_select, &left_table)?;
-        if bound.filter.is_some() {
+        if let Some(filter) = &bound.filter {
             let metrics = if let Some(stats) = stats {
                 Metrics {
                     actual: Some(stats.filter_rows as u64),
@@ -1100,7 +1100,8 @@ impl SqlEngine {
             } else {
                 Metrics::default()
             };
-            plan = PlanNode::unary(PlanKind::Filter(metrics), plan);
+            let pred = PlanExpr::from_exec(filter, &left_table.schema)?;
+            plan = PlanNode::unary(PlanKind::Filter { pred, metrics }, plan);
         }
         if bound.is_grouped() {
             let metrics = if let Some(stats) = stats {

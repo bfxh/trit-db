@@ -22,7 +22,7 @@ Lisp 的可借之处不是括号或运行时，而是同像性（homoiconicity�
 2. `build_plan` 从返回 `String` 改为返回 `PlanNode`；`PlanNode::to_text()` 负责历史文本格式。现有 `EXPLAIN` 文本必须逐字保持不变，由既有的整段 `assert_eq!` 计划测试守护。
 3. `PlanNode::to_sexpr()` 输出只读的括号化计划树；新增 `EXPLAIN SEXPR SELECT ...`，返回一列 `plan`、一行文本值。它不是 Lisp 解释器，也不接受用户自定义表达式或函数。
 4. `EXPLAIN SEXPR` 只做静态计划；本 ADR 当时不支持 `EXPLAIN ANALYZE SEXPR`，由 parser 明确拒绝。该限制已由 ADR-020 撤销：`EXPLAIN SEXPR` 仍只输出估算（`:est-rows` / `:est-groups`），`EXPLAIN ANALYZE SEXPR` 走真实执行并只输出 actual 字段和 `(execution ...)` 汇总；`EXPLAIN ANALYZE` 文本路径不变。
-5. S-expression 的字段是稳定的最小集合：节点名、扫描标签/是否下推过滤/估算行数/裁剪列、join 算法/连接类型/键或残余谓词、投影列、排序键数、limit 值。join 的 `details` 当时保留为已渲染的键/残余片段，避免把当前 join 条件分析复制成第二套逻辑；ADR-018 已把该字段替换为结构化 `JoinKeys` / `residual` / `on_expr`，文本保持不变；ADR-019 随后把 S-expression 的 join 输出升级为 `:keys` / `:residual` / `:on-expr`。
+5. S-expression 的字段是稳定的最小集合：节点名、扫描标签/是否下推过滤/估算行数/裁剪列、join 算法/连接类型/键或残余谓词、投影列、排序键数、limit 值。join 的 `details` 当时保留为已渲染的键/残余片段，避免把当前 join 条件分析复制成第二套逻辑；ADR-018 已把该字段替换为结构化 `JoinKeys` / `residual` / `on_expr`，文本保持不变；ADR-019 随后把 S-expression 的 join 输出升级为 `:keys` / `:residual` / `:on-expr`；ADR-021 又把 `Filter` 的绑定谓词转成 `:pred` 的 `PlanExpr`。
 6. 明确不做：完整逻辑/物理计划分层、规则注册表、代价搜索、join 重排、表达式级列下推、Lisp/Scheme 方言、运行时宏展开、通用 `eval`、把 SQL parser 改成 s-expression reader。
 7. `EXPLAIN SEXPR` 不改变执行路径、统计、错误语义、结果行集或列标签；它只在 `EXPLAIN` 的输出格式分支上生效。
 

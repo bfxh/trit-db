@@ -7,6 +7,8 @@
 //! intended for debugging and future rule matching.
 
 use crate::ast::JoinKind;
+use crate::error::SqlError;
+use tritdb_exec::{BinaryOp, Expr as ExecExpr, Schema, TruthValue, Value};
 
 /// A plan node with zero, one, or two children.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,7 +28,10 @@ pub(crate) enum PlanKind {
         columns: Option<Vec<String>>,
     },
     Join(JoinPlan),
-    Filter(Metrics),
+    Filter {
+        pred: PlanExpr,
+        metrics: Metrics,
+    },
     Aggregate(Metrics),
     Having(Metrics),
     Project {
@@ -41,6 +46,51 @@ pub(crate) enum PlanKind {
         limit: usize,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
+    },
+}
+
+/// A bound predicate rendered as data. Column indexes from the executor
+/// expression are resolved back to schema names so the plan remains readable
+/// without the binder context.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PlanExpr {
+    Literal(Value),
+    Column(String),
+    IsNull {
+        expr: Box<PlanExpr>,
+        negated: bool,
+    },
+    IsTruth {
+        expr: Box<PlanExpr>,
+        expected: TruthValue,
+        negated: bool,
+    },
+    Not(Box<PlanExpr>),
+    InList {
+        expr: Box<PlanExpr>,
+        values: Vec<PlanExpr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<PlanExpr>,
+        low: Box<PlanExpr>,
+        high: Box<PlanExpr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<PlanExpr>,
+        pattern: Box<PlanExpr>,
+        negated: bool,
+    },
+    Case {
+        operand: Option<Box<PlanExpr>>,
+        branches: Vec<(PlanExpr, PlanExpr)>,
+        else_expr: Option<Box<PlanExpr>>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<PlanExpr>,
+        right: Box<PlanExpr>,
     },
 }
 
@@ -207,7 +257,7 @@ impl PlanNode {
                 push_metrics(&mut text, &join.metrics, "rows");
                 text
             }
-            PlanKind::Filter(metrics) => {
+            PlanKind::Filter { metrics, .. } => {
                 let mut text = "Filter".to_string();
                 push_metrics(&mut text, metrics, "rows");
                 text
@@ -305,8 +355,9 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Filter(metrics) => {
-                out.push_str("(filter");
+            PlanKind::Filter { pred, metrics } => {
+                out.push_str("(filter :pred ");
+                pred.write_sexpr(out);
                 push_sexpr_metrics(out, metrics, "rows");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
@@ -365,6 +416,210 @@ impl PlanNode {
     }
 }
 
+impl PlanExpr {
+    pub(crate) fn from_exec(expr: &ExecExpr, schema: &Schema) -> Result<Self, SqlError> {
+        match expr {
+            ExecExpr::Literal(value) => Ok(Self::Literal(value.clone())),
+            ExecExpr::Column(index) => schema
+                .columns
+                .get(*index)
+                .map(|column| Self::Column(column.name.clone()))
+                .ok_or_else(|| SqlError::UnknownColumn(format!("column index {index}"))),
+            ExecExpr::IsNull { expr, negated } => Ok(Self::IsNull {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                negated: *negated,
+            }),
+            ExecExpr::IsTruth {
+                expr,
+                expected,
+                negated,
+            } => Ok(Self::IsTruth {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                expected: *expected,
+                negated: *negated,
+            }),
+            ExecExpr::Not(expr) => Ok(Self::Not(Box::new(Self::from_exec(expr, schema)?))),
+            ExecExpr::InList {
+                expr,
+                values,
+                negated,
+            } => Ok(Self::InList {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                values: values
+                    .iter()
+                    .map(|value| Self::from_exec(value, schema))
+                    .collect::<Result<Vec<_>, _>>()?,
+                negated: *negated,
+            }),
+            ExecExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(Self::Between {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                low: Box::new(Self::from_exec(low, schema)?),
+                high: Box::new(Self::from_exec(high, schema)?),
+                negated: *negated,
+            }),
+            ExecExpr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(Self::Like {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                pattern: Box::new(Self::from_exec(pattern, schema)?),
+                negated: *negated,
+            }),
+            ExecExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => Ok(Self::Case {
+                operand: operand
+                    .as_deref()
+                    .map(|expr| Self::from_exec(expr, schema))
+                    .transpose()?
+                    .map(Box::new),
+                branches: branches
+                    .iter()
+                    .map(|(when, then)| {
+                        Ok((
+                            Self::from_exec(when, schema)?,
+                            Self::from_exec(then, schema)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, SqlError>>()?,
+                else_expr: else_expr
+                    .as_deref()
+                    .map(|expr| Self::from_exec(expr, schema))
+                    .transpose()?
+                    .map(Box::new),
+            }),
+            ExecExpr::Binary { op, left, right } => Ok(Self::Binary {
+                op: *op,
+                left: Box::new(Self::from_exec(left, schema)?),
+                right: Box::new(Self::from_exec(right, schema)?),
+            }),
+        }
+    }
+
+    fn write_sexpr(&self, out: &mut String) {
+        match self {
+            Self::Literal(value) => push_plan_value(out, value),
+            Self::Column(name) => {
+                out.push_str("(col ");
+                push_string(out, name);
+                out.push(')');
+            }
+            Self::IsNull { expr, negated } => {
+                out.push('(');
+                out.push_str(if *negated { "is-not-null" } else { "is-null" });
+                out.push(' ');
+                expr.write_sexpr(out);
+                out.push(')');
+            }
+            Self::IsTruth {
+                expr,
+                expected,
+                negated,
+            } => {
+                out.push('(');
+                out.push_str(if *negated { "is-not-truth" } else { "is-truth" });
+                out.push(' ');
+                expr.write_sexpr(out);
+                out.push(' ');
+                out.push_str(truth_name(*expected));
+                out.push(')');
+            }
+            Self::Not(expr) => {
+                out.push_str("(not ");
+                expr.write_sexpr(out);
+                out.push(')');
+            }
+            Self::InList {
+                expr,
+                values,
+                negated,
+            } => {
+                out.push('(');
+                out.push_str(if *negated { "not-in" } else { "in" });
+                out.push(' ');
+                expr.write_sexpr(out);
+                out.push_str(" (");
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(' ');
+                    }
+                    value.write_sexpr(out);
+                }
+                out.push_str("))");
+            }
+            Self::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                out.push('(');
+                out.push_str(if *negated { "not-between" } else { "between" });
+                out.push(' ');
+                expr.write_sexpr(out);
+                out.push(' ');
+                low.write_sexpr(out);
+                out.push(' ');
+                high.write_sexpr(out);
+                out.push(')');
+            }
+            Self::Like {
+                expr,
+                pattern,
+                negated,
+            } => {
+                out.push('(');
+                out.push_str(if *negated { "not-like" } else { "like" });
+                out.push(' ');
+                expr.write_sexpr(out);
+                out.push(' ');
+                pattern.write_sexpr(out);
+                out.push(')');
+            }
+            Self::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                out.push_str("(case");
+                if let Some(operand) = operand {
+                    out.push_str(" :operand ");
+                    operand.write_sexpr(out);
+                }
+                for (when, then) in branches {
+                    out.push_str(" (when ");
+                    when.write_sexpr(out);
+                    out.push(' ');
+                    then.write_sexpr(out);
+                    out.push(')');
+                }
+                if let Some(else_expr) = else_expr {
+                    out.push_str(" :else ");
+                    else_expr.write_sexpr(out);
+                }
+                out.push(')');
+            }
+            Self::Binary { op, left, right } => {
+                out.push('(');
+                out.push_str(binary_name(*op));
+                out.push(' ');
+                left.write_sexpr(out);
+                out.push(' ');
+                right.write_sexpr(out);
+                out.push(')');
+            }
+        }
+    }
+}
+
 impl JoinPlan {
     /// Reconstruct the exact fragments historically appended to a join label.
     fn detail_fragments(&self) -> Vec<String> {
@@ -412,6 +667,41 @@ fn push_sexpr_metrics(out: &mut String, metrics: &Metrics, unit: &str) {
         }
     } else if let Some(est) = metrics.est {
         out.push_str(&format!(" :est-{unit} {est}"));
+    }
+}
+
+fn push_plan_value(out: &mut String, value: &Value) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Int(value) => out.push_str(&value.to_string()),
+        Value::Text(value) => push_string(out, value),
+        Value::Bool(true) => out.push_str("#t"),
+        Value::Bool(false) => out.push_str("#f"),
+    }
+}
+
+fn truth_name(value: TruthValue) -> &'static str {
+    match value {
+        TruthValue::True => "true",
+        TruthValue::False => "false",
+        TruthValue::Unknown => "unknown",
+    }
+}
+
+fn binary_name(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::And => "and",
+        BinaryOp::Or => "or",
+        BinaryOp::Eq => "=",
+        BinaryOp::Ne => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::Le => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Ge => ">=",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
     }
 }
 

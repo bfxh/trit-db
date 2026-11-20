@@ -1993,7 +1993,10 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
         "unexpected plan: {plan}"
     );
     assert!(
-        plan.contains("(filter :actual-rows 2 :time-ms "),
+        plan.contains(
+            "(filter :pred (or (>= (col \"a.id\") 1) (<> (col \"b.w\") \"b2x\")) \
+             :actual-rows 2 :time-ms "
+        ),
         "unexpected plan: {plan}"
     );
     assert!(
@@ -2013,6 +2016,38 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     );
     assert!(!plan.contains(":est-rows"), "unexpected plan: {plan}");
     assert!(!plan.contains("Execution:"), "unexpected plan: {plan}");
+}
+
+#[test]
+fn explain_sexpr_reports_structured_filter_predicate() {
+    let dir = TempDir::new("sql-explain-sexpr-predicate");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'skip'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'skip'), (4, 'b4');",
+        )
+        .expect("seed");
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' OR b.w LIKE 'b%';",
+        )
+        .expect("explain sexpr predicate");
+    let (_, rows) = as_rows(&explained[0]);
+    let plan = match &rows[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        "(project (\"v\")\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
+         (like (col \"b.w\") \"b%\"))\n    (join hash inner :keys ((\"a.id\" \"b.id\"))\n      \
+         (scan \"a\")\n      (scan \"b\"))))"
+    );
 }
 
 #[test]

@@ -31,7 +31,7 @@ ADR-018 把 `JoinPlan` 从渲染好的 `details: Vec<String>` 改成 `JoinKeys`�
 - 正结果：`:residual` / `:on-expr` 从字符串片段变成布尔字段，规则和脚本可以直接分支。
 - 正结果：文本计划完全不变，既有 `EXPLAIN` 整段断言继续有效。
 - 负结果：`EXPLAIN SEXPR` 的 join 输出格式发生了一次有意变更；上一版按 `:details` 解析的消费者需要切换到 `:keys` / `:residual` / `:on-expr`。该格式只在此前两个提交内存在，没有外部兼容承诺。
-- 负结果：`:residual #t` 仍只是“有残余谓词”的标志，不携带残余表达式；要重写谓词，后续仍需把绑定后的 `ExecExpr` 纳入计划或建立单独的谓词表示。
+- 负结果：`:residual #t` 仍只是“有残余谓词”的标志，不携带残余表达式；要重写谓词，后续仍需把绑定后的 `ExecExpr` 纳入计划或建立单独的谓词表示。ADR-021 已把 `Filter` 的残余 `WHERE` 谓词转成 `:pred` 的 `PlanExpr`，但 join 自身的 `residual` / `on-expr` 仍只有布尔标志。
 - 负结果：`:keys` 的 `Names` 形态只保存共享列名，不保存右侧列对象；需要右侧 schema 的规则仍要从计划节点或绑定上下文取。
 
 ## 被否掉的替代
