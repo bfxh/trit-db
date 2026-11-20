@@ -86,6 +86,8 @@ fn print_help() {
     println!("  manifest verify --store dir --head <hex>");
     println!("  manifest snapshot --store dir --db sql.db [--parent <hex>]");
     println!("  manifest restore --store dir --head <hex> --db restored.db");
+    println!("  manifest snapshot-pages --store dir --data file.pages [--parent <hex>]");
+    println!("  manifest restore-pages --store dir --head <hex> --out file.pages");
     println!("  manifest replicate --from src --to dst --head <hex> [--entry name]");
     println!("  manifest show --store dir --hash <hex>");
     println!("  anchor write --out anchor.bin --head <hex> [--key-file secret]");
@@ -878,6 +880,8 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("snapshot-pages") => manifest_snapshot_pages(args),
+        Some("restore-pages") => manifest_restore_pages(args),
         Some("snapshot") => {
             let root = required_arg(args, "--store")?;
             let db = required_arg(args, "--db")?;
@@ -930,10 +934,136 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
         }
         Some(other) => Err(format!("unknown manifest subcommand: {other}")),
         None => Err(
-            "manifest requires `commit`, `verify`, `show`, `replicate`, `snapshot`, or `restore`"
+            "manifest requires `commit`, `verify`, `show`, `replicate`, `snapshot`, `restore`, \
+             `snapshot-pages`, or `restore-pages`"
                 .to_string(),
         ),
     }
+}
+
+const PAGE_SNAPSHOT_LAYOUT: &[u8; 4] = b"TRPF";
+const PAGE_SNAPSHOT_VERSION: u8 = 1;
+const PAGE_SNAPSHOT_LAYOUT_LEN: usize = 18;
+
+/// Splits the page file into one CAS chunk per 8 KiB page.
+///
+/// The manifest carries a `layout` entry (`TRPF`, version, page size, page
+/// count) plus one `page/<index>` entry per page, so a restore can reject a
+/// manifest that was built for a different page size.
+fn manifest_snapshot_pages(args: &[String]) -> Result<(), String> {
+    let root = required_arg(args, "--store")?;
+    let data = required_arg(args, "--data")?;
+    let parent = arg_value(args, "--parent")
+        .map(|text| tritdb_cas::Hash::from_hex(&text))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let bytes = std::fs::read(&data).map_err(|error| format!("read {data}: {error}"))?;
+    if bytes.len() % PAGE_SIZE != 0 {
+        return Err(format!(
+            "page file {data} is {} bytes, not a multiple of {PAGE_SIZE}",
+            bytes.len()
+        ));
+    }
+    let page_count = bytes.len() / PAGE_SIZE;
+
+    let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+        .map_err(|error| error.to_string())?;
+    let mut entries = std::collections::BTreeMap::new();
+    for index in 0..page_count {
+        let start = index * PAGE_SIZE;
+        let hash = store
+            .put(&bytes[start..start + PAGE_SIZE])
+            .map_err(|error| error.to_string())?;
+        entries.insert(format!("page/{index:016x}"), hash);
+    }
+
+    let mut layout = Vec::with_capacity(PAGE_SNAPSHOT_LAYOUT_LEN);
+    layout.extend_from_slice(PAGE_SNAPSHOT_LAYOUT);
+    layout.push(PAGE_SNAPSHOT_VERSION);
+    layout.push(0);
+    layout.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    layout.extend_from_slice(&(page_count as u64).to_le_bytes());
+    let layout_hash = store.put(&layout).map_err(|error| error.to_string())?;
+    entries.insert("layout".to_string(), layout_hash);
+
+    let manifest = tritdb_cas::Manifest::new(parent, entries);
+    let hash = manifest.store(&store).map_err(|error| error.to_string())?;
+    println!(
+        "manifest={hash} parent={} pages={page_count} bytes={}",
+        parent.map_or("-".to_string(), |hash| hash.to_hex()),
+        bytes.len()
+    );
+    Ok(())
+}
+
+/// Rebuilds a page file from a snapshot produced by `manifest snapshot-pages`.
+fn manifest_restore_pages(args: &[String]) -> Result<(), String> {
+    let root = required_arg(args, "--store")?;
+    let head = required_arg(args, "--head")?;
+    let out = required_arg(args, "--out")?;
+    let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+        .map_err(|error| error.to_string())?;
+    let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
+    let manifest = tritdb_cas::Manifest::load(&store, &head).map_err(|error| error.to_string())?;
+
+    let layout_hash = manifest
+        .entries
+        .get("layout")
+        .ok_or_else(|| format!("manifest {head} has no `layout` entry"))?;
+    let layout = store.get(layout_hash).map_err(|error| error.to_string())?;
+    if layout.len() != PAGE_SNAPSHOT_LAYOUT_LEN || &layout[0..4] != PAGE_SNAPSHOT_LAYOUT {
+        return Err(format!("manifest {head} has a malformed page layout"));
+    }
+    if layout[4] != PAGE_SNAPSHOT_VERSION {
+        return Err(format!("unsupported page layout version {}", layout[4]));
+    }
+    let page_size = u32::from_le_bytes([layout[6], layout[7], layout[8], layout[9]]) as usize;
+    if page_size != PAGE_SIZE {
+        return Err(format!(
+            "page snapshot uses {page_size} byte pages, this build uses {PAGE_SIZE}"
+        ));
+    }
+    let page_count = u64::from_le_bytes([
+        layout[10], layout[11], layout[12], layout[13], layout[14], layout[15], layout[16],
+        layout[17],
+    ]);
+    let expected_entries = usize::try_from(page_count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| "page count overflows this platform".to_string())?;
+    if manifest.entries.len() != expected_entries {
+        return Err(format!(
+            "manifest {head} lists {} entries, expected {expected_entries}",
+            manifest.entries.len()
+        ));
+    }
+
+    let capacity = usize::try_from(page_count)
+        .ok()
+        .and_then(|count| count.checked_mul(page_size))
+        .ok_or_else(|| "page file size overflows this platform".to_string())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    for index in 0..page_count {
+        let name = format!("page/{index:016x}");
+        let hash = manifest
+            .entries
+            .get(&name)
+            .ok_or_else(|| format!("manifest {head} is missing {name}"))?;
+        let page = store.get(hash).map_err(|error| error.to_string())?;
+        if page.len() != page_size {
+            return Err(format!(
+                "{name} is {} bytes, expected {page_size}",
+                page.len()
+            ));
+        }
+        bytes.extend_from_slice(&page);
+    }
+
+    let tmp = format!("{out}.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|error| format!("write {tmp}: {error}"))?;
+    std::fs::rename(&tmp, &out).map_err(|error| format!("rename {tmp} -> {out}: {error}"))?;
+    println!("pages={page_count} bytes={} out={out}", bytes.len());
+    Ok(())
 }
 
 fn run_anchor(args: &[String]) -> Result<(), String> {
