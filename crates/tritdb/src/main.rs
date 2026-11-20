@@ -15,6 +15,7 @@ use std::process::exit;
 use std::thread;
 use std::time::Duration;
 
+use tritdb_exec::TruthValue;
 use tritdb_format::Block;
 use tritdb_page::{Page, PageKind, PAGE_SIZE};
 use tritdb_radix::{pack, unpack, Radix, Trit};
@@ -42,6 +43,7 @@ fn run() -> Result<(), String> {
         Some("sql") => run_sql(&args),
         Some("models") => run_models(&args),
         Some("repair") => run_repair(&args),
+        Some("graph") => run_graph(&args),
         Some("cas") => run_cas(&args),
         Some("manifest") => run_manifest(&args),
         Some("anchor") => run_anchor(&args),
@@ -79,6 +81,11 @@ fn print_help() {
     println!("  sql --db sql.db --file script.sql");
     println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
     println!("  repair --facts 2 --denial 0,1 --query 0");
+    println!(
+        "  graph reach --nodes 4 --edges 0-1,1-2 [--label 1-2=U] --from 0 --to 2 [--max-hops 4]"
+    );
+    println!("  graph neighbors --nodes 4 --edges 0-1,1-2 --node 0 [--hops 1]");
+    println!("  graph knn --points \"1,2;3,4\" [--labels T,U] --query \"1,2\" [--k 3]");
     println!("  cas put --store dir --file blob");
     println!("  cas get --store dir --hash <hex> --out blob");
     println!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
@@ -1127,6 +1134,225 @@ fn run_anchor(args: &[String]) -> Result<(), String> {
         Some(other) => Err(format!("unknown anchor subcommand: {other}")),
         None => Err("anchor requires `write` or `verify`".to_string()),
     }
+}
+
+fn run_graph(args: &[String]) -> Result<(), String> {
+    match args.get(1).map(String::as_str) {
+        Some("reach") => graph_reach(args),
+        Some("neighbors") => graph_neighbors(args),
+        Some("knn") => graph_knn(args),
+        Some(other) => Err(format!("unknown graph subcommand: {other}")),
+        None => Err("graph requires `reach`, `neighbors`, or `knn`".to_string()),
+    }
+}
+
+fn parse_edges(text: &str) -> Result<Vec<(u32, u32)>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    text.split(',')
+        .map(|part| {
+            let (from, to) = part
+                .split_once('-')
+                .ok_or_else(|| format!("edge must be from-to, got {part}"))?;
+            let from = from
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("invalid node: {from}"))?;
+            let to = to
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("invalid node: {to}"))?;
+            Ok((from, to))
+        })
+        .collect()
+}
+
+fn parse_truth(text: &str) -> Result<TruthValue, String> {
+    match text.trim().to_ascii_uppercase().as_str() {
+        "T" | "TRUE" => Ok(TruthValue::True),
+        "U" | "UNKNOWN" | "NULL" => Ok(TruthValue::Unknown),
+        "F" | "FALSE" => Ok(TruthValue::False),
+        other => Err(format!("invalid truth value: {other} (use T, U, or F)")),
+    }
+}
+
+fn parse_truth_list(text: Option<&str>) -> Result<Vec<TruthValue>, String> {
+    match text {
+        Some(text) if !text.trim().is_empty() => text.split(',').map(parse_truth).collect(),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_vector(text: &str) -> Result<Vec<i64>, String> {
+    text.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<i64>()
+                .map_err(|_| format!("invalid coordinate: {part}"))
+        })
+        .collect()
+}
+
+fn parse_points(text: &str) -> Result<Vec<Vec<i64>>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    text.split(';').map(parse_vector).collect()
+}
+
+fn graph_edges(args: &[String]) -> Result<Vec<(u32, u32, TruthValue)>, String> {
+    let edges = parse_edges(&required_arg(args, "--edges")?)?;
+    let mut labels = std::collections::BTreeMap::new();
+    for spec in arg_values(args, "--label") {
+        let (pair, value) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--label must be from-to=T|U|F, got {spec}"))?;
+        let (from, to) = pair
+            .split_once('-')
+            .ok_or_else(|| format!("--label must be from-to=T|U|F, got {spec}"))?;
+        let from = from
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid node: {from}"))?;
+        let to = to
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid node: {to}"))?;
+        labels.insert((from, to), parse_truth(value)?);
+    }
+    Ok(edges
+        .into_iter()
+        .map(|(from, to)| {
+            (
+                from,
+                to,
+                labels.get(&(from, to)).copied().unwrap_or(TruthValue::True),
+            )
+        })
+        .collect())
+}
+
+fn graph_node_count(args: &[String], edges: &[(u32, u32, TruthValue)]) -> Result<usize, String> {
+    let declared = arg_usize(args, "--nodes", 0);
+    if declared > 0 {
+        return Ok(declared);
+    }
+    match edges.iter().map(|&(from, to, _)| from.max(to)).max() {
+        Some(max) => Ok(max as usize + 1),
+        None => Err("pass --nodes or --edges".to_string()),
+    }
+}
+
+fn build_graph(args: &[String]) -> Result<tritdb_exec::graph::AnnotatedGraph, String> {
+    let edges = graph_edges(args)?;
+    let nodes = graph_node_count(args, &edges)?;
+    tritdb_exec::graph::AnnotatedGraph::from_edges(nodes, &edges).map_err(|error| error.to_string())
+}
+
+fn graph_reach(args: &[String]) -> Result<(), String> {
+    let graph = build_graph(args)?;
+    let from = required_arg(args, "--from")?
+        .parse::<u32>()
+        .map_err(|_| "invalid --from".to_string())?;
+    let to = required_arg(args, "--to")?
+        .parse::<u32>()
+        .map_err(|_| "invalid --to".to_string())?;
+    let max_hops = arg_usize(args, "--max-hops", graph.node_count());
+    let reach = graph
+        .reach(from, to, max_hops)
+        .map_err(|error| error.to_string())?;
+    let answer = match reach.answer {
+        tritdb_exec::ann::RepairAnswer::Certain => "certain",
+        tritdb_exec::ann::RepairAnswer::Contingent => "contingent",
+        tritdb_exec::ann::RepairAnswer::Impossible => "impossible",
+    };
+    let hops = reach.hops.map_or("-".to_string(), |hops| hops.to_string());
+    let path = if reach.path.is_empty() {
+        "-".to_string()
+    } else {
+        reach
+            .path
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    println!(
+        "nodes={} edges={} from={from} to={to} max_hops={max_hops} answer={answer} hops={hops} path={path}",
+        graph.node_count(),
+        graph.edge_count()
+    );
+    Ok(())
+}
+
+fn graph_neighbors(args: &[String]) -> Result<(), String> {
+    let graph = build_graph(args)?;
+    let node = required_arg(args, "--node")?
+        .parse::<u32>()
+        .map_err(|_| "invalid --node".to_string())?;
+    let hops = arg_usize(args, "--hops", 1);
+    let reached = graph
+        .reachable_within(node, hops)
+        .map_err(|error| error.to_string())?;
+    let list = if reached.is_empty() {
+        "-".to_string()
+    } else {
+        reached
+            .iter()
+            .map(|(node, _)| node.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    println!(
+        "node={node} hops={hops} count={} nodes={list}",
+        reached.len()
+    );
+    Ok(())
+}
+
+fn graph_knn(args: &[String]) -> Result<(), String> {
+    let vectors = parse_points(&required_arg(args, "--points")?)?;
+    let labels = parse_truth_list(arg_value(args, "--labels").as_deref())?;
+    if !labels.is_empty() && labels.len() != vectors.len() {
+        return Err(format!(
+            "--labels has {} values for {} points",
+            labels.len(),
+            vectors.len()
+        ));
+    }
+    let query = parse_vector(&required_arg(args, "--query")?)?;
+    let k = arg_usize(args, "--k", 3);
+    let points: Vec<tritdb_exec::graph::Point> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(id, vector)| tritdb_exec::graph::Point {
+            id: id as u32,
+            vector,
+            label: labels.get(id).copied().unwrap_or(TruthValue::True),
+        })
+        .collect();
+    let answer =
+        tritdb_exec::graph::annotated_knn(&points, &query, k).map_err(|error| error.to_string())?;
+    for (name, bucket) in [
+        ("TRUE", &answer.certain),
+        ("UNKNOWN", &answer.uncertain),
+        ("FALSE", &answer.excluded),
+    ] {
+        for (rank, neighbor) in bucket.iter().enumerate() {
+            println!(
+                "label={name} rank={rank} id={} distance={}",
+                neighbor.id, neighbor.distance
+            );
+        }
+    }
+    println!(
+        "certain={} uncertain={} excluded={}",
+        answer.certain.len(),
+        answer.uncertain.len(),
+        answer.excluded.len()
+    );
+    Ok(())
 }
 
 fn run_models(args: &[String]) -> Result<(), String> {
