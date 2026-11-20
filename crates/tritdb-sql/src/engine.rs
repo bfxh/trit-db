@@ -17,7 +17,8 @@ use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr}
 use crate::error::SqlError;
 use crate::parser::parse_script;
 use crate::plan::{
-    AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode,
+    AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode, SortKey,
+    SortPlan,
 };
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
@@ -1207,13 +1208,14 @@ impl SqlEngine {
             } else {
                 Metrics::default()
             };
-            plan = PlanNode::unary(
-                PlanKind::Sort {
-                    keys: bound.order_by.len(),
-                    metrics,
-                },
-                plan,
-            );
+            let mut keys = Vec::with_capacity(bound.order_by.len());
+            for order in &bound.order_by {
+                keys.push(SortKey {
+                    expr: PlanExpr::from_group_expr(&order.expr, &left_table.schema)?,
+                    ascending: order.ascending,
+                });
+            }
+            plan = PlanNode::unary(PlanKind::Sort(SortPlan { keys, metrics }), plan);
         }
         if let Some(limit) = bound.limit {
             let actual_rows = stats.map(|stats| stats.output_rows as u64);

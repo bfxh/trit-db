@@ -1942,7 +1942,7 @@ fn explain_sexpr_reports_structured_plan() {
     };
     assert_eq!(
         plan,
-        "(limit :limit 1\n  (sort :keys 1\n    (project (\"v\")\n      \
+        "(limit :limit 1\n  (sort :keys ((asc (col \"a.v\")))\n    (project (\"v\")\n      \
          (join hash inner :keys ((\"a.id\" \"b.id\")) \
          :pred (= (col \"a.id\") (col \"b.id\"))\n        \
          (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
@@ -2014,6 +2014,33 @@ fn explain_sexpr_reports_structured_plan() {
         grouped_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ()"),
         "unexpected plan: {grouped_plan}"
     );
+
+    let sorted = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v, SUM(a.id) FROM a GROUP BY a.v \
+             ORDER BY SUM(a.id) DESC, a.v ASC;",
+        )
+        .expect("explain sexpr sorted");
+    let sorted_plan = match &as_rows(&sorted[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        sorted_plan.contains("(sort :keys ((desc (sum (col \"a.id\"))) (asc (col \"a.v\")))"),
+        "unexpected plan: {sorted_plan}"
+    );
+
+    let sorted_source = engine
+        .execute_script("EXPLAIN SEXPR SELECT a.v FROM a ORDER BY a.id DESC;")
+        .expect("explain sexpr sorted source column");
+    let sorted_source_plan = match &as_rows(&sorted_source[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        sorted_source_plan.contains("(sort :keys ((desc (col \"a.id\")))"),
+        "unexpected plan: {sorted_source_plan}"
+    );
 }
 
 #[test]
@@ -2053,7 +2080,7 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
         "unexpected plan: {plan}"
     );
     assert!(
-        plan.contains("(sort :keys 1 :actual-rows 2 :time-ms "),
+        plan.contains("(sort :keys ((asc (col \"a.v\"))) :actual-rows 2 :time-ms "),
         "unexpected plan: {plan}"
     );
     assert!(

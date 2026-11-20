@@ -42,10 +42,7 @@ pub(crate) enum PlanKind {
         columns: Vec<String>,
         metrics: Metrics,
     },
-    Sort {
-        keys: usize,
-        metrics: Metrics,
-    },
+    Sort(SortPlan),
     Limit {
         limit: usize,
         actual_rows: Option<u64>,
@@ -130,6 +127,22 @@ pub(crate) struct AggregatePlan {
     pub(crate) keys: Vec<PlanExpr>,
     pub(crate) aggregates: Vec<PlanExpr>,
     pub(crate) metrics: Metrics,
+}
+
+/// Sort-specific fields. `keys` preserve the bound `ORDER BY` expressions and
+/// their directions; null placement remains the executor's fixed rule (ASC
+/// puts NULL first, DESC puts NULL last) rather than a per-key field.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SortPlan {
+    pub(crate) keys: Vec<SortKey>,
+    pub(crate) metrics: Metrics,
+}
+
+/// One bound `ORDER BY` key.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SortKey {
+    pub(crate) expr: PlanExpr,
+    pub(crate) ascending: bool,
 }
 
 /// How a join's keys are displayed. `USING` / `NATURAL` keys are symbolic
@@ -300,9 +313,9 @@ impl PlanNode {
                 push_metrics(&mut text, metrics, "rows");
                 text
             }
-            PlanKind::Sort { keys, metrics } => {
-                let mut text = format!("Sort ({keys} key(s))");
-                push_metrics(&mut text, metrics, "rows");
+            PlanKind::Sort(sort) => {
+                let mut text = format!("Sort ({} key(s))", sort.keys.len());
+                push_metrics(&mut text, &sort.metrics, "rows");
                 text
             }
             PlanKind::Limit {
@@ -412,9 +425,10 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Sort { keys, metrics } => {
-                out.push_str(&format!("(sort :keys {keys}"));
-                push_sexpr_metrics(out, metrics, "rows");
+            PlanKind::Sort(sort) => {
+                out.push_str("(sort :keys ");
+                push_sort_keys(out, &sort.keys);
+                push_sexpr_metrics(out, &sort.metrics, "rows");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
@@ -861,6 +875,21 @@ fn push_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+fn push_sort_keys(out: &mut String, keys: &[SortKey]) {
+    out.push('(');
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        out.push_str(if key.ascending { "asc" } else { "desc" });
+        out.push(' ');
+        key.expr.write_sexpr(out);
+        out.push(')');
+    }
+    out.push(')');
 }
 
 fn push_plan_expr_list(out: &mut String, exprs: &[PlanExpr]) {
