@@ -158,8 +158,13 @@ impl Parser {
             TokenKind::Word(name) => name,
             _ => return Err(SqlError::parse("expected type name", token.offset)),
         };
-        DataType::from_name(&name)
-            .ok_or_else(|| SqlError::parse(format!("unknown type: {name}"), token.offset))
+        let data_type = DataType::from_name(&name)
+            .ok_or_else(|| SqlError::parse(format!("unknown type: {name}"), token.offset))?;
+        // `LOGIC K3` is the only annotation domain accepted today.
+        if data_type == DataType::Logic {
+            self.eat_word("k3");
+        }
+        Ok(data_type)
     }
 
     fn parse_statement(&mut self) -> Result<Statement, SqlError> {
@@ -835,6 +840,32 @@ impl Parser {
             TokenKind::Number(value) => Ok(Expr::Literal(Value::Int(value))),
             TokenKind::String(value) => Ok(Expr::Literal(Value::Text(value))),
             TokenKind::Word(name) | TokenKind::QuotedIdent(name) => {
+                // `truth(x)` is sugar for a three-valued projection:
+                // NULL -> UNKNOWN, TRUE -> TRUE, FALSE -> FALSE.
+                if name.eq_ignore_ascii_case("truth")
+                    && self
+                        .peek()
+                        .is_some_and(|token| token.kind == TokenKind::Symbol(Symbol::LParen))
+                {
+                    self.bump(); // (
+                    let inner = self.parse_expr()?;
+                    self.expect_symbol(Symbol::RParen)?;
+                    let null_check = Expr::IsNull {
+                        expr: Box::new(inner.clone()),
+                        negated: false,
+                    };
+                    return Ok(Expr::Case {
+                        operand: None,
+                        branches: vec![
+                            (
+                                null_check,
+                                Expr::Literal(Value::Text("UNKNOWN".to_string())),
+                            ),
+                            (inner, Expr::Literal(Value::Text("TRUE".to_string()))),
+                        ],
+                        else_expr: Some(Box::new(Expr::Literal(Value::Text("FALSE".to_string())))),
+                    });
+                }
                 if self.eat_symbol(Symbol::Dot) {
                     let column = self.parse_ident()?;
                     Ok(Expr::Column {

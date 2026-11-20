@@ -189,3 +189,45 @@ fn under_repair_unknown_key_is_an_error() {
     ]);
     assert!(!output.status.success(), "unknown key must fail");
 }
+
+#[test]
+fn logic_column_and_truth_projection() {
+    let dir = TempDir::new("sql-logic-column");
+    let db = dir.join("logic.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, status LOGIC K3); \
+         INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL); \
+         SELECT id, truth(status) AS s FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\tTRUE"), "out: {text}");
+    assert!(text.contains("2\tFALSE"), "out: {text}");
+    assert!(text.contains("3\tUNKNOWN"), "out: {text}");
+}
+
+#[test]
+fn logic_column_is_unknown_filterable() {
+    let dir = TempDir::new("sql-logic-unknown");
+    let db = dir.join("logic.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, status LOGIC K3); \
+         INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL); \
+         SELECT id FROM t WHERE status IS UNKNOWN;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("3"), "out: {text}");
+    assert!(!text.contains("\n1"), "out: {text}");
+    assert!(!text.contains("\n2"), "out: {text}");
+}
