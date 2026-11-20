@@ -100,9 +100,10 @@ struct PushdownPlan {
 /// Columns retained for each source before joining.
 ///
 /// `None` means the source cannot be pruned safely; `Some(columns)` is a strict
-/// subset in schema order. This is a conservative physical optimization: the
-/// query must expose every column by an explicit qualifier, and no wildcard,
-/// `USING`, or `NATURAL` join may depend on the original schema.
+/// subset in schema order. This is a conservative physical optimization: every
+/// column reference must be static, an unqualified name must match exactly one
+/// source, and no wildcard, `USING`, or `NATURAL` join may depend on the original
+/// schema.
 #[derive(Clone, Debug, Default)]
 struct ScanProjection {
     columns: Vec<Option<Vec<String>>>,
@@ -763,7 +764,7 @@ impl SqlEngine {
     }
 
     /// Plans a conservative source-column projection. A query is prunable only
-    /// when every column reference is explicitly qualified, there is no
+    /// when every column reference can be assigned to one source, there is no
     /// wildcard, and no `USING`/`NATURAL` join depends on merged schema names.
     fn plan_scan_projection(&self, select: &Select) -> Result<ScanProjection, SqlError> {
         let sources = self.source_tables(select)?;
@@ -771,9 +772,21 @@ impl SqlEngine {
             .iter()
             .map(|(_, qualifier)| qualifier.clone())
             .collect::<Vec<_>>();
+        let source_columns = sources
+            .iter()
+            .map(|(table, _)| {
+                table
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
         let mut keep = vec![BTreeSet::new(); qualifiers.len()];
         let mut disabled = false;
-        let mut collect = |expr: &Expr| collect_expr_columns(expr, &qualifiers, &mut keep);
+        let mut collect =
+            |expr: &Expr| collect_expr_columns(expr, &qualifiers, &source_columns, &mut keep);
 
         for item in &select.items {
             match item {
@@ -1359,8 +1372,14 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
 }
 
 /// Collects the unqualified column names needed from each source. Returns
-/// `false` when a reference cannot be assigned to exactly one source yet.
-fn collect_expr_columns(expr: &Expr, qualifiers: &[String], keep: &mut [BTreeSet<String>]) -> bool {
+/// `false` when a qualified reference names an unknown source, or when an
+/// unqualified reference does not match exactly one source schema.
+fn collect_expr_columns(
+    expr: &Expr,
+    qualifiers: &[String],
+    source_columns: &[BTreeSet<String>],
+    keep: &mut [BTreeSet<String>],
+) -> bool {
     match expr {
         Expr::Literal(_) => true,
         Expr::Column {
@@ -1373,26 +1392,39 @@ fn collect_expr_columns(expr: &Expr, qualifiers: &[String], keep: &mut [BTreeSet
             }
             None => false,
         },
-        Expr::Column { table: None, .. } => false,
+        Expr::Column { table: None, name } => {
+            let mut matches = source_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, columns)| columns.contains(name));
+            let Some((index, _)) = matches.next() else {
+                return false;
+            };
+            if matches.next().is_some() {
+                return false;
+            }
+            keep[index].insert(name.clone());
+            true
+        }
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
-            collect_expr_columns(expr, qualifiers, keep)
+            collect_expr_columns(expr, qualifiers, source_columns, keep)
         }
         Expr::InList { expr, values, .. } => {
-            collect_expr_columns(expr, qualifiers, keep)
+            collect_expr_columns(expr, qualifiers, source_columns, keep)
                 && values
                     .iter()
-                    .all(|value| collect_expr_columns(value, qualifiers, keep))
+                    .all(|value| collect_expr_columns(value, qualifiers, source_columns, keep))
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            collect_expr_columns(expr, qualifiers, keep)
-                && collect_expr_columns(low, qualifiers, keep)
-                && collect_expr_columns(high, qualifiers, keep)
+            collect_expr_columns(expr, qualifiers, source_columns, keep)
+                && collect_expr_columns(low, qualifiers, source_columns, keep)
+                && collect_expr_columns(high, qualifiers, source_columns, keep)
         }
         Expr::Like { expr, pattern, .. } => {
-            collect_expr_columns(expr, qualifiers, keep)
-                && collect_expr_columns(pattern, qualifiers, keep)
+            collect_expr_columns(expr, qualifiers, source_columns, keep)
+                && collect_expr_columns(pattern, qualifiers, source_columns, keep)
         }
         Expr::Case {
             operand,
@@ -1401,22 +1433,22 @@ fn collect_expr_columns(expr: &Expr, qualifiers: &[String], keep: &mut [BTreeSet
         } => {
             operand
                 .as_deref()
-                .is_none_or(|expr| collect_expr_columns(expr, qualifiers, keep))
+                .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep))
                 && branches.iter().all(|(when, then)| {
-                    collect_expr_columns(when, qualifiers, keep)
-                        && collect_expr_columns(then, qualifiers, keep)
+                    collect_expr_columns(when, qualifiers, source_columns, keep)
+                        && collect_expr_columns(then, qualifiers, source_columns, keep)
                 })
                 && else_expr
                     .as_deref()
-                    .is_none_or(|expr| collect_expr_columns(expr, qualifiers, keep))
+                    .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep))
         }
         Expr::Binary { left, right, .. } => {
-            collect_expr_columns(left, qualifiers, keep)
-                && collect_expr_columns(right, qualifiers, keep)
+            collect_expr_columns(left, qualifiers, source_columns, keep)
+                && collect_expr_columns(right, qualifiers, source_columns, keep)
         }
         Expr::Aggregate { input, .. } => input
             .as_deref()
-            .is_none_or(|expr| collect_expr_columns(expr, qualifiers, keep)),
+            .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep)),
     }
 }
 

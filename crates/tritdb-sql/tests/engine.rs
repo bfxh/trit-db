@@ -2917,8 +2917,41 @@ fn join_projection_prunes_unused_source_columns() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!plan.contains("cols="), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("cols=id,v"),
+        "unambiguous unqualified column should be pruned: {plan}"
+    );
+    assert!(!plan.contains("spare"), "unexpected plan: {plan}");
     assert!(plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let unqualified_result = engine
+        .execute_script("SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE v = 'a2';")
+        .expect("unqualified projected join");
+    assert_eq!(
+        as_rows(&unqualified_result[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let single_unqualified = engine
+        .execute_script("EXPLAIN SELECT v FROM a;")
+        .expect("single unqualified explain");
+    let plan = as_rows(&single_unqualified[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("cols=v"),
+        "single-source unqualified column should be pruned: {plan}"
+    );
+    assert!(!plan.contains("spare"), "unexpected plan: {plan}");
 
     let using = engine
         .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b USING (id);")
