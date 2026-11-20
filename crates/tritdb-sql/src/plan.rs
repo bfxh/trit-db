@@ -880,6 +880,7 @@ fn aggregate_name(kind: AggregateKind) -> &'static str {
     match kind {
         AggregateKind::Count => "count",
         AggregateKind::Sum => "sum",
+        AggregateKind::Avg => "avg",
         AggregateKind::Min => "min",
         AggregateKind::Max => "max",
     }

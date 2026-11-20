@@ -4,6 +4,7 @@
 //! This is the semantic core of M3. It deliberately does not touch the SQL
 //! parser yet: callers build [`BoolExpr`] or fact sets directly.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::TruthValue;
@@ -724,6 +725,179 @@ fn parse_var_name(name: &str) -> Result<usize, AnnError> {
         .map_err(|_| AnnError::Parse(format!("invalid variable: {name}")))
 }
 
+/// Reduced ordered binary decision diagram used by [`count_models_bdd`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BddOp {
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BddNode {
+    var: usize,
+    low: u32,
+    high: u32,
+}
+
+#[derive(Default)]
+struct Bdd {
+    // Index 0 is FALSE, index 1 is TRUE; both are terminal.
+    nodes: Vec<Option<BddNode>>,
+    unique: HashMap<(usize, u32, u32), u32>,
+    apply_cache: HashMap<(u8, u32, u32), u32>,
+}
+
+impl Bdd {
+    fn new() -> Self {
+        Self {
+            nodes: vec![None, None],
+            unique: HashMap::new(),
+            apply_cache: HashMap::new(),
+        }
+    }
+
+    fn mk(&mut self, var: usize, low: u32, high: u32) -> u32 {
+        if low == high {
+            return low;
+        }
+        let key = (var, low, high);
+        if let Some(&node) = self.unique.get(&key) {
+            return node;
+        }
+        let node = self.nodes.len() as u32;
+        self.nodes.push(Some(BddNode { var, low, high }));
+        self.unique.insert(key, node);
+        node
+    }
+
+    fn var(&mut self, index: usize) -> u32 {
+        self.mk(index, 0, 1)
+    }
+
+    fn apply(&mut self, op: BddOp, left: u32, right: u32) -> u32 {
+        match op {
+            BddOp::And => {
+                if left == 0 || right == 0 {
+                    return 0;
+                }
+                if left == 1 {
+                    return right;
+                }
+                if right == 1 {
+                    return left;
+                }
+            }
+            BddOp::Or => {
+                if left == 1 || right == 1 {
+                    return 1;
+                }
+                if left == 0 {
+                    return right;
+                }
+                if right == 0 {
+                    return left;
+                }
+            }
+        }
+
+        let key = (op as u8, left, right);
+        if let Some(&node) = self.apply_cache.get(&key) {
+            return node;
+        }
+
+        let left_node = self.nodes[left as usize];
+        let right_node = self.nodes[right as usize];
+        let var = left_node
+            .map_or(usize::MAX, |node| node.var)
+            .min(right_node.map_or(usize::MAX, |node| node.var));
+        let (left_low, left_high) = match left_node {
+            Some(node) if node.var == var => (node.low, node.high),
+            _ => (left, left),
+        };
+        let (right_low, right_high) = match right_node {
+            Some(node) if node.var == var => (node.low, node.high),
+            _ => (right, right),
+        };
+
+        let low = self.apply(op, left_low, right_low);
+        let high = self.apply(op, left_high, right_high);
+        let node = self.mk(var, low, high);
+        self.apply_cache.insert(key, node);
+        node
+    }
+
+    fn neg(&mut self, node: u32) -> u32 {
+        match node {
+            0 => 1,
+            1 => 0,
+            _ => {
+                let current = self.nodes[node as usize].expect("non-terminal");
+                let low = self.neg(current.low);
+                let high = self.neg(current.high);
+                self.mk(current.var, low, high)
+            }
+        }
+    }
+
+    fn build_expr(&mut self, expr: &BoolExpr) -> u32 {
+        match expr {
+            BoolExpr::Const(false) => 0,
+            BoolExpr::Const(true) => 1,
+            BoolExpr::Var(index) => self.var(*index),
+            BoolExpr::Not(inner) => {
+                let node = self.build_expr(inner);
+                self.neg(node)
+            }
+            BoolExpr::And(items) => {
+                let mut result = 1;
+                for item in items {
+                    let node = self.build_expr(item);
+                    result = self.apply(BddOp::And, result, node);
+                }
+                result
+            }
+            BoolExpr::Or(items) => {
+                let mut result = 0;
+                for item in items {
+                    let node = self.build_expr(item);
+                    result = self.apply(BddOp::Or, result, node);
+                }
+                result
+            }
+        }
+    }
+
+    fn count(&self, node: u32, level: usize, vars: usize) -> u64 {
+        match node {
+            0 => 0,
+            1 => 1u64 << (vars - level),
+            _ => {
+                let current = self.nodes[node as usize].expect("non-terminal");
+                let factor = 1u64 << (current.var - level);
+                factor
+                    * (self.count(current.low, current.var + 1, vars)
+                        + self.count(current.high, current.var + 1, vars))
+            }
+        }
+    }
+}
+
+/// Counts satisfying assignments with a reduced ordered BDD.
+///
+/// This is a second exact backend for [`count_models`]; tests compare the two.
+pub fn count_models_bdd(expr: &BoolExpr, vars: usize) -> Result<u64, AnnError> {
+    if vars > MAX_MODEL_VARS {
+        return Err(AnnError::TooManyVars {
+            vars,
+            max: MAX_MODEL_VARS,
+        });
+    }
+    check_vars(expr, vars)?;
+    let mut bdd = Bdd::new();
+    let root = bdd.build_expr(expr);
+    Ok(bdd.count(root, 0, vars))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,6 +1020,45 @@ mod tests {
         assert_eq!(
             under_repair(3, &[vec![0, 1], vec![1, 2]], &[0, 1]).unwrap(),
             RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn bdd_matches_dpll_on_small_formulas() {
+        let formulas = vec![
+            BoolExpr::Const(true),
+            BoolExpr::Const(false),
+            BoolExpr::Var(0),
+            BoolExpr::Not(Box::new(BoolExpr::Var(0))),
+            BoolExpr::And(vec![BoolExpr::Var(0), BoolExpr::Var(1)]),
+            BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(1)]),
+            BoolExpr::And(vec![
+                BoolExpr::Var(0),
+                BoolExpr::Or(vec![
+                    BoolExpr::Not(Box::new(BoolExpr::Var(1))),
+                    BoolExpr::Var(2),
+                ]),
+            ]),
+        ];
+        for formula in formulas {
+            for vars in 0..=6 {
+                assert_eq!(
+                    count_models_bdd(&formula, vars),
+                    count_models(&formula, vars),
+                    "vars={vars} formula={formula:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bdd_counts_beyond_enumeration_scale() {
+        let vars = 25;
+        let either = BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(1)]);
+        assert_eq!(count_models_bdd(&either, vars).unwrap(), 3 << 23);
+        assert_eq!(
+            count_models_bdd(&BoolExpr::Const(true), MAX_MODEL_VARS).unwrap(),
+            1u64 << MAX_MODEL_VARS
         );
     }
 

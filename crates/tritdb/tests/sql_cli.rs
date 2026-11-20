@@ -485,3 +485,26 @@ fn check_constraints_reject_false_and_accept_unknown() {
     assert!(text.contains("1	10"), "out: {text}");
     assert!(text.contains("2	NULL"), "out: {text}");
 }
+
+#[test]
+fn annotation_columns_support_sum_avg_min_max() {
+    let dir = TempDir::new("sql-ann-agg");
+    let db = dir.join("a.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, conf LOGIC LUKASIEWICZ, n LOGIC NAT); \
+         INSERT INTO t VALUES (1,200,3),(2,300,4),(3,NULL,5); \
+         SELECT SUM(conf) AS s, AVG(conf) AS a, MIN(conf) AS lo, MAX(conf) AS hi FROM t; \
+         SELECT SUM(n) AS s, AVG(n) AS a, MIN(n) AS lo, MAX(n) AS hi FROM t;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["0.500", "0.250", "0.200", "0.300"] {
+        assert!(text.contains(expected), "missing {expected} in {text}");
+    }
+    assert!(text.contains("\n12\t4\t3\t5"), "out: {text}");
+}
