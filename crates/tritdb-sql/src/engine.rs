@@ -16,7 +16,7 @@ use crate::ast::{
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
-use crate::plan::{JoinPlan, Metrics, PlanKind, PlanNode};
+use crate::plan::{JoinKey, JoinKeys, JoinPlan, Metrics, PlanKind, PlanNode};
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
     decode_stats, decode_table, encode_stats, encode_table, stats_key, table_key, STATS_KEY_PREFIX,
@@ -2350,50 +2350,54 @@ fn join_plan(
     right: &Table,
     predicate: Option<&ExecExpr>,
 ) -> JoinPlan {
-    let mut details = Vec::new();
-    match &join.condition {
+    let (keys, residual, on_expr) = match &join.condition {
         JoinCondition::Using(names) => {
-            if !names.is_empty() {
-                details.push(format!("keys=({})", names.join(", ")));
-            }
+            let keys = if names.is_empty() {
+                None
+            } else {
+                Some(JoinKeys::Names(names.clone()))
+            };
+            (keys, false, false)
         }
         JoinCondition::Natural => {
-            if !hash_pairs.is_empty() {
+            let keys = if hash_pairs.is_empty() {
+                None
+            } else {
                 let names = hash_pairs
                     .iter()
-                    .map(|(left_index, _)| unqualified_name(&left.schema.columns[*left_index].name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                details.push(format!("keys=({names})"));
-            }
+                    .map(|(left_index, _)| {
+                        unqualified_name(&left.schema.columns[*left_index].name).to_string()
+                    })
+                    .collect::<Vec<_>>();
+                Some(JoinKeys::Names(names))
+            };
+            (keys, false, false)
         }
         JoinCondition::On(_) => {
             if uses_hash {
-                let keys = hash_pairs
+                let pairs = hash_pairs
                     .iter()
-                    .map(|(left_index, right_index)| {
-                        format!(
-                            "{} = {}",
-                            left.schema.columns[*left_index].name,
-                            right.schema.columns[*right_index].name
-                        )
+                    .map(|(left_index, right_index)| JoinKey {
+                        left: left.schema.columns[*left_index].name.clone(),
+                        right: right.schema.columns[*right_index].name.clone(),
                     })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                details.push(format!("keys=({keys})"));
-                if predicate.is_some_and(|expr| !is_pure_equi_conjunction(expr)) {
-                    details.push("residual=yes".to_string());
-                }
+                    .collect::<Vec<_>>();
+                let residual = predicate.is_some_and(|expr| !is_pure_equi_conjunction(expr));
+                (Some(JoinKeys::Pairs(pairs)), residual, false)
             } else if predicate.is_some() {
-                details.push("on=expr".to_string());
+                (None, false, true)
+            } else {
+                (None, false, false)
             }
         }
-        JoinCondition::None => {}
-    }
+        JoinCondition::None => (None, false, false),
+    };
     JoinPlan {
         uses_hash,
         kind: join.kind,
-        details,
+        keys,
+        residual,
+        on_expr,
         metrics: Metrics::default(),
     }
 }

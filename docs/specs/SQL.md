@@ -178,11 +178,11 @@ EXPLAIN SEXPR SELECT ...;
 - 返回单列 `plan`、单行文本；文本内部保留换行和缩进，便于直接作为机器可读的计划值保存。
 - 节点形如：
   - `(scan "a" :filtered #t :est-rows 3 :cols ("id"))`；没有列裁剪时省略 `:cols`，零列显示 `:cols ()`；
-  - `(join hash inner :details ("keys=(a.id = b.id)") :est-rows 2 child child)`；算法为 `hash` 或 `nested-loop`，`details` 保留键/残余片段；
+  - `(join hash inner :details ("keys=(a.id = b.id)") :est-rows 2 child child)`；算法为 `hash` 或 `nested-loop`；`details` 暂按历史文本保留键/残余片段，由 ADR-018 的 `JoinKeys` / `residual` / `on_expr` 结构化字段渲染，输出不变；
   - `(filter :est-rows N child)`、`(aggregate :est-groups N child)`、`(having :est-groups N child)`；
   - `(project ("v" "n") :est-rows N child)`、`(sort :keys 1 :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
 - 只有静态计划，因此不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。
-- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md) 与 [`ADR-018`](../ADR/018-structured-join-keys.md)。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -350,7 +350,7 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode` 与 `EXPLAIN SEXPR`、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪与无歧义未限定列裁剪、零列源表投影、常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`、`EXPLAIN SEXPR` 与 `JoinKeys`、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
 - Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）；`ANALYZE`/计划输出不做 SQLite 对拍。
 - `tritdb-bench sql-join` 提供可复现的规模基准；本机 1024 行时 hash 中位 0.688ms、nested 67.560ms。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

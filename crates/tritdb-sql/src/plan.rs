@@ -44,14 +44,35 @@ pub(crate) enum PlanKind {
     },
 }
 
-/// Join-specific fields. `details` contains the already-rendered key/residual
-/// fragments so the text form remains stable while the tree itself is data.
+/// Join-specific fields. Keys and residual flags are data; the historical
+/// `keys=...` / `residual=yes` / `on=expr` fragments are rendered on demand.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JoinPlan {
     pub(crate) uses_hash: bool,
     pub(crate) kind: JoinKind,
-    pub(crate) details: Vec<String>,
+    pub(crate) keys: Option<JoinKeys>,
+    /// `true` when an `ON` hash join has a predicate beyond its equi-keys.
+    pub(crate) residual: bool,
+    /// `true` when a nested-loop `ON` join shows the whole predicate as
+    /// `on=expr`.
+    pub(crate) on_expr: bool,
     pub(crate) metrics: Metrics,
+}
+
+/// How a join's keys are displayed. `USING` / `NATURAL` keys are symbolic
+/// names shared by both sides; explicit `ON` equalities retain both qualified
+/// column names.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum JoinKeys {
+    Names(Vec<String>),
+    Pairs(Vec<JoinKey>),
+}
+
+/// One explicit equality key, e.g. `a.id = b.id`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct JoinKey {
+    pub(crate) left: String,
+    pub(crate) right: String,
 }
 
 /// Observability fields shared by unary operators. `actual` and `est` are rows
@@ -162,9 +183,10 @@ impl PlanNode {
                     },
                     join_kind_name(join.kind)
                 );
-                if !join.details.is_empty() {
+                let fragments = join.detail_fragments();
+                if !fragments.is_empty() {
                     text.push(' ');
-                    text.push_str(&join.details.join(" "));
+                    text.push_str(&fragments.join(" "));
                 }
                 push_metrics(&mut text, &join.metrics, "rows");
                 text
@@ -253,9 +275,10 @@ impl PlanNode {
                 });
                 out.push(' ');
                 out.push_str(join_kind_name(join.kind));
-                if !join.details.is_empty() {
+                let fragments = join.detail_fragments();
+                if !fragments.is_empty() {
                     out.push_str(" :details ");
-                    push_string_list(out, &join.details);
+                    push_string_list(out, &fragments);
                 }
                 push_sexpr_metrics(out, &join.metrics, "rows");
                 self.write_sexpr_children(out, indent);
@@ -318,6 +341,34 @@ impl PlanNode {
             out.push('\n');
             child.write_sexpr(out, indent + 1);
         }
+    }
+}
+
+impl JoinPlan {
+    /// Reconstruct the exact fragments historically appended to a join label.
+    fn detail_fragments(&self) -> Vec<String> {
+        let mut details = Vec::new();
+        match &self.keys {
+            Some(JoinKeys::Names(names)) if !names.is_empty() => {
+                details.push(format!("keys=({})", names.join(", ")));
+            }
+            Some(JoinKeys::Pairs(pairs)) => {
+                let keys = pairs
+                    .iter()
+                    .map(|key| format!("{} = {}", key.left, key.right))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                details.push(format!("keys=({keys})"));
+            }
+            _ => {}
+        }
+        if self.residual {
+            details.push("residual=yes".to_string());
+        }
+        if self.on_expr {
+            details.push("on=expr".to_string());
+        }
+        details
     }
 }
 

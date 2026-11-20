@@ -1949,6 +1949,53 @@ fn explain_sexpr_reports_structured_plan() {
 }
 
 #[test]
+fn explain_sexpr_preserves_join_key_and_residual_details() {
+    fn plan_text(engine: &mut SqlEngine, sql: &str) -> String {
+        let result = engine.execute_script(sql).expect("explain sexpr");
+        let (_, rows) = as_rows(&result[0]);
+        match &rows[0][0] {
+            Value::Text(plan) => plan.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        }
+    }
+
+    let dir = TempDir::new("sql-explain-sexpr-join-details");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script("CREATE TABLE a (id INT, code INT); CREATE TABLE b (id INT, code INT);")
+        .expect("seed");
+
+    let using = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT * FROM a LEFT JOIN b USING (id);",
+    );
+    assert!(
+        using.contains("(join hash left :details (\"keys=(id)\")"),
+        "unexpected plan: {using}"
+    );
+
+    let residual = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id AND b.code <> 0;",
+    );
+    assert!(
+        residual.contains(":details (\"keys=(a.id = b.id)\" \"residual=yes\")"),
+        "unexpected plan: {residual}"
+    );
+
+    engine.set_join_strategy(JoinStrategy::NestedLoop);
+    let nested = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b ON a.id = b.id;",
+    );
+    assert!(
+        nested.contains("(join nested-loop inner :details (\"on=expr\")"),
+        "unexpected plan: {nested}"
+    );
+}
+
+#[test]
 fn explain_sexpr_includes_estimates_and_zero_columns() {
     let dir = TempDir::new("sql-explain-sexpr-est");
     let db = dir.join("sql.db");
