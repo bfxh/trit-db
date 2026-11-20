@@ -70,7 +70,7 @@ cargo test -p tritdb --test ann_cli    # 2 passed
 ## 6. 还没做
 
 - SQL 支持 `UNDER REPAIR ON (a, b, ...)` 多列函数依赖；列级/表级 `UNIQUE` 与 `CHECK` 在 `INSERT` / `UPDATE` 时生效（CHECK 的 `UNKNOWN` 通过）；Ł/ℕ 的 `SUM/AVG/MIN/MAX` 已支持；
-- Ł / ℕ 的 `truth()` 投影（这两类不是布尔，`truth()` 会拒绝）；
-- BDD 计数器已提供（`count_models_bdd`，与 DPLL 对拍）；组件级计数（多分量相乘）仍未做；默认仍是 DPLL；
+- Ł / ℕ 的 `truth()` 投影（这两类不是布尔，`truth()` 会拒绝）；`PROB_SUM` 已提供；
+- `count_models` 默认走组件分解 + BDD（独立合取项相乘、自由变量乘 `2^k`）；DPLL 保留为对拍 oracle；
 - `under_repair` 的增量修复与更优的 MCS 枚举仍未做；
 - 概率/模糊聚合与 `Łukasiewicz` 的更多 t-norm。

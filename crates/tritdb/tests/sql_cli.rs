@@ -508,3 +508,23 @@ fn annotation_columns_support_sum_avg_min_max() {
     }
     assert!(text.contains("\n12\t4\t3\t5"), "out: {text}");
 }
+
+#[test]
+fn prob_sum_multiplies_survival_probabilities() {
+    let dir = TempDir::new("sql-prob-sum");
+    let db = dir.join("p.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, conf LOGIC LUKASIEWICZ);          INSERT INTO t VALUES (1,200),(2,300),(3,NULL);          SELECT PROB_SUM(conf) AS p FROM t;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("0.440"),
+        "out: {}",
+        stdout(&output)
+    );
+}

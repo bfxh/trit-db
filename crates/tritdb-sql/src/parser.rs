@@ -990,6 +990,7 @@ impl Parser {
             TokenKind::Keyword(Keyword::Count) => self.parse_aggregate(AggregateKind::Count),
             TokenKind::Keyword(Keyword::Sum) => self.parse_aggregate(AggregateKind::Sum),
             TokenKind::Keyword(Keyword::Avg) => self.parse_aggregate(AggregateKind::Avg),
+            TokenKind::Keyword(Keyword::ProbSum) => self.parse_aggregate(AggregateKind::ProbSum),
             TokenKind::Keyword(Keyword::Min) => self.parse_aggregate(AggregateKind::Min),
             TokenKind::Keyword(Keyword::Max) => self.parse_aggregate(AggregateKind::Max),
             TokenKind::Keyword(Keyword::Case) => self.parse_case(),
