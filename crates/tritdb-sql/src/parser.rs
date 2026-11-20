@@ -125,11 +125,12 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(TokenKind::Keyword(Keyword::Select)) => self.parse_select(),
             Some(TokenKind::Keyword(Keyword::Explain)) => self.parse_explain(),
+            Some(TokenKind::Keyword(Keyword::Analyze)) => self.parse_analyze(),
             Some(TokenKind::Keyword(Keyword::Update)) => self.parse_update(),
             Some(TokenKind::Keyword(Keyword::Delete)) => self.parse_delete(),
-            Some(_) => {
-                Err(self.error("expected CREATE, DROP, INSERT, SELECT, EXPLAIN, UPDATE, or DELETE"))
-            }
+            Some(_) => Err(self.error(
+                "expected CREATE, DROP, INSERT, SELECT, EXPLAIN, ANALYZE, UPDATE, or DELETE",
+            )),
             None => Err(self.error("empty statement")),
         }
     }
@@ -240,6 +241,15 @@ impl Parser {
         } else {
             Statement::Explain(select)
         })
+    }
+
+    fn parse_analyze(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Analyze)?;
+        let table = match self.peek().map(|token| &token.kind) {
+            Some(TokenKind::Word(_)) | Some(TokenKind::QuotedIdent(_)) => Some(self.parse_ident()?),
+            _ => None,
+        };
+        Ok(Statement::Analyze { table })
     }
 
     fn parse_select(&mut self) -> Result<Statement, SqlError> {
@@ -801,6 +811,19 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_analyze_table_or_all() {
+        let statements = parse_script("ANALYZE; ANALYZE t;").expect("parse analyze");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0], Statement::Analyze { table: None });
+        assert_eq!(
+            statements[1],
+            Statement::Analyze {
+                table: Some("t".to_string())
+            }
+        );
     }
 
     #[test]

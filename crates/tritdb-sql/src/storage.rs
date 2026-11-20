@@ -1,18 +1,31 @@
 use tritdb_exec::{Column, DataType, ExecError, Schema, Table, Value};
 
 use crate::error::SqlError;
+use crate::stats::{ColumnStats, TableStats};
 
 /// Prefix for table values in the key/value store.
 pub const TABLE_KEY_PREFIX: &str = "sql/table/";
+/// Prefix for `ANALYZE` statistics in the key/value store.
+pub const STATS_KEY_PREFIX: &str = "sql/stats/";
 
 const TABLE_MAGIC: [u8; 4] = *b"TRSQ";
 const TABLE_VERSION: u8 = 0;
+const STATS_MAGIC: [u8; 4] = *b"TRSS";
+const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
 
 /// Builds the key for a table.
 pub fn table_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(TABLE_KEY_PREFIX.len() + name.len());
     key.extend_from_slice(TABLE_KEY_PREFIX.as_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+/// Builds the key for table statistics.
+pub fn stats_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(STATS_KEY_PREFIX.len() + name.len());
+    key.extend_from_slice(STATS_KEY_PREFIX.as_bytes());
     key.extend_from_slice(name.as_bytes());
     key
 }
@@ -25,6 +38,10 @@ fn put_u32(out: &mut Vec<u8>, value: usize) -> Result<(), SqlError> {
 }
 
 fn put_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -79,6 +96,27 @@ pub fn encode_table(table: &Table) -> Result<Vec<u8>, SqlError> {
         for (value, column) in row.iter().zip(&table.schema.columns) {
             encode_value(&mut out, value, column.data_type, &table.name, &column.name)?;
         }
+    }
+    Ok(out)
+}
+
+/// Encodes exact table statistics into the value stored under the
+/// `sql/stats/` key prefix.
+pub fn encode_stats(stats: &TableStats) -> Result<Vec<u8>, SqlError> {
+    if stats.columns.len() > MAX_COLUMNS {
+        return Err(SqlError::Unsupported(format!(
+            "statistics have more than {MAX_COLUMNS} columns"
+        )));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&STATS_MAGIC);
+    out.push(STATS_VERSION);
+    put_u64(&mut out, stats.rows);
+    put_u32(&mut out, stats.columns.len())?;
+    for column in &stats.columns {
+        put_text(&mut out, &column.name)?;
+        put_u64(&mut out, column.nulls);
+        put_u64(&mut out, column.distinct);
     }
     Ok(out)
 }
@@ -239,8 +277,72 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
     })
 }
 
+/// Decodes table statistics, checking that they still match the table schema
+/// and row count.
+pub fn decode_stats(table: &Table, bytes: &[u8]) -> Result<TableStats, SqlError> {
+    let corrupt = |reason: &str| SqlError::CorruptStats {
+        table: table.name.clone(),
+        reason: reason.to_string(),
+    };
+    let mut reader = Reader::new(bytes);
+    if reader.bytes.get(0..4) != Some(STATS_MAGIC.as_slice()) {
+        return Err(corrupt("bad magic"));
+    }
+    reader.pos = 4;
+    let version = reader.u8().ok_or_else(|| corrupt("missing version"))?;
+    if version != STATS_VERSION {
+        return Err(corrupt("unsupported version"));
+    }
+    let rows = reader.u64().ok_or_else(|| corrupt("missing row count"))?;
+    let column_count = reader
+        .u32()
+        .ok_or_else(|| corrupt("missing column count"))? as usize;
+    if column_count == 0 || column_count > MAX_COLUMNS {
+        return Err(corrupt("invalid column count"));
+    }
+    if column_count != table.schema.len() {
+        return Err(corrupt("column count does not match table"));
+    }
+    let mut columns = Vec::with_capacity(column_count);
+    for schema_column in &table.schema.columns {
+        let name_len = reader
+            .u32()
+            .ok_or_else(|| corrupt("missing column name length"))? as usize;
+        let name = reader
+            .text(name_len)
+            .ok_or_else(|| corrupt("invalid column name"))?;
+        if name != schema_column.name {
+            return Err(corrupt("column name does not match table"));
+        }
+        let nulls = reader.u64().ok_or_else(|| corrupt("missing null count"))?;
+        let distinct = reader
+            .u64()
+            .ok_or_else(|| corrupt("missing distinct count"))?;
+        if nulls > rows {
+            return Err(corrupt("null count exceeds row count"));
+        }
+        if distinct > rows - nulls {
+            return Err(corrupt("distinct count exceeds non-null row count"));
+        }
+        columns.push(ColumnStats {
+            name,
+            nulls,
+            distinct,
+        });
+    }
+    if reader.pos != bytes.len() {
+        return Err(corrupt("trailing bytes"));
+    }
+    if rows != table.rows.len() as u64 {
+        return Err(corrupt("row count does not match table"));
+    }
+    Ok(TableStats { rows, columns })
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::stats::analyze_table;
+
     use super::*;
 
     fn table() -> Table {
@@ -294,5 +396,25 @@ mod tests {
         let mut table = table();
         table.rows[0][0] = Value::Text("x".to_string());
         assert!(encode_table(&table).is_err());
+    }
+
+    #[test]
+    fn stats_roundtrip_and_validate_table() {
+        let table = table();
+        let stats = analyze_table(&table);
+        let bytes = encode_stats(&stats).expect("encode stats");
+        let decoded = decode_stats(&table, &bytes).expect("decode stats");
+        assert_eq!(decoded, stats);
+
+        for end in 0..bytes.len() {
+            assert!(
+                decode_stats(&table, &bytes[..end]).is_err(),
+                "stats prefix {end}"
+            );
+        }
+
+        let mut shorter = table;
+        shorter.rows.pop();
+        assert!(decode_stats(&shorter, &bytes).is_err());
     }
 }

@@ -253,6 +253,11 @@ pub enum Statement {
     Explain(Select),
     /// `EXPLAIN ANALYZE SELECT`.
     ExplainAnalyze(Select),
+    /// `ANALYZE [table]`: recompute exact table statistics.
+    Analyze {
+        /// Optional table name; `None` analyzes every table.
+        table: Option<String>,
+    },
     /// `DELETE FROM`.
     Delete {
         /// Table name.

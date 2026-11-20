@@ -14,7 +14,11 @@ use crate::ast::{AggregateKind, Assignment, Join, JoinCondition, JoinKind, Selec
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
-use crate::storage::{decode_table, encode_table, table_key, TABLE_KEY_PREFIX};
+use crate::stats::{analyze_table, TableStats};
+use crate::storage::{
+    decode_stats, decode_table, encode_stats, encode_table, stats_key, table_key, STATS_KEY_PREFIX,
+    TABLE_KEY_PREFIX,
+};
 
 /// Result of one SQL statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +66,19 @@ struct ExecutionStats {
     total_ms: f64,
 }
 
+/// Cardinality estimates attached to a static `EXPLAIN` plan.
+#[derive(Debug, Default)]
+struct PlanEstimate {
+    scan_rows: Vec<u64>,
+    join_rows: Vec<u64>,
+    filter_rows: u64,
+    aggregate_groups: u64,
+    having_groups: u64,
+    project_rows: u64,
+    sort_rows: u64,
+    output_rows: u64,
+}
+
 /// A SQL engine backed by one [`TxnStore`].
 ///
 /// M1 keeps the whole table in memory and rewrites the table value on every
@@ -69,6 +86,7 @@ struct ExecutionStats {
 pub struct SqlEngine {
     store: TxnStore,
     tables: BTreeMap<String, Table>,
+    stats: BTreeMap<String, TableStats>,
     join_strategy: JoinStrategy,
 }
 
@@ -77,26 +95,49 @@ impl SqlEngine {
     pub fn open(path: &Path) -> Result<Self, SqlError> {
         let store = TxnStore::open(path)?;
         let mut tables = BTreeMap::new();
+        let mut stats_bytes = BTreeMap::new();
         for (key, value) in store.iter()? {
-            let Some(name_bytes) = key.strip_prefix(TABLE_KEY_PREFIX.as_bytes()) else {
+            if let Some(name_bytes) = key.strip_prefix(TABLE_KEY_PREFIX.as_bytes()) {
+                let name = str::from_utf8(name_bytes).map_err(|error| SqlError::CorruptTable {
+                    table: "<non-utf8>".to_string(),
+                    reason: error.to_string(),
+                })?;
+                if name.is_empty() {
+                    return Err(SqlError::CorruptTable {
+                        table: "<empty>".to_string(),
+                        reason: "empty table name".to_string(),
+                    });
+                }
+                let table = decode_table(name, &value)?;
+                tables.insert(name.to_string(), table);
                 continue;
-            };
-            let name = str::from_utf8(name_bytes).map_err(|error| SqlError::CorruptTable {
-                table: "<non-utf8>".to_string(),
-                reason: error.to_string(),
-            })?;
-            if name.is_empty() {
-                return Err(SqlError::CorruptTable {
-                    table: "<empty>".to_string(),
-                    reason: "empty table name".to_string(),
-                });
             }
-            let table = decode_table(name, &value)?;
-            tables.insert(name.to_string(), table);
+            if let Some(name_bytes) = key.strip_prefix(STATS_KEY_PREFIX.as_bytes()) {
+                let name = str::from_utf8(name_bytes).map_err(|error| SqlError::CorruptStats {
+                    table: "<non-utf8>".to_string(),
+                    reason: error.to_string(),
+                })?;
+                if name.is_empty() {
+                    return Err(SqlError::CorruptStats {
+                        table: "<empty>".to_string(),
+                        reason: "empty table name".to_string(),
+                    });
+                }
+                stats_bytes.insert(name.to_string(), value);
+            }
+        }
+        let mut stats = BTreeMap::new();
+        for (name, value) in stats_bytes {
+            // Statistics are derived metadata. An orphaned stats key is ignored
+            // rather than making a database with otherwise valid tables unopenable.
+            if let Some(table) = tables.get(&name) {
+                stats.insert(name, decode_stats(table, &value)?);
+            }
         }
         Ok(Self {
             store,
             tables,
+            stats,
             join_strategy: JoinStrategy::Auto,
         })
     }
@@ -143,6 +184,7 @@ impl SqlEngine {
             Statement::Select(select) => self.select(select),
             Statement::Explain(select) => self.explain(select, false),
             Statement::ExplainAnalyze(select) => self.explain(select, true),
+            Statement::Analyze { table } => self.analyze(table.as_deref()),
             Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
             Statement::Update {
                 table,
@@ -198,10 +240,13 @@ impl SqlEngine {
             return Err(SqlError::UnknownTable(name.to_string()));
         }
         let key = table_key(name);
+        let stats = stats_key(name);
         let mut txn = self.store.begin()?;
         txn.delete(&key)?;
+        txn.delete(&stats)?;
         txn.commit()?;
         self.tables.remove(name);
+        self.stats.remove(name);
         Ok(QueryResult::Message(format!("dropped table {name}")))
     }
 
@@ -372,7 +417,51 @@ impl SqlEngine {
         execute_select(&table, &plan)
     }
 
+    fn analyze(&mut self, table_name: Option<&str>) -> Result<QueryResult, SqlError> {
+        let names = match table_name {
+            Some(name) => {
+                if !self.tables.contains_key(name) {
+                    return Err(SqlError::UnknownTable(name.to_string()));
+                }
+                vec![name.to_string()]
+            }
+            None => self.tables.keys().cloned().collect(),
+        };
+        if names.is_empty() {
+            return Ok(QueryResult::Message("analyzed 0 table(s)".to_string()));
+        }
+
+        let mut analyzed = Vec::with_capacity(names.len());
+        for name in &names {
+            let table = self
+                .tables
+                .get(name)
+                .expect("table list came from the catalog");
+            let stats = analyze_table(table);
+            let value = encode_stats(&stats)?;
+            analyzed.push((name.clone(), stats, value));
+        }
+
+        let mut txn = self.store.begin()?;
+        for (name, _, value) in &analyzed {
+            txn.put(&stats_key(name), value)?;
+        }
+        txn.commit()?;
+        for (name, stats, _) in analyzed {
+            self.stats.insert(name, stats);
+        }
+        Ok(QueryResult::Message(format!(
+            "analyzed {} table(s)",
+            names.len()
+        )))
+    }
+
     fn explain(&self, select: &Select, analyze: bool) -> Result<QueryResult, SqlError> {
+        let estimates = if analyze {
+            None
+        } else {
+            self.estimate_plan(select)?
+        };
         let (plan, stats) = if analyze {
             let start = Instant::now();
             let mut stats = ExecutionStats::default();
@@ -383,10 +472,10 @@ impl SqlEngine {
                 stats.output_rows = rows.len();
             }
             stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let plan = self.build_plan(select, Some(&stats))?;
+            let plan = self.build_plan(select, Some(&stats), None)?;
             (plan, Some(stats))
         } else {
-            (self.build_plan(select, None)?, None)
+            (self.build_plan(select, None, estimates.as_ref())?, None)
         };
         let mut plan = plan;
         if let Some(stats) = stats {
@@ -402,6 +491,113 @@ impl SqlEngine {
                 .map(|line| vec![Value::Text(line.to_string())])
                 .collect(),
         })
+    }
+
+    fn estimate_plan(&self, select: &Select) -> Result<Option<PlanEstimate>, SqlError> {
+        let mut sources = self.source_tables(select)?.into_iter();
+        let (left, left_qualifier) = sources.next().expect("base table is always present");
+        let Some(left_stats) = self.stats.get(&left.name) else {
+            return Ok(None);
+        };
+        let mut left_table = qualify_table_schema(left, &left_qualifier);
+        let mut left_rows = left_stats.rows as f64;
+        let mut left_ndvs = left_stats
+            .columns
+            .iter()
+            .map(|column| column.distinct)
+            .collect::<Vec<_>>();
+        let mut estimate = PlanEstimate {
+            scan_rows: vec![left_stats.rows],
+            ..PlanEstimate::default()
+        };
+
+        for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+            let Some(right_stats) = self.stats.get(&right.name) else {
+                return Ok(None);
+            };
+            let right_table = qualify_table_schema(right, &qualifier);
+            let pairs = match &join.condition {
+                JoinCondition::Using(names) => using_pairs(&left_table, &right_table, names)?,
+                JoinCondition::Natural => natural_pairs(&left_table, &right_table)?,
+                JoinCondition::On(_) | JoinCondition::None => Vec::new(),
+            };
+            let pair_schema = Schema::new(
+                left_table
+                    .schema
+                    .columns
+                    .iter()
+                    .chain(right_table.schema.columns.iter())
+                    .cloned()
+                    .collect(),
+            );
+            let predicate = match &join.condition {
+                JoinCondition::On(expr) => Some(bind_expr(expr, &pair_schema)?),
+                JoinCondition::Using(_) | JoinCondition::Natural => {
+                    using_predicate(&pairs, left_table.schema.len())
+                }
+                JoinCondition::None => None,
+            };
+            let hash_pairs = match &join.condition {
+                JoinCondition::Using(_) | JoinCondition::Natural => pairs.clone(),
+                JoinCondition::On(_) => predicate
+                    .as_ref()
+                    .map(|expr| equi_join_pairs(expr, left_table.schema.len()))
+                    .unwrap_or_default(),
+                JoinCondition::None => Vec::new(),
+            };
+            let right_ndvs = right_stats
+                .columns
+                .iter()
+                .map(|column| column.distinct)
+                .collect::<Vec<_>>();
+            let join_rows = estimate_join_rows(
+                join.kind,
+                left_rows,
+                right_stats.rows as f64,
+                &hash_pairs,
+                &left_ndvs,
+                &right_ndvs,
+                predicate.as_ref(),
+            );
+            let (schema, output_sources) =
+                build_join_layout(&left_table, &right_table, &pairs, join.kind);
+            left_ndvs = join_output_ndvs(&output_sources, &left_ndvs, &right_ndvs);
+            left_table = Table {
+                name: left_table.name,
+                schema,
+                rows: Vec::new(),
+            };
+            left_rows = join_rows;
+            estimate.scan_rows.push(right_stats.rows);
+            estimate.join_rows.push(ceil_estimate(join_rows));
+        }
+
+        let bound = bind_select(select, &left_table)?;
+        let filtered = match bound.filter.as_ref() {
+            Some(filter) => left_rows * estimate_selectivity(filter, &left_ndvs),
+            None => left_rows,
+        };
+        estimate.filter_rows = ceil_estimate(filtered);
+
+        if bound.is_grouped() {
+            let groups = estimate_group_count(&bound, filtered, &left_ndvs);
+            let having = if bound.having.is_some() {
+                groups * 0.5
+            } else {
+                groups
+            };
+            estimate.aggregate_groups = ceil_estimate(groups);
+            estimate.having_groups = ceil_estimate(having);
+            estimate.project_rows = ceil_estimate(having);
+        } else {
+            estimate.project_rows = ceil_estimate(filtered);
+        }
+        estimate.sort_rows = estimate.project_rows;
+        estimate.output_rows = match bound.limit {
+            Some(limit) => estimate.project_rows.min(limit as u64),
+            None => estimate.project_rows,
+        };
+        Ok(Some(estimate))
     }
 
     fn source_tables<'a>(&'a self, select: &Select) -> Result<Vec<(&'a Table, String)>, SqlError> {
@@ -470,6 +666,7 @@ impl SqlEngine {
         &self,
         select: &Select,
         stats: Option<&ExecutionStats>,
+        estimates: Option<&PlanEstimate>,
     ) -> Result<String, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
@@ -478,6 +675,7 @@ impl SqlEngine {
         let mut plan = scan_plan(
             &source_label(left.name.as_str(), &left_qualifier),
             stats,
+            estimates,
             scan_index,
         );
         scan_index += 1;
@@ -529,10 +727,15 @@ impl SqlEngine {
                 ) {
                     header.push_str(&format!(" actual rows={rows} time={ms:.3}ms"));
                 }
+            } else if let Some(rows) =
+                estimates.and_then(|estimate| estimate.join_rows.get(join_index).copied())
+            {
+                header.push_str(&format!(" est rows={rows}"));
             }
             let right_plan = scan_plan(
                 &source_label(right.name.as_str(), &qualifier),
                 stats,
+                estimates,
                 scan_index,
             );
             scan_index += 1;
@@ -551,38 +754,41 @@ impl SqlEngine {
 
         let bound = bind_select(select, &left_table)?;
         if bound.filter.is_some() {
-            let label = stats.map_or_else(
-                || "Filter".to_string(),
-                |stats| {
-                    format!(
-                        "Filter actual rows={} time={:.3}ms",
-                        stats.filter_rows, stats.filter_ms
-                    )
-                },
-            );
+            let label = if let Some(stats) = stats {
+                format!(
+                    "Filter actual rows={} time={:.3}ms",
+                    stats.filter_rows, stats.filter_ms
+                )
+            } else if let Some(estimate) = estimates {
+                format!("Filter est rows={}", estimate.filter_rows)
+            } else {
+                "Filter".to_string()
+            };
             plan = format!("{label}\n{}", indent_plan(&plan, 2));
         }
         if bound.is_grouped() {
-            let label = stats.map_or_else(
-                || "Aggregate".to_string(),
-                |stats| {
-                    format!(
-                        "Aggregate actual groups={} time={:.3}ms",
-                        stats.aggregate_groups, stats.aggregate_ms
-                    )
-                },
-            );
+            let label = if let Some(stats) = stats {
+                format!(
+                    "Aggregate actual groups={} time={:.3}ms",
+                    stats.aggregate_groups, stats.aggregate_ms
+                )
+            } else if let Some(estimate) = estimates {
+                format!("Aggregate est groups={}", estimate.aggregate_groups)
+            } else {
+                "Aggregate".to_string()
+            };
             plan = format!("{label}\n{}", indent_plan(&plan, 2));
             if bound.having.is_some() {
-                let label = stats.map_or_else(
-                    || "Having".to_string(),
-                    |stats| {
-                        format!(
-                            "Having actual groups={} time={:.3}ms",
-                            stats.having_groups, stats.having_ms
-                        )
-                    },
-                );
+                let label = if let Some(stats) = stats {
+                    format!(
+                        "Having actual groups={} time={:.3}ms",
+                        stats.having_groups, stats.having_ms
+                    )
+                } else if let Some(estimate) = estimates {
+                    format!("Having est groups={}", estimate.having_groups)
+                } else {
+                    "Having".to_string()
+                };
                 plan = format!("{label}\n{}", indent_plan(&plan, 2));
             }
         }
@@ -592,47 +798,63 @@ impl SqlEngine {
             .map(|item| item.name().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let label = stats.map_or_else(
-            || format!("Project [{projection}]"),
-            |stats| {
-                format!(
-                    "Project [{projection}] actual rows={} time={:.3}ms",
-                    stats.project_rows, stats.project_ms
-                )
-            },
-        );
+        let label = if let Some(stats) = stats {
+            format!(
+                "Project [{projection}] actual rows={} time={:.3}ms",
+                stats.project_rows, stats.project_ms
+            )
+        } else if let Some(estimate) = estimates {
+            format!("Project [{projection}] est rows={}", estimate.project_rows)
+        } else {
+            format!("Project [{projection}]")
+        };
         plan = format!("{label}\n{}", indent_plan(&plan, 2));
         if !bound.order_by.is_empty() {
-            let label = stats.map_or_else(
-                || format!("Sort ({} key(s))", bound.order_by.len()),
-                |stats| {
-                    format!(
-                        "Sort ({} key(s)) actual rows={} time={:.3}ms",
-                        bound.order_by.len(),
-                        stats.sort_rows,
-                        stats.sort_ms
-                    )
-                },
-            );
+            let label = if let Some(stats) = stats {
+                format!(
+                    "Sort ({} key(s)) actual rows={} time={:.3}ms",
+                    bound.order_by.len(),
+                    stats.sort_rows,
+                    stats.sort_ms
+                )
+            } else if let Some(estimate) = estimates {
+                format!(
+                    "Sort ({} key(s)) est rows={}",
+                    bound.order_by.len(),
+                    estimate.sort_rows
+                )
+            } else {
+                format!("Sort ({} key(s))", bound.order_by.len())
+            };
             plan = format!("{label}\n{}", indent_plan(&plan, 2));
         }
         if let Some(limit) = bound.limit {
-            let label = stats.map_or_else(
-                || format!("Limit {limit}"),
-                |stats| format!("Limit {limit} actual rows={}", stats.output_rows),
-            );
+            let label = if let Some(stats) = stats {
+                format!("Limit {limit} actual rows={}", stats.output_rows)
+            } else if let Some(estimate) = estimates {
+                format!("Limit {limit} est rows={}", estimate.output_rows)
+            } else {
+                format!("Limit {limit}")
+            };
             plan = format!("{label}\n{}", indent_plan(&plan, 2));
         }
         Ok(plan)
     }
 
     fn put_table(&mut self, table: Table) -> Result<(), SqlError> {
-        let key = table_key(&table.name);
+        let name = table.name.clone();
+        let key = table_key(&name);
+        let stats_key_bytes = stats_key(&name);
         let value = encode_table(&table)?;
         let mut txn = self.store.begin()?;
         txn.put(&key, &value)?;
+        // Statistics describe the previous table contents. Invalidate them in
+        // the same transaction that rewrites the table so a reopen cannot see
+        // old statistics against new rows.
+        txn.delete(&stats_key_bytes)?;
         txn.commit()?;
-        self.tables.insert(table.name.clone(), table);
+        self.tables.insert(name.clone(), table);
+        self.stats.remove(&name);
         Ok(())
     }
 }
@@ -1032,6 +1254,180 @@ fn use_hash_join(strategy: JoinStrategy, pairs: &[(usize, usize)]) -> bool {
     }
 }
 
+fn ceil_estimate(value: f64) -> u64 {
+    if value.is_finite() {
+        value.max(0.0).ceil() as u64
+    } else {
+        0
+    }
+}
+
+fn estimate_join_rows(
+    kind: JoinKind,
+    left_rows: f64,
+    right_rows: f64,
+    hash_pairs: &[(usize, usize)],
+    left_ndvs: &[u64],
+    right_ndvs: &[u64],
+    predicate: Option<&ExecExpr>,
+) -> f64 {
+    let product = left_rows * right_rows;
+    let mut rows = if hash_pairs.is_empty() {
+        if predicate.is_some() {
+            product * 0.1
+        } else {
+            product
+        }
+    } else {
+        let mut denominator = 1.0;
+        for &(left_index, right_index) in hash_pairs {
+            let left_ndv = left_ndvs.get(left_index).copied().unwrap_or(0).max(1) as f64;
+            let right_ndv = right_ndvs.get(right_index).copied().unwrap_or(0).max(1) as f64;
+            denominator *= left_ndv.max(right_ndv);
+        }
+        (product / denominator).min(product)
+    };
+    if !hash_pairs.is_empty()
+        && predicate.is_some_and(|predicate| !is_pure_equi_conjunction(predicate))
+    {
+        rows *= 0.5;
+    }
+    match kind {
+        JoinKind::Inner => rows,
+        JoinKind::Left => rows.max(left_rows),
+        JoinKind::Right => rows.max(right_rows),
+        JoinKind::Full => rows.max(left_rows).max(right_rows),
+        JoinKind::Cross => product,
+    }
+}
+
+fn join_output_ndvs(sources: &[JoinSource], left_ndvs: &[u64], right_ndvs: &[u64]) -> Vec<u64> {
+    sources
+        .iter()
+        .map(|source| match source {
+            JoinSource::Left(index) => left_ndvs.get(*index).copied().unwrap_or(0),
+            JoinSource::Right(index) => right_ndvs.get(*index).copied().unwrap_or(0),
+            JoinSource::Coalesced { left, right } => left_ndvs
+                .get(*left)
+                .copied()
+                .unwrap_or(0)
+                .max(right_ndvs.get(*right).copied().unwrap_or(0)),
+        })
+        .collect()
+}
+
+fn estimate_group_count(grouped: &BoundSelect, input_rows: f64, ndvs: &[u64]) -> f64 {
+    if grouped.group_by.is_empty() {
+        return 1.0;
+    }
+    let mut groups = 1.0;
+    for expr in &grouped.group_by {
+        match expr {
+            ExecExpr::Column(index) => {
+                groups *= ndvs.get(*index).copied().unwrap_or(0).max(1) as f64;
+            }
+            _ => {
+                groups = input_rows.max(1.0);
+                break;
+            }
+        }
+    }
+    groups
+        .min(input_rows)
+        .max(if input_rows > 0.0 { 1.0 } else { 0.0 })
+}
+
+fn estimate_selectivity(expr: &ExecExpr, ndvs: &[u64]) -> f64 {
+    let selectivity = match expr {
+        ExecExpr::IsNull { negated, .. } => {
+            if *negated {
+                0.9
+            } else {
+                0.1
+            }
+        }
+        ExecExpr::IsTruth { .. } => 0.5,
+        ExecExpr::Not(expr) => 1.0 - estimate_selectivity(expr, ndvs),
+        ExecExpr::InList {
+            expr,
+            values,
+            negated,
+        } => {
+            let mut value = 0.5;
+            if let ExecExpr::Column(index) = expr.as_ref() {
+                value = (values.len() as f64
+                    / ndvs.get(*index).copied().unwrap_or(0).max(1) as f64)
+                    .min(1.0);
+            }
+            if *negated {
+                1.0 - value
+            } else {
+                value
+            }
+        }
+        ExecExpr::Between { negated, .. } => {
+            if *negated {
+                0.67
+            } else {
+                0.33
+            }
+        }
+        ExecExpr::Like { negated, .. } => {
+            if *negated {
+                0.9
+            } else {
+                0.1
+            }
+        }
+        ExecExpr::Case { .. } => 0.5,
+        ExecExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => estimate_selectivity(left, ndvs) * estimate_selectivity(right, ndvs),
+        ExecExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let left = estimate_selectivity(left, ndvs);
+            let right = estimate_selectivity(right, ndvs);
+            1.0 - (1.0 - left) * (1.0 - right)
+        }
+        ExecExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => equality_selectivity(left, right, ndvs),
+        ExecExpr::Binary {
+            op: BinaryOp::Ne,
+            left,
+            right,
+        } => 1.0 - equality_selectivity(left, right, ndvs),
+        ExecExpr::Binary {
+            op: BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge,
+            ..
+        } => 0.33,
+        _ => 0.5,
+    };
+    selectivity.clamp(0.0, 1.0)
+}
+
+fn equality_selectivity(left: &ExecExpr, right: &ExecExpr, ndvs: &[u64]) -> f64 {
+    if matches!(left, ExecExpr::Literal(Value::Null))
+        || matches!(right, ExecExpr::Literal(Value::Null))
+    {
+        return 0.0;
+    }
+    match (left, right) {
+        (ExecExpr::Column(index), ExecExpr::Literal(_))
+        | (ExecExpr::Literal(_), ExecExpr::Column(index)) => {
+            1.0 / ndvs.get(*index).copied().unwrap_or(0).max(1) as f64
+        }
+        _ => 0.5,
+    }
+}
+
 fn source_label(table: &str, qualifier: &str) -> String {
     if table == qualifier {
         table.to_string()
@@ -1040,10 +1436,17 @@ fn source_label(table: &str, qualifier: &str) -> String {
     }
 }
 
-fn scan_plan(label: &str, stats: Option<&ExecutionStats>, index: usize) -> String {
+fn scan_plan(
+    label: &str,
+    stats: Option<&ExecutionStats>,
+    estimates: Option<&PlanEstimate>,
+    index: usize,
+) -> String {
     let mut node = format!("Scan {label}");
     if let Some(rows) = stats.and_then(|stats| stats.scan_rows.get(index)) {
         node.push_str(&format!(" actual rows={rows}"));
+    } else if let Some(rows) = estimates.and_then(|estimate| estimate.scan_rows.get(index)) {
+        node.push_str(&format!(" est rows={rows}"));
     }
     node
 }

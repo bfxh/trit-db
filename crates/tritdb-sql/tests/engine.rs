@@ -1954,6 +1954,194 @@ fn explain_analyze_reports_actual_rows_and_times() {
 }
 
 #[test]
+fn analyze_persists_and_explain_uses_estimates() {
+    let dir = TempDir::new("sql-analyze-explain");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    let results = engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, NULL); \
+             INSERT INTO b VALUES (1, 'p'), (2, 'q'), (2, 'r'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+    assert_eq!(message(&results[4]), "analyzed 2 table(s)");
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT a.id, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id >= 2 ORDER BY a.id LIMIT 2;",
+        )
+        .expect("explain with estimates");
+    let (columns, rows) = as_rows(&explained[0]);
+    assert_eq!(columns, ["plan"]);
+    let plan = rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        plan,
+        "Limit 2 est rows=1\n  Sort (1 key(s)) est rows=1\n    \
+         Project [id, w] est rows=1\n      Filter est rows=1\n        \
+         HashJoin (inner) keys=(a.id = b.id) est rows=3\n          \
+         Scan a est rows=3\n          Scan b est rows=3"
+    );
+    let grouped = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v HAVING COUNT(*) >= 1 ORDER BY a.v;",
+        )
+        .expect("explain grouped estimates");
+    let plan = as_rows(&grouped[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Aggregate est groups=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Having est groups=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [v, n] est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    drop(engine);
+
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    let explained = reopened
+        .execute_script("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id;")
+        .expect("explain after reopen");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Project [id] est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3"),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
+fn dml_invalidates_persisted_statistics_until_next_analyze() {
+    let dir = TempDir::new("sql-analyze-invalidate");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT, v TEXT); \
+             INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'); \
+             ANALYZE t;",
+        )
+        .expect("seed and analyze");
+    let explained = engine
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain before dml");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+
+    engine
+        .execute_script("INSERT INTO t VALUES (4, 'd');")
+        .expect("insert");
+    let explained = engine
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain after dml");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("est rows"), "unexpected plan: {plan}");
+    drop(engine);
+
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    let explained = reopened
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain after reopen");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("est rows"), "unexpected plan: {plan}");
+
+    let analyzed = reopened
+        .execute_script("ANALYZE t;")
+        .expect("analyze again");
+    assert_eq!(message(&analyzed[0]), "analyzed 1 table(s)");
+    let explained = reopened
+        .execute_script("EXPLAIN SELECT id FROM t WHERE id >= 2;")
+        .expect("explain after re-analyze");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan t est rows=4"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(reopened.execute_script("ANALYZE missing;").is_err());
+}
+
+#[test]
 fn natural_join_without_common_columns_is_cross_join_and_validates_using() {
     let dir = TempDir::new("sql-natural-using-errors");
     let db = dir.join("sql.db");

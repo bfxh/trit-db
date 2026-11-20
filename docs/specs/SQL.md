@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、`EXPLAIN SELECT` 文本计划、`EXPLAIN ANALYZE` 实际行数/耗时、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、优化器仍未做。
 
 ## 1. 范围
 
@@ -39,7 +39,7 @@ DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`EXPLAIN SELECT` 输出绑定后的文本计划，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；不支持子查询。
+- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；不支持子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE 重写整张表。
@@ -111,9 +111,22 @@ FROM name [AS alias]
 - `LEFT`/`FULL JOIN` 的右侧非合并列、`RIGHT`/`FULL JOIN` 的左侧非合并列在输出 schema 中一律标记为可空；`USING`/`NATURAL` 合并列在 `LEFT` 保留左值、`RIGHT` 保留右值、`FULL` 两侧取非 `NULL` 值。`WHERE` 在 join 之后执行，因此 `WHERE right.col IS NULL` / `WHERE left.col IS NULL` 可筛出未匹配行。
 - 限定列写作 `alias.column`；非限定列先精确匹配，再按唯一列名解析，多表同名列必须限定，否则报 `ambiguous column`。
 - 别名/表名在同一 `FROM` 子句内必须唯一；自连接必须给同一张表分配不同别名，否则报 `duplicate table name or alias`。
-- 等值 JOIN 使用右表 hash 桶 + 左表探测；非等值 `ON`/`CROSS JOIN`/逗号源仍用嵌套循环，`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果。hash join 的桶只存右表行号，输出仍按左行优先、`RIGHT`/`FULL` 的未匹配右行最后追加，和 nested loop 的顺序一致；不引入优化器或统计信息。
+- 等值 JOIN 使用右表 hash 桶 + 左表探测；非等值 `ON`/`CROSS JOIN`/逗号源仍用嵌套循环，`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果。hash join 的桶只存右表行号，输出仍按左行优先、`RIGHT`/`FULL` 的未匹配右行最后追加，和 nested loop 的顺序一致；`ANALYZE` 统计只供估算展示，尚未反向影响执行策略，也不引入优化器或代价模型。
 - 执行器默认 `JoinStrategy::Auto`：有等值键走 hash，否则 nested loop。`JoinStrategy::Hash` 与 `Auto` 在当前有键时行为相同，`JoinStrategy::NestedLoop` 强制嵌套循环；该开关只通过 `SqlEngine::set_join_strategy` 暴露给基准和差分测试，不是 SQL hint。
 - 输出列标签去掉限定前缀；普通多表 join 遇到同名列会产生重复标签，`USING`/`NATURAL` 的合并列不会重复输出。
+
+### ANALYZE
+
+```sql
+ANALYZE [table];
+```
+
+- `ANALYZE table` 扫描一张表；不带表名时扫描当前所有表。未知表报 `unknown table`。
+- 统计内容：行数、每列 `NULL` 数、每列非 `NULL` 的不同值数（NDV）；空表的列统计为 0。
+- 统计是精确快照，持久化在 `sql/stats/<table>` 的 `TRSS` value 中；重开数据库后可继续供 `EXPLAIN` 使用。
+- 统计只由 `ANALYZE` 写入；`CREATE`/`INSERT`/`DELETE`/`UPDATE`/`DROP` 在同一事务里删除对应统计，避免旧统计和新表内容混用。写入后不会自动刷新，必须重新 `ANALYZE`。
+- 返回消息 `analyzed N table(s)`；不带表名且没有表时返回 `analyzed 0 table(s)`。
+- 持久化与失效的设计取舍见 [`ADR-007`](../ADR/007-analyze-statistics.md)。
 
 ### EXPLAIN SELECT
 
@@ -125,7 +138,15 @@ EXPLAIN SELECT ...;
 - 返回单列 `plan`，每个节点一行；缩进表示父子关系。
 - 节点包括 `Scan`、`Join`、`Filter`、`Aggregate`、`Having`、`Project`、`Sort`、`Limit`。
 - Join 节点显示 `HashJoin` 或 `NestedLoop` 和 join 类型；`HashJoin` 显示 `keys=(...)`，`ON` 中除等值键外还有残余谓词时显示 `residual=yes`；强制 nested loop 时显示 `NestedLoop (...) on=expr`。
-- 该计划是当前执行路径的静态文本，不做代价估算，不显示行数/字节统计。
+- 当查询涉及的所有源表都有 `ANALYZE` 统计时，节点追加估算：
+  - `Scan`：`est rows=N`（统计中的精确行数）；
+  - `HashJoin` / `NestedLoop`：`est rows=N`；
+  - `Filter`、`Project`、`Sort`：`est rows=N`；
+  - `Aggregate`、`Having`：`est groups=N`；
+  - `Limit`：`est rows=N`。
+- 估算规则是启发式的：等值 join 用 `left_rows * right_rows / max(left_ndv, right_ndv)`（复合键逐键相乘），有残余谓词再乘 0.5；非等值 join 乘 0.1；外连接至少保留被保留侧的行数。过滤 `=` 用 `1/NDV`、`IS NULL` 用 0.1、范围用 0.33、`LIKE` 用 0.1，`AND` 相乘、`OR` 取并集概率，其他谓词默认 0.5。分组数用分组列 NDV 乘积并受输入行数上限约束，`HAVING` 再乘 0.5。所有基数向上取整。
+- 没有统计时退回不带数字的静态计划；估算只用于展示，不选择 join 策略，也不改变执行路径。
+- 该计划仍是当前执行路径的静态文本，不是优化器或代价模型；没有统计采样、直方图和候选计划比较。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -134,7 +155,7 @@ EXPLAIN ANALYZE SELECT ...;
 ```
 
 - 只接受 `SELECT`；真实执行一次查询，但不返回查询结果行，只返回单列 `plan`。
-- 在静态计划的节点上追加运行时统计：
+- 在静态计划的节点上追加运行时统计（有 `ANALYZE` 统计时也不混入 `est`）：
   - `Scan`：`actual rows=N`；
   - `HashJoin` / `NestedLoop`：`actual rows=N time=Xms`；
   - `Filter`、`Project`、`Sort`：`actual rows=N time=Xms`；
@@ -142,7 +163,7 @@ EXPLAIN ANALYZE SELECT ...;
   - `Limit`：`actual rows=N`。
 - 末行 `Execution: rows=N time=Xms`：`rows` 是最终输出行数，`time` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间，不含计划文本渲染。
 - 节点耗时是单次运行测量：Join 只计 `join_tables`，Filter/Aggregate/Having/Project/Sort 分别计对应阶段；`Scan` 不单独计时。
-- 这不是代价模型，也不做统计信息采样；耗时受机器负载影响，只用于观察当前执行路径。
+- 这不是代价模型；耗时受机器负载影响，只用于观察当前执行路径。`EXPLAIN SELECT` 的 `est` 是统计估算，`EXPLAIN ANALYZE` 的 `actual` 是本次执行实测。
 
 - `WHERE` 在 join 之后执行，只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。
 - `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
@@ -257,10 +278,34 @@ per row:
 - 表值走 `TxnStore` 的 `Begin/Put/Commit`，因此复用 WAL、提交组、快照 checkpoint 和崩溃恢复。
 - 每次写重写整表；大表会产生明显写放大，这是 M1 语义切片的已知边界。
 
+`ANALYZE` 统计 key：
+
+```text
+sql/stats/<table-name>
+```
+
+value 是 `TRSS` v0：
+
+```text
+0..4    "TRSS"
+4       version = 0
+5..13   u64 LE row_count
+13..17  u32 column_count
+per column:
+  u32   name_len
+  bytes name
+  u64 LE null_count
+  u64 LE distinct_non_null_count
+```
+
+- 解码时校验 magic/version/截断/trailing bytes、列名与表 schema 一致、`null_count <= row_count`、`distinct <= row_count - null_count`、`row_count` 与表值一致。
+- 统计只由 `ANALYZE` 写入；表的 `CREATE/INSERT/DELETE/UPDATE` 与统计删除在同一事务提交，`DROP` 同时删除表与统计 key。
+
 ## 6. CLI
 
 ```bash
 tritdb sql --db sql.db --sql "CREATE TABLE t (id INT); INSERT INTO t VALUES (1);"
+tritdb sql --db sql.db --sql "ANALYZE; EXPLAIN SELECT id FROM t WHERE id >= 1;"
 tritdb sql --db sql.db --sql "SELECT * FROM t;"
 tritdb sql --db sql.db --file script.sql
 ```
@@ -269,7 +314,7 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`EXPLAIN` / `EXPLAIN ANALYZE` 计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
-- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）；`ANALYZE`/计划输出不做 SQLite 对拍。
 - `tritdb-bench sql-join` 提供可复现的规模基准；本机 1024 行时 hash 中位 0.688ms、nested 67.560ms。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。
