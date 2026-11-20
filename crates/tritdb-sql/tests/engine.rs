@@ -1857,6 +1857,103 @@ fn explain_reports_hash_and_nested_loop_join_plans() {
 }
 
 #[test]
+fn explain_analyze_reports_actual_rows_and_times() {
+    let dir = TempDir::new("sql-explain-analyze");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (2, 'b2x'), (4, 'b4');",
+        )
+        .expect("seed");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v FROM a JOIN b \
+             ON a.id = b.id AND b.w <> 'b2x' \
+             WHERE a.id >= 1 ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain analyze join");
+    let plan = plan_text(&analyzed[0]);
+    assert_eq!(as_rows(&analyzed[0]).0, ["plan"]);
+    assert!(
+        plan.contains("Limit 1 actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Sort (1 key(s)) actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [v] actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) residual=yes actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan a actual rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b actual rows=4"),
+        "unexpected plan: {plan}"
+    );
+    let execution = plan.lines().last().expect("execution line");
+    assert!(
+        execution.starts_with("Execution: rows=1 time=") && execution.ends_with("ms"),
+        "unexpected execution line: {execution}"
+    );
+
+    let grouped = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v HAVING COUNT(*) >= 1 ORDER BY a.v LIMIT 2;",
+        )
+        .expect("explain analyze grouped join");
+    let plan = plan_text(&grouped[0]);
+    assert!(
+        plan.contains("Aggregate actual groups=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Having actual groups=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Project [v, n] actual rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("HashJoin (inner) keys=(a.id = b.id) actual rows=3 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Execution: rows=2 time="),
+        "unexpected plan: {plan}"
+    );
+}
+
+#[test]
 fn natural_join_without_common_columns_is_cross_join_and_validates_using() {
     let dir = TempDir::new("sql-natural-using-errors");
     let db = dir.join("sql.db");

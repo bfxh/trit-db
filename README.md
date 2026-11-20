@@ -50,6 +50,7 @@ cargo run -p tritdb -- sql --db sql.db --sql "SELECT id, flag FROM t WHERE flag 
 cargo run -p tritdb -- sql --db sql.db --sql "SELECT flag, COUNT(*) AS n FROM t GROUP BY flag HAVING COUNT(*) >= 1 ORDER BY flag;"
 cargo run -p tritdb -- sql --db sql.db --sql "CREATE TABLE d (id INT NOT NULL, name TEXT); INSERT INTO d VALUES (1, 'eng'); SELECT t.id, d.name FROM t JOIN d ON t.id = d.id;"
 cargo run -p tritdb -- sql --db sql.db --sql "EXPLAIN SELECT t.id FROM t JOIN d ON t.id = d.id;"
+cargo run -p tritdb -- sql --db sql.db --sql "EXPLAIN ANALYZE SELECT t.id FROM t JOIN d ON t.id = d.id;"
 cargo run -p tritdb-bench --release -- radix --trits 1000000 --rounds 6
 cargo run -p tritdb-bench --release -- baseline --trits 1000000 --rounds 6
 cargo run -p tritdb-bench --release -- block --trits 1000000 --rounds 6 --radix r3
@@ -72,7 +73,7 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 
 ## 测试与 CI
 
-当前 **233 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN/DML/谓词/CASE 分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
+当前 **234 个正常测试 + 4 个 ignored 压力测试**，按格式、引擎、故障注入、跨语言、跨引擎、SQL 3VL/分组聚合/JOIN/DML/谓词/CASE 分层；完整矩阵见 [`docs/testing/README.md`](docs/testing/README.md)。
 
 - `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / 三平台 Python 交叉校验（向量 + CLI + SQLite SQL 对拍）/ coverage / docs。
 - `stress.yml`：每天 04:00 UTC 跑 release 模式压力测试与 crash matrix。
@@ -123,4 +124,4 @@ docs/results/          M0/M1 读数与负结果
 - `已设计`：只有文档。
 - `未做`：没有代码。
 
-当前：radix/page/format/wal/txn/store/页 checkpoint/键值 checkpoint/提交组/CLI/bench/最小 SQL 3VL/单表 GROUP BY/多表 INNER JOIN/CROSS JOIN/逗号 FROM/LEFT JOIN/RIGHT JOIN/FULL JOIN/NATURAL JOIN/USING/等值 hash join/`EXPLAIN SELECT`/JOIN 策略开关/UPDATE/IN·BETWEEN·LIKE/CASE 为 `已实现`；子查询、优化器/pgwire/MVCC/WAL 段轮转/后台 checkpoint/跨进程锁 为 `未做`。
+当前：radix/page/format/wal/txn/store/页 checkpoint/键值 checkpoint/提交组/CLI/bench/最小 SQL 3VL/单表 GROUP BY/多表 INNER JOIN/CROSS JOIN/逗号 FROM/LEFT JOIN/RIGHT JOIN/FULL JOIN/NATURAL JOIN/USING/等值 hash join/`EXPLAIN SELECT`/`EXPLAIN ANALYZE`/JOIN 策略开关/UPDATE/IN·BETWEEN·LIKE/CASE 为 `已实现`；子查询、优化器/pgwire/MVCC/WAL 段轮转/后台 checkpoint/跨进程锁 为 `未做`。

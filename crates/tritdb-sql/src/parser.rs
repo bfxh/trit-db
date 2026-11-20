@@ -230,11 +230,16 @@ impl Parser {
 
     fn parse_explain(&mut self) -> Result<Statement, SqlError> {
         self.expect_keyword(Keyword::Explain)?;
+        let analyze = self.eat_keyword(Keyword::Analyze);
         let select = match self.parse_select()? {
             Statement::Select(select) => select,
             _ => unreachable!("parse_select always returns SELECT"),
         };
-        Ok(Statement::Explain(select))
+        Ok(if analyze {
+            Statement::ExplainAnalyze(select)
+        } else {
+            Statement::Explain(select)
+        })
     }
 
     fn parse_select(&mut self) -> Result<Statement, SqlError> {
@@ -800,16 +805,30 @@ mod tests {
 
     #[test]
     fn parses_explain_select() {
-        let statements = parse_script("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id;")
-            .expect("parse explain");
-        assert_eq!(statements.len(), 1);
-        match &statements[0] {
-            Statement::Explain(select) => {
-                assert_eq!(select.table, "a");
-                assert_eq!(select.joins.len(), 1);
-                assert_eq!(select.joins[0].table, "b");
+        for (sql, analyze) in [
+            ("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id;", false),
+            (
+                "EXPLAIN ANALYZE SELECT a.id FROM a JOIN b ON a.id = b.id;",
+                true,
+            ),
+        ] {
+            let statements = parse_script(sql).expect("parse explain");
+            assert_eq!(statements.len(), 1);
+            match &statements[0] {
+                Statement::Explain(select) => {
+                    assert!(!analyze);
+                    assert_eq!(select.table, "a");
+                    assert_eq!(select.joins.len(), 1);
+                    assert_eq!(select.joins[0].table, "b");
+                }
+                Statement::ExplainAnalyze(select) => {
+                    assert!(analyze);
+                    assert_eq!(select.table, "a");
+                    assert_eq!(select.joins.len(), 1);
+                    assert_eq!(select.joins[0].table, "b");
+                }
+                other => panic!("unexpected {other:?}"),
             }
-            other => panic!("unexpected {other:?}"),
         }
     }
 

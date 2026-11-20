@@ -251,6 +251,8 @@ pub enum Statement {
     Select(Select),
     /// `EXPLAIN SELECT`.
     Explain(Select),
+    /// `EXPLAIN ANALYZE SELECT`.
+    ExplainAnalyze(Select),
     /// `DELETE FROM`.
     Delete {
         /// Table name.

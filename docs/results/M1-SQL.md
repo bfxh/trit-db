@@ -1,6 +1,6 @@
 # M1 SQL 3VL：最小纵向切片读数
 
-状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / 等值 JOIN 的 hash join / `EXPLAIN SELECT` / JOIN 策略开关 / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
+状态：parser / binder / executor / CLI / 持久化 / SQLite 对拍 / 单表 GROUP BY / 多表 INNER JOIN / CROSS JOIN / 逗号 FROM / LEFT JOIN / RIGHT JOIN / FULL JOIN / NATURAL JOIN / USING / 等值 JOIN 的 hash join / `EXPLAIN SELECT` / `EXPLAIN ANALYZE` / JOIN 策略开关 / UPDATE / IN·BETWEEN·LIKE 谓词 / CASE 表达式已实现。
 日期：2026-11-20
 
 ## 1. 交付
@@ -27,6 +27,7 @@ docs/specs/SQL.md
 - `JOIN ... USING (col, ...)`：指定列匹配、合并列排序、重复/缺失/类型不一致校验、`LEFT/RIGHT/FULL` 的非 `NULL` 侧合并
 - 等值 JOIN 执行：`USING`/`NATURAL` 与 `ON` 顶层 `AND` 的列等值走 hash join；支持复合键、残余 `ON` 谓词、`NULL` 键不匹配；`OR`、非等值比较、表达式键回退 nested loop
 - `EXPLAIN SELECT`：绑定但不执行，输出 `Scan` / `Join` / `Filter` / `Aggregate` / `Having` / `Project` / `Sort` / `Limit` 文本计划；Join 节点标出 `HashJoin` 或 `NestedLoop`、键和残余谓词
+- `EXPLAIN ANALYZE SELECT`：执行一次查询，在计划节点上追加 `actual rows`（聚合节点为 `actual groups`）和墙钟耗时；末行给出 `Execution: rows=N time=Xms`，不返回查询结果行
 - JOIN 策略开关：`JoinStrategy::{Auto, Hash, NestedLoop}`，供基准和差分测试强制指定执行路径
 - `UPDATE ... SET column = expr [, ...] [WHERE ...]`：旧行求值、多列赋值、类型/NOT NULL 校验
 - `IN` / `NOT IN`、`BETWEEN` / `NOT BETWEEN`、`LIKE` / `NOT LIKE`：三值逻辑、NULL 传播、ASCII 大小写不敏感
@@ -88,11 +89,11 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 |---|---:|
 | `tritdb-exec` 单元测试 | 12 |
 | `tritdb-sql` 单元测试 | 22 |
-| `tritdb-sql` 引擎集成测试 | 39 |
+| `tritdb-sql` 引擎集成测试 | 40 |
 | `tritdb` SQL CLI 集成测试 | 2 |
-| **合计** | **75** |
+| **合计** | **76** |
 
-其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4），1 个来自 hash join 切片（复合键/NULL 键/残余谓词/非等值回退），2 个来自 EXPLAIN 切片（1 个 parser + 1 个 engine）。工作区测试从 158 增至 **233 个正常测试 + 4 个 ignored 压力测试**。
+其中 26 个来自初始 SQL 3VL 切片，6 个来自 GROUP BY/HAVING 切片，10 个来自 JOIN 切片（3 个 parser + 7 个 engine），5 个来自 UPDATE 切片（1 个 parser + 4 个 engine），7 个来自谓词切片（3 个 exec + 1 个 parser + 3 个 engine），5 个来自 CASE 切片（1 个 exec + 1 个 parser + 3 个 engine），4 个来自 RIGHT/FULL JOIN 切片（1 个 parser + 3 个 engine），5 个来自 CROSS JOIN/逗号 FROM 切片（2 个 parser + 3 个 engine），5 个来自 NATURAL JOIN/USING 切片（3 个 parser + 2 个 engine，替换 1 个旧 unsupported join 测试，净增 4），1 个来自 hash join 切片（复合键/NULL 键/残余谓词/非等值回退），2 个来自 EXPLAIN 切片（1 个 parser + 1 个 engine），1 个来自 EXPLAIN ANALYZE 切片（计划实际行数/分组数/耗时）。工作区测试从 158 增至 **234 个正常测试 + 4 个 ignored 压力测试**。
 
 ## 4. 负结果 / 边界
 
@@ -108,18 +109,18 @@ cargo run -p tritdb-bench --release -- sql-join --rows 2048 --rounds 3 --strateg
 10. **JOIN 全内存**：hash 桶保存右表行号，每个 join 仍构造新的临时表并复制行，没有流式执行、分区或 spill；多表/大表会快速放大内存。
 11. **谓词只做标量列表**：`IN` 不支持子查询或行构造器；`LIKE` 仅支持 `TEXT`，没有 `ESCAPE`、`GLOB` 或正则，大小写折叠只覆盖 ASCII。
 12. **CASE 只做标量分支**：不支持子查询条件/结果；简单式 `CASE operand WHEN` 用本引擎的类型严格等值比较，探针与候选类型不同会报 `type mismatch`，而 SQLite 会落到 `ELSE`。未选中分支不求值，因此其中的除零/类型错误不会触发。
-13. **EXPLAIN 只是静态文本计划**：绑定但不执行，不做代价估算，不显示行数、字节或统计信息；节点顺序反映当前执行路径，不是优化器候选比较。`JoinStrategy` 是进程内 API 开关，不是 SQL hint，也没有 `EXPLAIN ANALYZE`。
+13. **EXPLAIN 不是优化器**：`EXPLAIN SELECT` 只绑定不执行，没有代价估算、行数/字节统计；`EXPLAIN ANALYZE` 会真实执行一次，但节点耗时是单次墙钟测量，受机器状态影响，不是稳定基线，也不返回查询结果。节点顺序反映当前执行路径，不是候选计划比较。`JoinStrategy` 是进程内 API 开关，不是 SQL hint。
 
 ## 5. CI 与覆盖
 
 - CROSS JOIN/逗号 FROM 切片 CI run：<https://github.com/bfxh/trit-db/actions/runs/44639115915>，11 个 job 全绿（lint、三平台 test、两平台 MSRV、三平台 Python 对拍、coverage、docs）。
 - NATURAL JOIN/USING 切片：本地 `sql_oracle.py` 133/133（127 SELECT + 6 UPDATE 行数）；等值 hash join 切片当前为 **138/138**（132 SELECT + 6 UPDATE 行数）。三平台 CI 待推送后补。上一轮 CROSS JOIN CI 的三平台对拍为 118/118。
-- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 5766/7646 = 75.41%，RIGHT/FULL JOIN 后 5814/7692 = 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；NATURAL/USING、hash join 与 EXPLAIN 切片尚未重跑覆盖率，65% 门禁仍有余量。
+- 行覆盖：SQL 3VL 切片 4710/6559 = 71.81%，GROUP BY/HAVING 后 4906/6777 = 72.39%，INNER JOIN 后 5080/6957 = 73.02%，LEFT JOIN 后 5117/6991 = 73.19%，UPDATE 后 5215/7081 = 73.65%，谓词后 5531/7426 = 74.48%，CASE 后 5766/7646 = 75.41%，RIGHT/FULL JOIN 后 5814/7692 = 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；NATURAL/USING、hash join、EXPLAIN 与 EXPLAIN ANALYZE 切片尚未重跑覆盖率，65% 门禁仍有余量。
 - 本机无法用 GNU/MSVC 工具链跑 `llvm-cov`（缺 profiler runtime / MSVC linker），覆盖数字取自 CI 的 `coverage-lcov` artifact。
 
 ## 6. 下一步
 
-- 等值 hash join、可复现 `sql-join` 基准和 `EXPLAIN SELECT` 已做：右表建桶、左表探测，`USING`/`NATURAL` 与 `ON` 顶层 `AND` 的列等值可命中；非等值/OR/表达式键回退 nested loop；`JoinStrategy` 可强制路径，`EXPLAIN` 直接显示 `HashJoin` / `NestedLoop` 与键。下一步做逻辑计划与统计信息，让策略选择从“有键就 hash”升级为可比较的代价决策；子查询需要新的作用域和计划层，成本更高。
+- 等值 hash join、可复现 `sql-join` 基准、`EXPLAIN SELECT` 与 `EXPLAIN ANALYZE` 已做：右表建桶、左表探测，`USING`/`NATURAL` 与 `ON` 顶层 `AND` 的列等值可命中；非等值/OR/表达式键回退 nested loop；`JoinStrategy` 可强制路径，`EXPLAIN` 直接显示 `HashJoin` / `NestedLoop` 与键，`EXPLAIN ANALYZE` 显示实际行数/分组数与耗时。下一步做逻辑计划、表/列统计信息和代价模型，让策略选择从“有键就 hash”升级为可比较的代价决策；子查询需要新的作用域和计划层，成本更高。
 - `tritdb-plan`：逻辑计划、列裁剪、谓词下推、常量折叠。
 - `tritdb-proto`：pgwire v3 simple query + extended query，先让 `psql` 能连。
 - 表存储从整表重写改成页/行格式，接 `tritdb-page`。

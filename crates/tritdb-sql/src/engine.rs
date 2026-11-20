@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::str;
+use std::time::Instant;
 
 use tritdb_exec::{
     compare_values, eval, truth_of, BinaryOp, Column, ExecError, Expr as ExecExpr, Row, Schema,
@@ -39,6 +40,26 @@ pub enum JoinStrategy {
     Hash,
     /// Always use nested loop, for benchmarks and differential tests.
     NestedLoop,
+}
+
+/// Runtime counters attached to an `EXPLAIN ANALYZE` plan.
+#[derive(Debug, Default)]
+struct ExecutionStats {
+    scan_rows: Vec<usize>,
+    join_rows: Vec<usize>,
+    join_ms: Vec<f64>,
+    filter_rows: usize,
+    filter_ms: f64,
+    aggregate_groups: usize,
+    aggregate_ms: f64,
+    having_groups: usize,
+    having_ms: f64,
+    project_rows: usize,
+    project_ms: f64,
+    sort_rows: usize,
+    sort_ms: f64,
+    output_rows: usize,
+    total_ms: f64,
 }
 
 /// A SQL engine backed by one [`TxnStore`].
@@ -120,7 +141,8 @@ impl SqlEngine {
                 rows,
             } => self.insert(table, columns.as_deref(), rows),
             Statement::Select(select) => self.select(select),
-            Statement::Explain(select) => self.explain(select),
+            Statement::Explain(select) => self.explain(select, false),
+            Statement::ExplainAnalyze(select) => self.explain(select, true),
             Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
             Statement::Update {
                 table,
@@ -350,8 +372,29 @@ impl SqlEngine {
         execute_select(&table, &plan)
     }
 
-    fn explain(&self, select: &Select) -> Result<QueryResult, SqlError> {
-        let plan = self.build_plan(select)?;
+    fn explain(&self, select: &Select, analyze: bool) -> Result<QueryResult, SqlError> {
+        let (plan, stats) = if analyze {
+            let start = Instant::now();
+            let mut stats = ExecutionStats::default();
+            let table = self.build_from_inner(select, Some(&mut stats))?;
+            let plan = bind_select(select, &table)?;
+            let result = execute_select_inner(&table, &plan, Some(&mut stats))?;
+            if let QueryResult::Rows { rows, .. } = &result {
+                stats.output_rows = rows.len();
+            }
+            stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let plan = self.build_plan(select, Some(&stats))?;
+            (plan, Some(stats))
+        } else {
+            (self.build_plan(select, None)?, None)
+        };
+        let mut plan = plan;
+        if let Some(stats) = stats {
+            plan.push_str(&format!(
+                "\nExecution: rows={} time={:.3}ms",
+                stats.output_rows, stats.total_ms
+            ));
+        }
         Ok(QueryResult::Rows {
             columns: vec!["plan".to_string()],
             rows: plan
@@ -388,10 +431,25 @@ impl SqlEngine {
     }
 
     fn build_from(&self, select: &Select) -> Result<Table, SqlError> {
+        self.build_from_inner(select, None)
+    }
+
+    fn build_from_inner(
+        &self,
+        select: &Select,
+        mut stats: Option<&mut ExecutionStats>,
+    ) -> Result<Table, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.scan_rows.push(left.rows.len());
+        }
         let mut joined = qualify_table(left, &left_qualifier);
         for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.scan_rows.push(right.rows.len());
+            }
+            let start = stats.is_some().then(Instant::now);
             let right = qualify_table(right, &qualifier);
             joined = join_tables(
                 &joined,
@@ -400,16 +458,31 @@ impl SqlEngine {
                 join.kind,
                 self.join_strategy,
             )?;
+            if let (Some(stats), Some(start)) = (stats.as_deref_mut(), start) {
+                stats.join_rows.push(joined.rows.len());
+                stats.join_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
         }
         Ok(joined)
     }
 
-    fn build_plan(&self, select: &Select) -> Result<String, SqlError> {
+    fn build_plan(
+        &self,
+        select: &Select,
+        stats: Option<&ExecutionStats>,
+    ) -> Result<String, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
         let mut left_table = qualify_table_schema(left, &left_qualifier);
-        let mut plan = format!("Scan {}", source_label(left.name.as_str(), &left_qualifier));
-        for (join, (right, qualifier)) in select.joins.iter().zip(sources) {
+        let mut scan_index = 0;
+        let mut plan = scan_plan(
+            &source_label(left.name.as_str(), &left_qualifier),
+            stats,
+            scan_index,
+        );
+        scan_index += 1;
+        for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
+        {
             let right_table = qualify_table_schema(right, &qualifier);
             let pairs = match &join.condition {
                 JoinCondition::Using(names) => using_pairs(&left_table, &right_table, names)?,
@@ -441,7 +514,7 @@ impl SqlEngine {
                 JoinCondition::None => Vec::new(),
             };
             let uses_hash = use_hash_join(self.join_strategy, &hash_pairs);
-            let header = join_plan_header(
+            let mut header = join_plan_header(
                 join,
                 uses_hash,
                 &hash_pairs,
@@ -449,7 +522,20 @@ impl SqlEngine {
                 &right_table,
                 predicate.as_ref(),
             );
-            let right_plan = format!("Scan {}", source_label(right.name.as_str(), &qualifier));
+            if let Some(stats) = stats {
+                if let (Some(rows), Some(ms)) = (
+                    stats.join_rows.get(join_index),
+                    stats.join_ms.get(join_index),
+                ) {
+                    header.push_str(&format!(" actual rows={rows} time={ms:.3}ms"));
+                }
+            }
+            let right_plan = scan_plan(
+                &source_label(right.name.as_str(), &qualifier),
+                stats,
+                scan_index,
+            );
+            scan_index += 1;
             plan = format!(
                 "{header}\n{}\n{}",
                 indent_plan(&plan, 2),
@@ -465,12 +551,39 @@ impl SqlEngine {
 
         let bound = bind_select(select, &left_table)?;
         if bound.filter.is_some() {
-            plan = format!("Filter\n{}", indent_plan(&plan, 2));
+            let label = stats.map_or_else(
+                || "Filter".to_string(),
+                |stats| {
+                    format!(
+                        "Filter actual rows={} time={:.3}ms",
+                        stats.filter_rows, stats.filter_ms
+                    )
+                },
+            );
+            plan = format!("{label}\n{}", indent_plan(&plan, 2));
         }
         if bound.is_grouped() {
-            plan = format!("Aggregate\n{}", indent_plan(&plan, 2));
+            let label = stats.map_or_else(
+                || "Aggregate".to_string(),
+                |stats| {
+                    format!(
+                        "Aggregate actual groups={} time={:.3}ms",
+                        stats.aggregate_groups, stats.aggregate_ms
+                    )
+                },
+            );
+            plan = format!("{label}\n{}", indent_plan(&plan, 2));
             if bound.having.is_some() {
-                plan = format!("Having\n{}", indent_plan(&plan, 2));
+                let label = stats.map_or_else(
+                    || "Having".to_string(),
+                    |stats| {
+                        format!(
+                            "Having actual groups={} time={:.3}ms",
+                            stats.having_groups, stats.having_ms
+                        )
+                    },
+                );
+                plan = format!("{label}\n{}", indent_plan(&plan, 2));
             }
         }
         let projection = bound
@@ -479,16 +592,36 @@ impl SqlEngine {
             .map(|item| item.name().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        plan = format!("Project [{projection}]\n{}", indent_plan(&plan, 2));
+        let label = stats.map_or_else(
+            || format!("Project [{projection}]"),
+            |stats| {
+                format!(
+                    "Project [{projection}] actual rows={} time={:.3}ms",
+                    stats.project_rows, stats.project_ms
+                )
+            },
+        );
+        plan = format!("{label}\n{}", indent_plan(&plan, 2));
         if !bound.order_by.is_empty() {
-            plan = format!(
-                "Sort ({} key(s))\n{}",
-                bound.order_by.len(),
-                indent_plan(&plan, 2)
+            let label = stats.map_or_else(
+                || format!("Sort ({} key(s))", bound.order_by.len()),
+                |stats| {
+                    format!(
+                        "Sort ({} key(s)) actual rows={} time={:.3}ms",
+                        bound.order_by.len(),
+                        stats.sort_rows,
+                        stats.sort_ms
+                    )
+                },
             );
+            plan = format!("{label}\n{}", indent_plan(&plan, 2));
         }
         if let Some(limit) = bound.limit {
-            plan = format!("Limit {limit}\n{}", indent_plan(&plan, 2));
+            let label = stats.map_or_else(
+                || format!("Limit {limit}"),
+                |stats| format!("Limit {limit} actual rows={}", stats.output_rows),
+            );
+            plan = format!("{label}\n{}", indent_plan(&plan, 2));
         }
         Ok(plan)
     }
@@ -907,6 +1040,14 @@ fn source_label(table: &str, qualifier: &str) -> String {
     }
 }
 
+fn scan_plan(label: &str, stats: Option<&ExecutionStats>, index: usize) -> String {
+    let mut node = format!("Scan {label}");
+    if let Some(rows) = stats.and_then(|stats| stats.scan_rows.get(index)) {
+        node.push_str(&format!(" actual rows={rows}"));
+    }
+    node
+}
+
 fn indent_plan(plan: &str, spaces: usize) -> String {
     let prefix = " ".repeat(spaces);
     plan.lines()
@@ -1075,6 +1216,15 @@ fn passes_filter(filter: Option<&ExecExpr>, schema: &Schema, row: &Row) -> Resul
 }
 
 fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlError> {
+    execute_select_inner(table, plan, None)
+}
+
+fn execute_select_inner(
+    table: &Table,
+    plan: &BoundSelect,
+    mut stats: Option<&mut ExecutionStats>,
+) -> Result<QueryResult, SqlError> {
+    let filter_start = stats.is_some().then(Instant::now);
     let filtered: Vec<Row> = table
         .rows
         .iter()
@@ -1086,12 +1236,18 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
+    if let (Some(stats), Some(start)) = (stats.as_deref_mut(), filter_start) {
+        stats.filter_rows = filtered.len();
+        stats.filter_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
 
     if plan.is_grouped() {
-        return execute_grouped(table, plan, &filtered);
+        return execute_grouped_inner(table, plan, &filtered, stats);
     }
 
     let mut rows = filtered;
+    let sort_start = stats.is_some().then(Instant::now);
+    let sort_rows = stats.is_some().then_some(rows.len());
     if !plan.order_by.is_empty() {
         let mut keyed = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1108,7 +1264,13 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
         keyed.sort_by(|left, right| compare_keys(&left.0, &right.0, plan));
         rows = keyed.into_iter().map(|(_, row)| row).collect();
     }
+    if let (Some(stats), Some(start), Some(rows)) = (stats.as_deref_mut(), sort_start, sort_rows) {
+        stats.sort_rows = rows;
+        stats.sort_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
 
+    let project_start = stats.is_some().then(Instant::now);
+    let project_rows = rows.len();
     let columns = plan
         .items
         .iter()
@@ -1123,8 +1285,15 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
         }
         output.push(projected);
     }
+    if let (Some(stats), Some(start)) = (stats.as_deref_mut(), project_start) {
+        stats.project_rows = project_rows;
+        stats.project_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
     if let Some(limit) = plan.limit {
         output.truncate(limit);
+    }
+    if let Some(stats) = stats {
+        stats.output_rows = output.len();
     }
     Ok(QueryResult::Rows {
         columns,
@@ -1132,10 +1301,11 @@ fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlE
     })
 }
 
-fn execute_grouped(
+fn execute_grouped_inner(
     table: &Table,
     plan: &BoundSelect,
     rows: &[Row],
+    mut stats: Option<&mut ExecutionStats>,
 ) -> Result<QueryResult, SqlError> {
     let columns = plan
         .items
@@ -1143,6 +1313,7 @@ fn execute_grouped(
         .map(|item| item.name().to_string())
         .collect::<Vec<_>>();
 
+    let aggregate_start = stats.is_some().then(Instant::now);
     let groups = if plan.group_by.is_empty() {
         vec![Group {
             rows: rows.iter().collect(),
@@ -1159,7 +1330,12 @@ fn execute_grouped(
         }
         grouped.into_values().map(|rows| Group { rows }).collect()
     };
+    if let (Some(stats), Some(start)) = (stats.as_deref_mut(), aggregate_start) {
+        stats.aggregate_groups = groups.len();
+        stats.aggregate_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
 
+    let having_start = stats.is_some().then(Instant::now);
     let mut kept = Vec::new();
     for group in groups {
         if let Some(having) = &plan.having {
@@ -1170,7 +1346,13 @@ fn execute_grouped(
         }
         kept.push(group);
     }
+    if let (Some(stats), Some(start)) = (stats.as_deref_mut(), having_start) {
+        stats.having_groups = kept.len();
+        stats.having_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
 
+    let project_start = stats.is_some().then(Instant::now);
+    let project_rows = kept.len();
     let mut keyed = Vec::with_capacity(kept.len());
     for group in kept {
         let mut projected = Vec::with_capacity(plan.items.len());
@@ -1183,15 +1365,28 @@ fn execute_grouped(
         }
         keyed.push((keys, projected));
     }
+    if let (Some(stats), Some(start)) = (stats.as_deref_mut(), project_start) {
+        stats.project_rows = project_rows;
+        stats.project_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
 
+    let sort_start = stats.is_some().then(Instant::now);
+    let sort_rows = keyed.len();
     if !plan.order_by.is_empty() {
         validate_sort_types(&keyed, plan.order_by.len())?;
         keyed.sort_by(|left, right| compare_keys(&left.0, &right.0, plan));
+    }
+    if let (Some(stats), Some(start)) = (stats.as_deref_mut(), sort_start) {
+        stats.sort_rows = sort_rows;
+        stats.sort_ms = start.elapsed().as_secs_f64() * 1000.0;
     }
 
     let mut output: Vec<Vec<Value>> = keyed.into_iter().map(|(_, row)| row).collect();
     if let Some(limit) = plan.limit {
         output.truncate(limit);
+    }
+    if let Some(stats) = stats {
+        stats.output_rows = output.len();
     }
     Ok(QueryResult::Rows {
         columns,
