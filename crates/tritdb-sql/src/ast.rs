@@ -223,6 +223,34 @@ pub struct Select {
     pub under_repair: Option<Vec<String>>,
 }
 
+/// One common table expression.
+///
+/// `seed UNION [ALL] step`; the recursive `step` may reference `name`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cte {
+    /// CTE name, usable as a table in `seed`, `step`, and the outer query.
+    pub name: String,
+    /// Optional explicit column names.
+    pub columns: Vec<String>,
+    /// Anchor query.
+    pub seed: Select,
+    /// Recursive step.
+    pub step: Select,
+    /// `UNION ALL` keeps duplicates; plain `UNION` removes them.
+    pub union_all: bool,
+}
+
+/// `WITH [RECURSIVE] cte, ... SELECT ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct With {
+    /// `RECURSIVE` was present.
+    pub recursive: bool,
+    /// Common table expressions, evaluated left to right.
+    pub ctes: Vec<Cte>,
+    /// Outer query.
+    pub query: Box<Select>,
+}
+
 /// One `SET` assignment in an `UPDATE`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Assignment {
@@ -283,6 +311,8 @@ pub enum Statement {
     },
     /// `SELECT`.
     Select(Select),
+    /// `WITH [RECURSIVE] ... SELECT`.
+    With(Box<With>),
     /// `EXPLAIN SELECT`.
     Explain(Select),
     /// `EXPLAIN SEXPR SELECT`: read-only parenthesized plan output.

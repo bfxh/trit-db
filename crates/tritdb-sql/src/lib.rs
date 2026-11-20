@@ -11,7 +11,7 @@ mod plan;
 mod stats;
 mod storage;
 
-pub use ast::{AggregateKind, ColumnDef, Expr, OrderBy, Select, SelectItem, Statement};
+pub use ast::{AggregateKind, ColumnDef, Cte, Expr, OrderBy, Select, SelectItem, Statement, With};
 pub use engine::{JoinStrategy, QueryResult, SqlEngine};
 pub use error::SqlError;
 pub use parser::parse_script;

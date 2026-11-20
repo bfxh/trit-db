@@ -528,3 +528,102 @@ fn prob_sum_multiplies_survival_probabilities() {
         stdout(&output)
     );
 }
+
+#[test]
+fn with_recursive_reaches_a_fixpoint() {
+    let dir = TempDir::new("sql-recursive");
+    let db = dir.join("rec.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL); \
+         INSERT INTO edges VALUES (0,1),(1,2),(2,3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH RECURSIVE reach(node) AS (\
+           SELECT src FROM edges WHERE src = 0 \
+           UNION SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node\
+         ) SELECT node FROM reach ORDER BY node;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["0", "1", "2", "3"] {
+        assert!(
+            text.lines().any(|line| line == expected),
+            "missing {expected}: {text}"
+        );
+    }
+
+    // UNION ALL walks a tree without revisiting nodes.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE tree (parent INT NOT NULL, child INT NOT NULL); \
+         INSERT INTO tree VALUES (0,1),(0,2),(1,3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH RECURSIVE walk(node) AS (\
+           SELECT child FROM tree WHERE parent = 0 \
+           UNION ALL SELECT t.child FROM tree t JOIN walk w ON t.parent = w.node\
+         ) SELECT node FROM walk ORDER BY node;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert_eq!(
+        text.lines().filter(|line| *line == "1").count(),
+        1,
+        "UNION ALL must not duplicate the tree node: {text}"
+    );
+    assert!(text.lines().any(|line| line == "3"), "out: {text}");
+}
+
+#[test]
+fn with_recursive_reports_column_and_fixpoint_errors() {
+    let dir = TempDir::new("sql-recursive-errors");
+    let db = dir.join("rec.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH RECURSIVE w(a, b) AS (SELECT id FROM t UNION SELECT id FROM t) SELECT a FROM w;",
+    ]);
+    assert!(!output.status.success(), "column mismatch must fail");
+    assert!(stderr(&output).contains("declares 2 column(s)"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH RECURSIVE w(n) AS (SELECT id FROM t UNION ALL SELECT n + 1 FROM w) SELECT n FROM w;",
+    ]);
+    assert!(!output.status.success(), "no fixpoint must fail");
+    assert!(stderr(&output).contains("did not reach a fixed point"));
+}
