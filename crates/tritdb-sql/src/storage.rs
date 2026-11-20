@@ -56,6 +56,7 @@ fn type_tag(data_type: DataType) -> u8 {
         DataType::Int => 0,
         DataType::Text => 1,
         DataType::Bool => 2,
+        DataType::Logic => 3,
     }
 }
 
@@ -64,6 +65,7 @@ fn type_from_tag(tag: u8) -> Option<DataType> {
         0 => Some(DataType::Int),
         1 => Some(DataType::Text),
         2 => Some(DataType::Bool),
+        3 => Some(DataType::Logic),
         _ => None,
     }
 }
@@ -142,7 +144,7 @@ fn encode_value(
             out.push(2);
             put_text(out, value)
         }
-        Value::Bool(value) if data_type == DataType::Bool => {
+        Value::Bool(value) if matches!(data_type, DataType::Bool | DataType::Logic) => {
             out.push(3);
             out.push(u8::from(*value));
             Ok(())

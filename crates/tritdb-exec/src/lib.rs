@@ -62,6 +62,8 @@ pub enum DataType {
     Text,
     /// Boolean.
     Bool,
+    /// K3 annotation column (`LOGIC K3`). Stored as `TRUE`/`FALSE`/`NULL`.
+    Logic,
 }
 
 impl DataType {
@@ -71,6 +73,7 @@ impl DataType {
             "INT" | "INTEGER" | "BIGINT" => Some(DataType::Int),
             "TEXT" | "VARCHAR" | "STRING" => Some(DataType::Text),
             "BOOL" | "BOOLEAN" => Some(DataType::Bool),
+            "LOGIC" | "K3" => Some(DataType::Logic),
             _ => None,
         }
     }
@@ -81,6 +84,7 @@ impl DataType {
             DataType::Int => "INT",
             DataType::Text => "TEXT",
             DataType::Bool => "BOOL",
+            DataType::Logic => "LOGIC",
         }
     }
 
@@ -92,6 +96,7 @@ impl DataType {
             (DataType::Int, Value::Int(value)) => Ok(Value::Int(value)),
             (DataType::Text, Value::Text(value)) => Ok(Value::Text(value)),
             (DataType::Bool, Value::Bool(value)) => Ok(Value::Bool(value)),
+            (DataType::Logic, Value::Bool(value)) => Ok(Value::Bool(value)),
             (expected, actual) => Err(ExecError::TypeMismatch {
                 expected: expected.name(),
                 actual: actual.type_name(),

@@ -36,7 +36,19 @@ tritdb repair --facts 3 --denial 0,1 --denial 1,2 --query 0,1
 
 表达式语法：变量 `a`..`z` / `vN` / `N`，`NOT`/`!`、`AND`/`&&`、`OR`/`||`、括号、`TRUE`/`FALSE`。
 
-## 3. 语义
+## 3. 注解列
+
+```sql
+CREATE TABLE reading (id INT NOT NULL, status LOGIC K3);
+INSERT INTO reading VALUES (1, TRUE), (2, FALSE), (3, NULL);
+SELECT id, truth(status) AS s FROM reading;
+-- 1 TRUE / 2 FALSE / 3 UNKNOWN
+SELECT id FROM reading WHERE status IS UNKNOWN;
+```
+
+`LOGIC K3` 列按 `TRUE`/`FALSE`/`NULL` 存储；`truth(expr)` 是把三值投影成 `TRUE`/`FALSE`/`UNKNOWN` 的语法糖（内部展开为 `CASE`）。
+
+## 4. 语义
 
 | 域 | 说明 |
 |---|---|
@@ -48,17 +60,17 @@ tritdb repair --facts 3 --denial 0,1 --denial 1,2 --query 0,1
 - `count_models`：变量 ≤ 32，DPLL 精确计数（部分求值 + 短路 + 自由变量一次乘回），超限 `TooManyVars`；
 - `under_repair`：总事实 ≤ 64；按 denial 连通分量分解，每个分量 ≤ 16；修复 = 最大一致子集，返回 `Certain / Impossible / Contingent`。
 
-## 4. 验收
+## 5. 验收
 
 ```bash
 cargo test -p tritdb-exec ann          # 5 passed
 cargo test -p tritdb --test ann_cli    # 2 passed
 ```
 
-## 5. 还没做
+## 6. 还没做
 
 - SQL 只支持最小 `UNDER REPAIR ON (key)`：按单列函数依赖 `key -> 其他列` 分组，冲突组整组丢弃；完整的 UNIQUE/FD/否定约束系统仍未做；
-- 注解列存储与执行器接线（当前只在库层与 CLI 使用）；
+- Belnap / Łukasiewicz / ℕ 列类型与存储编码（当前只接 `LOGIC K3`，底层复用 Bool/Null）；
 - BDD 与组件级计数仍未做（当前 DPLL，变量上限 32）；
 - `under_repair` 的组件分解已做（按 denial 连通分量）；增量修复与更优的 MCS 枚举仍未做；
 - 概率/模糊聚合与 `Łukasiewicz` 的更多 t-norm。
