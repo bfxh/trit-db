@@ -6,6 +6,7 @@
 //! when they appear as scalar values.
 
 pub mod ann;
+pub mod graph;
 
 use std::cmp::Ordering;
 
