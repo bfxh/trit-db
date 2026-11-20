@@ -138,3 +138,41 @@ fn plain_checkpoint_does_not_create_history() {
     };
     assert!(!history.exists());
 }
+
+#[test]
+fn prune_history_keeps_only_the_newest_archives() {
+    let dir = TempDir::new("txn-pitr-prune");
+    let wal = dir.join("pitr.wal");
+    let store = TxnStore::open(&wal).expect("open");
+
+    let mut first_lsn = 0;
+    for i in 0..2 {
+        first_lsn = put(&store, &format!("a{i}"), b"1");
+    }
+    store.checkpoint_archive().expect("archive 1");
+
+    for i in 0..2 {
+        put(&store, &format!("b{i}"), b"2");
+    }
+    store.checkpoint_archive().expect("archive 2");
+
+    let mut last_lsn = 0;
+    for i in 0..2 {
+        last_lsn = put(&store, &format!("c{i}"), b"3");
+    }
+    store.checkpoint_archive().expect("archive 3");
+    drop(store);
+
+    let info = TxnStore::prune_history(&wal, 2).expect("prune");
+    assert_eq!(info.removed.len(), 1);
+    assert_eq!(info.kept.len(), 2);
+
+    let error = TxnStore::recover_at(&wal, first_lsn).expect_err("oldest archive removed");
+    match error {
+        TxnError::PitrBeforeHistory { target_lsn, .. } => assert_eq!(target_lsn, first_lsn),
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let view = TxnStore::recover_at(&wal, last_lsn).expect("newest archive survives");
+    assert_eq!(view.entries.len(), 6);
+}

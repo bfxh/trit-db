@@ -271,6 +271,15 @@ pub struct PitrView {
     pub discarded_txns: usize,
 }
 
+/// Result of pruning archived checkpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneInfo {
+    /// Checkpoint LSNs removed, oldest first.
+    pub removed: Vec<u64>,
+    /// Checkpoint LSNs kept, oldest first.
+    pub kept: Vec<u64>,
+}
+
 /// A store with one WAL writer and concurrent logical transactions.
 pub struct TxnStore {
     path: PathBuf,
@@ -559,6 +568,35 @@ impl TxnStore {
             entries: recovered.state.into_iter().collect(),
             committed_txns: recovered.info.committed_txns,
             discarded_txns: recovered.info.discarded_txns,
+        })
+    }
+
+    /// Removes the oldest archived checkpoints, keeping the newest `keep`.
+    ///
+    /// Only complete archive pairs are considered. Removing an archive means
+    /// [`TxnStore::recover_at`] can no longer target an LSN at or before the
+    /// removed checkpoint; the live snapshot and newer archives are untouched.
+    pub fn prune_history(path: &Path, keep: usize) -> Result<PruneInfo, TxnError> {
+        let history = history_dir_for(path);
+        let archives = list_archives(&history)?;
+        if archives.len() <= keep {
+            return Ok(PruneInfo {
+                removed: Vec::new(),
+                kept: archives,
+            });
+        }
+        let split = archives.len() - keep;
+        let (remove, keep_lsns) = archives.split_at(split);
+        for lsn in remove {
+            let (snap, wal) = archive_paths(&history, *lsn);
+            // A missing `.snap` is not fatal: the `.wal` is the marker used by
+            // `list_archives`, and a half archive is already unusable.
+            let _ = fs::remove_file(&snap);
+            fs::remove_file(&wal)?;
+        }
+        Ok(PruneInfo {
+            removed: remove.to_vec(),
+            kept: keep_lsns.to_vec(),
         })
     }
 
