@@ -86,13 +86,13 @@ struct PlanEstimate {
     output_rows: u64,
 }
 
-/// A single-table `WHERE` predicate moved to one source scan.
+/// Source-local `WHERE` conjuncts moved to source scans.
 #[derive(Clone, Debug)]
 struct PushdownPlan {
-    /// Source index in base-table + join order.
-    source: Option<usize>,
-    /// Predicate to bind against that source's qualified schema.
-    filter: Option<Expr>,
+    /// Combined predicate for each source in base-table + join order.
+    ///
+    /// Multiple conjuncts assigned to the same source are joined with `AND`.
+    filters: Vec<Option<Expr>>,
     /// Part of the original filter that remains above the join.
     residual: Option<Expr>,
 }
@@ -695,7 +695,7 @@ impl SqlEngine {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
         let mut joined = qualify_table(left, &left_qualifier);
-        let left_filtered = pushdown.source == Some(0);
+        let left_filtered = pushdown_filter(pushdown, 0).is_some();
         if let Some(filter) = pushdown_filter(pushdown, 0) {
             joined = filter_table(joined, filter)?;
         }
@@ -718,7 +718,7 @@ impl SqlEngine {
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
         {
             let mut right = qualify_table(right, &qualifier);
-            let right_filtered = pushdown.source == Some(join_index + 1);
+            let right_filtered = pushdown_filter(pushdown, join_index + 1).is_some();
             if let Some(filter) = pushdown_filter(pushdown, join_index + 1) {
                 right = filter_table(right, filter)?;
             }
@@ -776,7 +776,7 @@ impl SqlEngine {
         let mut scan_index = 0;
         let left_filtered = stats
             .and_then(|stats| stats.scan_filters.get(scan_index).copied())
-            .unwrap_or(pushdown.source == Some(scan_index));
+            .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
         let mut plan = scan_plan(
             &source_label(left.name.as_str(), &left_qualifier),
             stats,
@@ -845,7 +845,7 @@ impl SqlEngine {
             }
             let right_filtered = stats
                 .and_then(|stats| stats.scan_filters.get(scan_index).copied())
-                .unwrap_or(pushdown.source == Some(scan_index));
+                .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
             let right_plan = scan_plan(
                 &source_label(right.name.as_str(), &qualifier),
                 stats,
@@ -999,20 +999,20 @@ fn qualify_table_schema(table: &Table, qualifier: &str) -> Table {
     }
 }
 
-/// Chooses a single-source `WHERE` predicate for scan pushdown.
+/// Splits top-level `AND` conjuncts and assigns source-local ones to scans.
 ///
-/// The whole predicate is moved only when every column is explicitly
-/// qualified by exactly one source and every join is inner or cross. Moving a
-/// predicate across an outer join, or one that references multiple sources,
-/// changes semantics or is not a source-local filter.
+/// A conjunct is moved only when every column is explicitly qualified by
+/// exactly one source and every join is inner or cross. Conjuncts that mix
+/// sources, use unqualified columns, or cross an outer join stay in the
+/// residual `WHERE`. Multiple conjuncts assigned to one source are combined
+/// with `AND` and evaluated before that source enters the join.
 fn plan_filter_pushdown(select: &Select) -> PushdownPlan {
-    let no_push = || PushdownPlan {
-        source: None,
-        filter: None,
-        residual: select.filter.clone(),
-    };
+    let mut filters = vec![None; select.joins.len() + 1];
     let Some(filter) = select.filter.as_ref() else {
-        return no_push();
+        return PushdownPlan {
+            filters,
+            residual: None,
+        };
     };
     if select.joins.is_empty()
         || select
@@ -1020,23 +1020,62 @@ fn plan_filter_pushdown(select: &Select) -> PushdownPlan {
             .iter()
             .any(|join| !matches!(join.kind, JoinKind::Inner | JoinKind::Cross))
     {
-        return no_push();
+        return PushdownPlan {
+            filters,
+            residual: Some(filter.clone()),
+        };
     }
 
     let qualifiers = source_qualifiers(select);
-    let mut referenced = BTreeSet::new();
-    if !expr_sources(filter, &mut referenced) || referenced.len() != 1 {
-        return no_push();
+    let mut conjuncts = Vec::new();
+    split_conjuncts(filter.clone(), &mut conjuncts);
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        let mut referenced = BTreeSet::new();
+        if !expr_sources(&conjunct, &mut referenced) || referenced.len() != 1 {
+            residual.push(conjunct);
+            continue;
+        }
+        let source = referenced.iter().next().expect("one source");
+        let Some(index) = qualifiers.iter().position(|qualifier| qualifier == source) else {
+            residual.push(conjunct);
+            continue;
+        };
+        filters[index] = match filters[index].take() {
+            Some(existing) => Some(and_expr(existing, conjunct)),
+            None => Some(conjunct),
+        };
     }
-    let source = referenced.iter().next().expect("one source");
-    let Some(index) = qualifiers.iter().position(|qualifier| qualifier == source) else {
-        return no_push();
-    };
     PushdownPlan {
-        source: Some(index),
-        filter: Some(filter.clone()),
-        residual: None,
+        filters,
+        residual: conjoin(residual),
     }
+}
+
+fn split_conjuncts(expr: Expr, conjuncts: &mut Vec<Expr>) {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            split_conjuncts(*left, conjuncts);
+            split_conjuncts(*right, conjuncts);
+        }
+        other => conjuncts.push(other),
+    }
+}
+
+fn and_expr(left: Expr, right: Expr) -> Expr {
+    Expr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn conjoin(exprs: Vec<Expr>) -> Option<Expr> {
+    exprs.into_iter().reduce(and_expr)
 }
 
 fn source_qualifiers(select: &Select) -> Vec<String> {
@@ -1111,11 +1150,7 @@ fn select_with_filter(select: &Select, filter: Option<Expr>) -> Select {
 }
 
 fn pushdown_filter(pushdown: &PushdownPlan, index: usize) -> Option<&Expr> {
-    if pushdown.source == Some(index) {
-        pushdown.filter.as_ref()
-    } else {
-        None
-    }
+    pushdown.filters.get(index).and_then(Option::as_ref)
 }
 
 fn filter_table(table: Table, filter: &Expr) -> Result<Table, SqlError> {

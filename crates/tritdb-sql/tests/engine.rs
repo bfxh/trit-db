@@ -1885,7 +1885,7 @@ fn explain_analyze_reports_actual_rows_and_times() {
         .execute_script(
             "EXPLAIN ANALYZE SELECT a.v FROM a JOIN b \
              ON a.id = b.id AND b.w <> 'b2x' \
-             WHERE a.id >= 1 AND b.w <> 'b2x' ORDER BY a.v LIMIT 1;",
+             WHERE a.id >= 1 OR b.w <> 'b2x' ORDER BY a.v LIMIT 1;",
         )
         .expect("explain analyze join");
     let plan = plan_text(&analyzed[0]);
@@ -2050,7 +2050,10 @@ fn inner_join_pushes_single_source_where_filter_to_scan() {
     assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
 
     let outer = engine
-        .execute_script("EXPLAIN SELECT a.v, b.w FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a LEFT JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
         .expect("outer join plan");
     let plan = plan_text(&outer[0]);
     assert!(
@@ -2066,16 +2069,206 @@ fn inner_join_pushes_single_source_where_filter_to_scan() {
     let mixed = engine
         .execute_script(
             "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
-             WHERE a.id = 2 AND b.id = 2;",
+             WHERE a.id = b.id;",
         )
-        .expect("mixed-source filter plan");
+        .expect("multi-source predicate plan");
     let plan = plan_text(&mixed[0]);
     assert!(
         plan.contains("Scan a est rows=3"),
         "unexpected plan: {plan}"
     );
     assert!(
+        plan.contains("Filter est rows=2"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
+}
+
+#[test]
+fn inner_join_splits_conjunctive_where_filters_across_scans() {
+    let dir = TempDir::new("sql-conjunctive-pushdown");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT, v TEXT); \
+             CREATE TABLE b (id INT, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let split = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("explain split conjunctive filter");
+    let plan = plan_text(&split[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let split_actual = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("explain analyze split conjunctive filter");
+    let plan = plan_text(&split_actual[0]);
+    assert!(
+        plan.contains("Scan a filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let selected = engine
+        .execute_script(
+            "SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("select split conjunctive filter");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let cross = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a CROSS JOIN b \
+             WHERE a.id = 2 AND b.w = 'b2';",
+        )
+        .expect("explain cross join conjunctive filter");
+    let plan = plan_text(&cross[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (cross) est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let same_source = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND a.v = 'a2' AND b.w = 'b2';",
+        )
+        .expect("explain same-source conjuncts");
+    let plan = plan_text(&same_source[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let residual = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.id = 2 AND a.id = b.id;",
+        )
+        .expect("explain residual conjunct");
+    let plan = plan_text(&residual[0]);
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
         plan.contains("Filter est rows=1"),
+        "unexpected plan: {plan}"
+    );
+
+    let residual_actual = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 AND b.id = 2 AND a.id = b.id;",
+        )
+        .expect("explain analyze residual conjunct");
+    let plan = plan_text(&residual_actual[0]);
+    assert!(
+        plan.contains("Scan a filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b filtered actual rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("NestedLoop (inner) on=expr actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter actual rows=1 time="),
+        "unexpected plan: {plan}"
+    );
+
+    let unsplittable = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id \
+             WHERE a.id = 2 OR b.id = 2;",
+        )
+        .expect("explain unsplittable OR filter");
+    let plan = plan_text(&unsplittable[0]);
+    assert!(
+        plan.contains("Scan a est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Filter est rows=2"),
         "unexpected plan: {plan}"
     );
     assert!(!plan.contains("filtered"), "unexpected plan: {plan}");
