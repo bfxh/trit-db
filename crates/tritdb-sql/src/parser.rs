@@ -63,6 +63,14 @@ impl Parser {
         self.tokens.get(self.pos + offset)
     }
 
+    fn expect_word(&mut self, word: &str) -> Result<(), SqlError> {
+        if self.eat_word(word) {
+            Ok(())
+        } else {
+            Err(self.error(format!("expected {word}")))
+        }
+    }
+
     fn offset(&self) -> usize {
         self.peek().map_or(0, |token| token.offset)
     }
@@ -468,6 +476,17 @@ impl Parser {
             });
         }
 
+        let under_repair = if self.eat_word("under") {
+            self.expect_word("repair")?;
+            self.expect_keyword(Keyword::On)?;
+            self.expect_symbol(Symbol::LParen)?;
+            let key = self.parse_ident()?;
+            self.expect_symbol(Symbol::RParen)?;
+            Some(key)
+        } else {
+            None
+        };
+
         let filter = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -531,6 +550,7 @@ impl Parser {
             having,
             order_by,
             limit,
+            under_repair,
         }))
     }
 
@@ -577,9 +597,11 @@ impl Parser {
             Some(self.parse_ident()?)
         } else {
             match self.peek().map(|token| &token.kind) {
-                Some(TokenKind::Word(_)) | Some(TokenKind::QuotedIdent(_)) => {
+                // `UNDER REPAIR` starts right after the table (and aliases).
+                Some(TokenKind::Word(word)) if !word.eq_ignore_ascii_case("under") => {
                     Some(self.parse_ident()?)
                 }
+                Some(TokenKind::QuotedIdent(_)) => Some(self.parse_ident()?),
                 _ => None,
             }
         };

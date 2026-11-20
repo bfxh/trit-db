@@ -57,7 +57,7 @@ cargo test -p tritdb --test ann_cli    # 2 passed
 
 ## 5. 还没做
 
-- `UNDER REPAIR` 还没有进 SQL parser：需要先有 UNIQUE/FD/否定约束才能定义“修复”，当前只提供库 API `under_repair`；
+- SQL 只支持最小 `UNDER REPAIR ON (key)`：按单列函数依赖 `key -> 其他列` 分组，冲突组整组丢弃；完整的 UNIQUE/FD/否定约束系统仍未做；
 - 注解列存储与执行器接线（当前只在库层与 CLI 使用）；
 - BDD 与组件级计数仍未做（当前 DPLL，变量上限 32）；
 - `under_repair` 的组件分解已做（按 denial 连通分量）；增量修复与更优的 MCS 枚举仍未做；
