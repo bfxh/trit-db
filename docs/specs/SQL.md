@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪、计划入口的常量折叠与恒真条件简化、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
 
 ## 1. 范围
 
@@ -39,7 +39,7 @@ DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；显式限定列且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪；不支持子查询。
+- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；显式限定列且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪；计划入口会折叠不含列/聚合的常量表达式，并移除恒真的 `WHERE` / `HAVING`；不支持子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
 - 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE 重写整张表。
@@ -114,6 +114,7 @@ FROM name [AS alias]
 - hash 路径使用右表 hash 桶 + 左表探测；nested loop 路径直接做左右行对匹配；非等值 `ON`/`CROSS JOIN`/逗号源只能用嵌套循环，`CROSS JOIN` 直接产生左右行对的笛卡尔积，左右表都物化为临时结果。hash join 的桶只存右表行号，输出仍按左行优先、`RIGHT`/`FULL` 的未匹配右行最后追加，和 nested loop 的顺序一致。`ANALYZE` 统计现在参与 `Auto` 的局部 join 选择，但不重排 join 顺序，也不是全局优化器。
 - 当 join 链全部是 `INNER` / `CROSS` 时，`WHERE` 顶层（含括号嵌套）的 `AND` 会被拆成独立合取项：每个只引用一个源表、且列都显式限定（`alias.column` / `table.column`）的合取项下推到该源表扫描；同一源表的多个合取项按原顺序用 `AND` 组合。不可下推的合取项按原顺序重组为残余 `WHERE`，留在 join 后。外连接、`OR` 分支、`NOT` 内部条件、引用多个源表的单个条件、含未限定列的条件仍留在 join 后。下推只减少 join 输入行，不改变内连接/交叉连接的结果行集。完整规则见 [`ADR-009`](../ADR/009-scan-predicate-pushdown.md) 与 [`ADR-010`](../ADR/010-conjunctive-predicate-pushdown.md)。
 - 源表列裁剪是独立的物理优化：当 `SELECT` 不含 `*`、所有列引用都显式限定、且 join 链不含 `USING` / `NATURAL` 时，收集 `SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY` 和 `ON` 引用的列，在源表限定阶段只保留每个源表真正需要的列。某源表没有引用列或引用覆盖全部列时保持完整 schema；出现未限定列、`*`、`USING` 或 `NATURAL` 时整条查询退回完整 schema。裁剪只减少 join 前的行副本宽度和中间结果宽度，源表仍完整加载，扫描 I/O 不减少，结果行集和 join 选择不变。完整规则见 [`ADR-011`](../ADR/011-source-column-pruning.md)。
+- 常量折叠在 `SELECT` / `EXPLAIN` 的计划入口执行：递归折叠 `WHERE`、`HAVING`、`GROUP BY`、`ORDER BY` 和 `JOIN ... ON` 中不含 `Column` / `Aggregate` 的子表达式；成功求值替换为字面量，求值失败保留原表达式，让执行阶段按原语义报错。只做 `TRUE AND x`、`x AND TRUE`、`FALSE OR x`、`x OR FALSE` 四个不改变求值范围的恒等；`WHERE` / `HAVING` 折叠为字面 `TRUE` 时移除该节点，字面 `FALSE` / `NULL` 保留。不折叠 `SELECT` 项，避免未别名常量表达式改变输出列标签。完整规则见 [`ADR-012`](../ADR/012-constant-folding.md)。
 - 执行器默认 `JoinStrategy::Auto`：有等值键时，两侧都有统计则比较 `nested_cost = left_rows * right_rows` 与 `hash_cost = right_rows + left_rows + est_output_rows`，选择成本更低者（平局保留 hash）；缺统计时有等值键走 hash，否则 nested loop。`JoinStrategy::Hash` 强制 hash，`JoinStrategy::NestedLoop` 强制嵌套循环；该开关只通过 `SqlEngine::set_join_strategy` 暴露给基准和差分测试，不是 SQL hint。
 - 输出列标签去掉限定前缀；普通多表 join 遇到同名列会产生重复标签，`USING`/`NATURAL` 的合并列不会重复输出。
 
@@ -136,9 +137,9 @@ ANALYZE [table];
 EXPLAIN SELECT ...;
 ```
 
-- `EXPLAIN` 只接受 `SELECT`；走与真实查询相同的表解析、别名检查和 binder，但不执行、不写表，也不求值表达式。
+- `EXPLAIN` 只接受 `SELECT`；走与真实查询相同的表解析、别名检查、常量折叠和 binder，但不执行查询、不扫描表、不写表；纯常量子表达式会在折叠阶段求值，求值失败则保留原表达式。
 - 返回单列 `plan`，每个节点一行；缩进表示父子关系。
-- 节点包括 `Scan`、`Join`、`Filter`、`Aggregate`、`Having`、`Project`、`Sort`、`Limit`；发生谓词下推时扫描节点显示为 `Scan <label> filtered`，不再生成对应的独立 `Filter` 节点；发生源表列裁剪时在该节点末尾追加 `cols=<col,...>`。
+- 节点包括 `Scan`、`Join`、`Filter`、`Aggregate`、`Having`、`Project`、`Sort`、`Limit`；发生谓词下推时扫描节点显示为 `Scan <label> filtered`，不再生成对应的独立 `Filter` 节点；发生源表列裁剪时在该节点末尾追加 `cols=<col,...>`；`WHERE` / `HAVING` 折叠为字面 `TRUE` 时不生成对应 `Filter` / `Having` 节点，字面 `FALSE` / `NULL` 仍保留。
 - Join 节点显示 `HashJoin` 或 `NestedLoop` 和 join 类型；`HashJoin` 显示 `keys=(...)`，`ON` 中除等值键外还有残余谓词时显示 `residual=yes`；强制 nested loop 时显示 `NestedLoop (...) on=expr`。
 - 当查询涉及的所有源表都有 `ANALYZE` 统计时，节点追加估算：
   - `Scan`：`est rows=N`；无下推时是统计中的精确行数，有下推时是按谓词选择率估算后的扫描输出行数；发生列裁剪时另有 `cols=<col,...>`；
@@ -146,9 +147,9 @@ EXPLAIN SELECT ...;
   - `Filter`、`Project`、`Sort`：`est rows=N`；
   - `Aggregate`、`Having`：`est groups=N`；
   - `Limit`：`est rows=N`。
-- 估算规则是启发式的：等值 join 用 `left_rows * right_rows / max(left_ndv, right_ndv)`（复合键逐键相乘），有残余谓词再乘 0.5；非等值 join 乘 0.1；外连接至少保留被保留侧的行数。过滤 `=` 用 `1/NDV`、`IS NULL` 用 0.1、范围用 0.33、`LIKE` 用 0.1，`AND` 相乘、`OR` 取并集概率，其他谓词默认 0.5。下推的单源扫描过滤复用同一套选择率规则；分组数用分组列 NDV 乘积并受输入行数上限约束，`HAVING` 再乘 0.5。所有基数向上取整。
+- 估算规则是启发式的：等值 join 用 `left_rows * right_rows / max(left_ndv, right_ndv)`（复合键逐键相乘），有残余谓词再乘 0.5；非等值 join 乘 0.1；外连接至少保留被保留侧的行数。过滤 `=` 用 `1/NDV`、`IS NULL` 用 0.1、范围用 0.33、`LIKE` 用 0.1，`AND` 相乘、`OR` 取并集概率，其他谓词默认 0.5；字面 `TRUE` 为 1，字面 `FALSE` / `NULL` 为 0。下推的单源扫描过滤复用同一套选择率规则；分组数用分组列 NDV 乘积并受输入行数上限约束，`HAVING` 再乘 0.5。所有基数向上取整。
 - 没有统计时退回不带数字的静态计划；有统计时，`Auto` 的局部 join 选择、估算展示和真实执行使用同一套统计输入。下推后的扫描行数会先按 `WHERE` 谓词选择率调整，再参与 join 基数和成本选择，因此计划可能从 `HashJoin` 变为 `NestedLoop`（或相反）；估算显示所选算法，但不重排 join 顺序。
-- 该计划仍是当前执行路径的静态文本，不是全局优化器；没有统计采样、直方图、候选计划枚举、join 顺序重排、表达式级列下推或跨 join 列需求传播；也不拆分 `OR` 分支、`NOT` 内部条件或外连接谓词。顶层 `AND` 的单源合取项已按 ADR-010 分别下推，单源显式列需求按 ADR-011 裁剪。
+- 该计划仍是当前执行路径的静态文本，不是全局优化器；没有统计采样、直方图、候选计划枚举、join 顺序重排、表达式级列下推或跨 join 列需求传播；也不拆分 `OR` 分支、`NOT` 内部条件或外连接谓词。顶层 `AND` 的单源合取项已按 ADR-010 分别下推，单源显式列需求按 ADR-011 裁剪，常量折叠按 ADR-012 只处理不含列/聚合的子表达式和四个安全布尔恒等。`FALSE AND x`、`TRUE OR x`、`NOT NOT x`、`SELECT` 项常量、常量传播均不做。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -167,7 +168,7 @@ EXPLAIN ANALYZE SELECT ...;
 - 节点耗时是单次运行测量：Join 只计 `join_tables`，Filter/Aggregate/Having/Project/Sort 分别计对应阶段；`Scan` 不单独计时。
 - 这不是全局代价模型；耗时受机器负载影响，只用于观察当前执行路径。`EXPLAIN SELECT` 的 `est` 是统计估算和 `Auto` 选择结果，`EXPLAIN ANALYZE` 的 `actual` 是本次执行实测，并显示执行时实际选中的 `HashJoin` / `NestedLoop`；下推后的过滤行数会同时影响两侧的静态估算和实测成本选择。
 
-- `WHERE` 只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。内连接/交叉连接会把顶层（含括号嵌套）的 `AND` 拆成合取项，单个显式限定的单源条件在 join 前下推到该源表扫描；外连接、`OR` 分支、`NOT` 内部条件、多源单条件和未限定列仍在 join 后求值。显式限定列的查询会按 ADR-011 同时裁剪源表列。
+- `WHERE` 只保留谓词为 `TRUE` 的行；`FALSE` 和 `UNKNOWN` 都过滤掉。计划入口先折叠不含列/聚合的常量，恒真 `WHERE` 直接移除；内连接/交叉连接会把顶层（含括号嵌套）的 `AND` 拆成合取项，单个显式限定的单源条件在 join 前下推到该源表扫描；外连接、`OR` 分支、`NOT` 内部条件、多源单条件和未限定列仍在 join 后求值。显式限定列的查询会按 ADR-011 同时裁剪源表列。
 - `GROUP BY` 只支持直接列引用（可带表限定）；`NULL` 作为同一个分组键；空输入在有 `GROUP BY` 时产生零组，无 `GROUP BY` 的聚合产生一行（`COUNT` 为 0，`SUM`/`MIN`/`MAX` 为 `NULL`）。
 - `HAVING` 在分组聚合之后、投影/排序之前执行，只保留 `TRUE`；可以引用分组键和聚合表达式，不能引用未分组列。
 - `SELECT` 聚合项支持 `COUNT(*)`、`COUNT(expr)`、`SUM(expr)`、`MIN(expr)`、`MAX(expr)`；分组查询中的裸列必须是 `GROUP BY` 列，标量表达式只能引用分组列。
@@ -316,7 +317,7 @@ tritdb sql --db sql.db --file script.sql
 
 ## 7. 验收门
 
-- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
+- Rust 单元/集成测试覆盖 parser、存储编解码、3VL、NULL 排序、聚合、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL JOIN、NATURAL JOIN/USING、等值 hash join、`ANALYZE` 统计与 DML 失效、`Auto` join 代价选择、`WHERE` 合取项拆分与单源下推、源表列裁剪、常量折叠与恒真条件简化、`EXPLAIN` 估算 / `EXPLAIN ANALYZE` 实际计划与 `JoinStrategy`、逗号 `FROM`、IN/BETWEEN/LIKE、UPDATE、DELETE/重开。
 - Python `sqlite3` 对拍 `tools/crosscheck/sql_oracle.py`，当前 138/138 项通过（132 条 SELECT + 6 条 UPDATE 行数）；`ANALYZE`/计划输出不做 SQLite 对拍。
 - `tritdb-bench sql-join` 提供可复现的规模基准；本机 1024 行时 hash 中位 0.688ms、nested 67.560ms。
 - CI 三平台 `python-crosscheck` job 同时跑向量、CLI 反校验和 SQL 对拍。

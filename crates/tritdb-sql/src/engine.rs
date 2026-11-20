@@ -463,10 +463,11 @@ impl SqlEngine {
     }
 
     fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {
-        let pushdown = plan_filter_pushdown(select);
-        let projection = self.plan_scan_projection(select)?;
-        let table = self.build_from(select, &pushdown, &projection)?;
-        let filtered_select = select_with_filter(select, pushdown.residual.clone());
+        let folded = fold_select(select);
+        let pushdown = plan_filter_pushdown(&folded);
+        let projection = self.plan_scan_projection(&folded)?;
+        let table = self.build_from(&folded, &pushdown, &projection)?;
+        let filtered_select = select_with_filter(&folded, pushdown.residual.clone());
         let plan = bind_select(&filtered_select, &table)?;
         execute_select(&table, &plan)
     }
@@ -511,29 +512,30 @@ impl SqlEngine {
     }
 
     fn explain(&self, select: &Select, analyze: bool) -> Result<QueryResult, SqlError> {
-        let pushdown = plan_filter_pushdown(select);
-        let projection = self.plan_scan_projection(select)?;
-        let filtered_select = select_with_filter(select, pushdown.residual.clone());
+        let folded = fold_select(select);
+        let pushdown = plan_filter_pushdown(&folded);
+        let projection = self.plan_scan_projection(&folded)?;
+        let filtered_select = select_with_filter(&folded, pushdown.residual.clone());
         let estimates = if analyze {
             None
         } else {
-            self.estimate_plan(select, &pushdown)?
+            self.estimate_plan(&folded, &pushdown)?
         };
         let (plan, stats) = if analyze {
             let start = Instant::now();
             let mut stats = ExecutionStats::default();
-            let table = self.build_from_inner(select, &pushdown, &projection, Some(&mut stats))?;
+            let table = self.build_from_inner(&folded, &pushdown, &projection, Some(&mut stats))?;
             let plan = bind_select(&filtered_select, &table)?;
             let result = execute_select_inner(&table, &plan, Some(&mut stats))?;
             if let QueryResult::Rows { rows, .. } = &result {
                 stats.output_rows = rows.len();
             }
             stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let plan = self.build_plan(select, &pushdown, &projection, Some(&stats), None)?;
+            let plan = self.build_plan(&folded, &pushdown, &projection, Some(&stats), None)?;
             (plan, Some(stats))
         } else {
             (
-                self.build_plan(select, &pushdown, &projection, None, estimates.as_ref())?,
+                self.build_plan(&folded, &pushdown, &projection, None, estimates.as_ref())?,
                 None,
             )
         };
@@ -1367,6 +1369,171 @@ fn collect_expr_columns(expr: &Expr, qualifiers: &[String], keep: &mut [BTreeSet
     }
 }
 
+/// Folds constant expressions and removes only trivially redundant boolean
+/// terms. `x AND TRUE`, `TRUE AND x`, `x OR FALSE`, and `FALSE OR x` are exact
+/// in SQL three-valued logic. Expressions with columns or aggregates are left
+/// for the binder; evaluation errors are preserved by the fallback.
+fn fold_select(select: &Select) -> Select {
+    let mut folded = select.clone();
+    if let Some(filter) = folded.filter.take() {
+        let filter = fold_expr(&filter);
+        if !is_true_literal(&filter) {
+            folded.filter = Some(filter);
+        }
+    }
+    if let Some(having) = folded.having.take() {
+        let having = fold_expr(&having);
+        if !is_true_literal(&having) {
+            folded.having = Some(having);
+        }
+    }
+    for expr in &mut folded.group_by {
+        *expr = fold_expr(expr);
+    }
+    for order in &mut folded.order_by {
+        order.expr = fold_expr(&order.expr);
+    }
+    for join in &mut folded.joins {
+        if let JoinCondition::On(expr) = &mut join.condition {
+            *expr = fold_expr(expr);
+        }
+    }
+    folded
+}
+
+fn is_true_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Value::Bool(true)))
+}
+
+fn is_false_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Value::Bool(false)))
+}
+
+fn fold_constant(expr: Expr) -> Expr {
+    if expr_is_constant(&expr) {
+        if let Ok(value) = eval_constant(&expr) {
+            return Expr::Literal(value);
+        }
+    }
+    expr
+}
+
+fn fold_expr(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Literal(_) | Expr::Column { .. } => expr.clone(),
+        Expr::IsNull { expr, negated } => fold_constant(Expr::IsNull {
+            expr: Box::new(fold_expr(expr)),
+            negated: *negated,
+        }),
+        Expr::IsTruth {
+            expr,
+            expected,
+            negated,
+        } => fold_constant(Expr::IsTruth {
+            expr: Box::new(fold_expr(expr)),
+            expected: *expected,
+            negated: *negated,
+        }),
+        Expr::Not(expr) => fold_constant(Expr::Not(Box::new(fold_expr(expr)))),
+        Expr::InList {
+            expr,
+            values,
+            negated,
+        } => fold_constant(Expr::InList {
+            expr: Box::new(fold_expr(expr)),
+            values: values.iter().map(fold_expr).collect(),
+            negated: *negated,
+        }),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => fold_constant(Expr::Between {
+            expr: Box::new(fold_expr(expr)),
+            low: Box::new(fold_expr(low)),
+            high: Box::new(fold_expr(high)),
+            negated: *negated,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => fold_constant(Expr::Like {
+            expr: Box::new(fold_expr(expr)),
+            pattern: Box::new(fold_expr(pattern)),
+            negated: *negated,
+        }),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => fold_constant(Expr::Case {
+            operand: operand.as_deref().map(|expr| Box::new(fold_expr(expr))),
+            branches: branches
+                .iter()
+                .map(|(when, then)| (fold_expr(when), fold_expr(then)))
+                .collect(),
+            else_expr: else_expr.as_deref().map(|expr| Box::new(fold_expr(expr))),
+        }),
+        Expr::Binary { op, left, right } => {
+            let left = fold_expr(left);
+            let right = fold_expr(right);
+            if matches!(*op, BinaryOp::And) {
+                if is_true_literal(&left) {
+                    return right;
+                }
+                if is_true_literal(&right) {
+                    return left;
+                }
+            }
+            if matches!(*op, BinaryOp::Or) {
+                if is_false_literal(&left) {
+                    return right;
+                }
+                if is_false_literal(&right) {
+                    return left;
+                }
+            }
+            fold_constant(Expr::Binary {
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        Expr::Aggregate { .. } => expr.clone(),
+    }
+}
+
+fn expr_is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Column { .. } | Expr::Aggregate { .. } => false,
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+            expr_is_constant(expr)
+        }
+        Expr::InList { expr, values, .. } => {
+            expr_is_constant(expr) && values.iter().all(expr_is_constant)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_is_constant(expr) && expr_is_constant(low) && expr_is_constant(high),
+        Expr::Like { expr, pattern, .. } => expr_is_constant(expr) && expr_is_constant(pattern),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_none_or(expr_is_constant)
+                && branches
+                    .iter()
+                    .all(|(when, then)| expr_is_constant(when) && expr_is_constant(then))
+                && else_expr.as_deref().is_none_or(expr_is_constant)
+        }
+        Expr::Binary { left, right, .. } => expr_is_constant(left) && expr_is_constant(right),
+    }
+}
+
 fn select_with_filter(select: &Select, filter: Option<Expr>) -> Select {
     let mut filtered = select.clone();
     filtered.filter = filter;
@@ -1914,6 +2081,8 @@ fn estimate_group_count(grouped: &BoundSelect, input_rows: f64, ndvs: &[u64]) ->
 
 fn estimate_selectivity(expr: &ExecExpr, ndvs: &[u64]) -> f64 {
     let selectivity = match expr {
+        ExecExpr::Literal(Value::Bool(true)) => 1.0,
+        ExecExpr::Literal(Value::Bool(false)) | ExecExpr::Literal(Value::Null) => 0.0,
         ExecExpr::IsNull { negated, .. } => {
             if *negated {
                 0.9

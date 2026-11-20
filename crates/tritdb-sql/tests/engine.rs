@@ -2821,6 +2821,164 @@ fn join_projection_prunes_unused_source_columns() {
 }
 
 #[test]
+fn constant_folding_removes_trivial_filters_and_keeps_errors() {
+    let dir = TempDir::new("sql-constant-fold");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, v TEXT); \
+             CREATE TABLE b (id INT NOT NULL, w TEXT); \
+             INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'); \
+             INSERT INTO b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let all = engine
+        .execute_script("SELECT a.v FROM a ORDER BY a.id;")
+        .expect("select all");
+    assert_eq!(as_rows(&all[0]).1.len(), 3);
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a WHERE 1 = 1;")
+        .expect("explain true filter");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("Scan a est rows=3 cols=v"),
+        "unexpected plan: {plan}"
+    );
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a WHERE 1 = 0;")
+        .expect("explain false filter");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Filter est rows=0"),
+        "unexpected plan: {plan}"
+    );
+    let none = engine
+        .execute_script("SELECT a.v FROM a WHERE 1 = 0;")
+        .expect("false select");
+    assert!(as_rows(&none[0]).1.is_empty());
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE 1 = 1 AND a.id = 2;",
+        )
+        .expect("explain folded join filter");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("Filter"), "unexpected plan: {plan}");
+    assert!(
+        plan.contains("Scan a filtered est rows=1"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3 cols=id"),
+        "unexpected plan: {plan}"
+    );
+
+    for query in [
+        "EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id WHERE a.id = 2 AND 1 = 1;",
+        "EXPLAIN SELECT a.v FROM a JOIN b ON a.id = b.id WHERE 1 = 0 OR a.id = 2;",
+    ] {
+        let explained = engine.execute_script(query).expect("explain identity");
+        let plan = as_rows(&explained[0])
+            .1
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Text(line) => line.clone(),
+                other => panic!("expected plan text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !plan.contains("Filter"),
+            "unexpected plan for {query}: {plan}"
+        );
+        assert!(
+            plan.contains("Scan a filtered est rows=1"),
+            "unexpected plan for {query}: {plan}"
+        );
+    }
+
+    let joined = engine
+        .execute_script("SELECT a.v FROM a JOIN b ON a.id = b.id WHERE 1 = 1 AND a.id = 2;")
+        .expect("folded join select");
+    assert_eq!(as_rows(&joined[0]).1, [vec![Value::Text("a2".to_string())]]);
+
+    let explained = engine
+        .execute_script(
+            "EXPLAIN SELECT a.id, COUNT(*) AS n FROM a \
+             GROUP BY a.id HAVING 1 = 1;",
+        )
+        .expect("explain true having");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("Having"), "unexpected plan: {plan}");
+    let grouped = engine
+        .execute_script(
+            "SELECT a.id, COUNT(*) AS n FROM a \
+             GROUP BY a.id HAVING 1 = 1;",
+        )
+        .expect("true having select");
+    assert_eq!(as_rows(&grouped[0]).1.len(), 3);
+
+    let error = engine
+        .execute_script("SELECT a.v FROM a WHERE 1 / 0 = 2;")
+        .expect_err("constant error must survive folding")
+        .to_string();
+    assert!(error.contains("division by zero"), "{error}");
+
+    for query in [
+        "SELECT a.v FROM a WHERE TRUE OR 1 / 0 = 2;",
+        "SELECT a.v FROM a WHERE FALSE AND 1 / 0 = 2;",
+    ] {
+        let error = engine
+            .execute_script(query)
+            .expect_err("non-identity boolean terms must keep errors")
+            .to_string();
+        assert!(
+            error.contains("division by zero"),
+            "unexpected error for {query}: {error}"
+        );
+    }
+}
+
+#[test]
 fn update_without_matches_and_empty_table_reports_zero() {
     let dir = TempDir::new("sql-update-empty");
     let db = dir.join("sql.db");
