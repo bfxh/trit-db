@@ -42,6 +42,13 @@ pub enum SqlError {
         /// Column name.
         column: String,
     },
+    /// A `CHECK` constraint evaluated to `FALSE`.
+    CheckViolation {
+        /// Table name.
+        table: String,
+        /// Constraint text.
+        expression: String,
+    },
     /// A `UNIQUE` column received a duplicate non-`NULL` value.
     DuplicateKey {
         /// Table name.
@@ -120,6 +127,9 @@ impl fmt::Display for SqlError {
                 column,
                 value,
             } => write!(f, "{table}.{column} UNIQUE violated by {value}"),
+            SqlError::CheckViolation { table, expression } => {
+                write!(f, "{table} CHECK violated: {expression}")
+            }
             SqlError::NestedAggregate => write!(f, "nested aggregate is not supported"),
             SqlError::ColumnOutsideAggregate(name) => {
                 write!(f, "column {name} must appear inside an aggregate")

@@ -238,7 +238,8 @@ impl SqlEngine {
                 if_not_exists,
                 columns,
                 unique,
-            } => self.create_table(name, *if_not_exists, columns, unique),
+                checks,
+            } => self.create_table(name, *if_not_exists, columns, unique, checks),
             Statement::AlterTableAddColumn {
                 name,
                 if_not_exists,
@@ -274,6 +275,7 @@ impl SqlEngine {
         if_not_exists: bool,
         definitions: &[crate::ast::ColumnDef],
         unique_sets: &[Vec<String>],
+        checks: &[String],
     ) -> Result<QueryResult, SqlError> {
         if self.tables.contains_key(name) {
             if if_not_exists {
@@ -297,6 +299,7 @@ impl SqlEngine {
                 data_type: definition.data_type,
                 not_null: definition.not_null,
                 unique: definition.unique,
+                check: definition.check.clone(),
             });
         }
         let mut unique_indices = Vec::with_capacity(unique_sets.len());
@@ -313,6 +316,7 @@ impl SqlEngine {
         }
         let mut schema = Schema::new(columns);
         schema.unique_sets = unique_indices;
+        schema.checks = checks.to_vec();
         let table = Table {
             name: name.to_string(),
             schema,
@@ -357,6 +361,7 @@ impl SqlEngine {
             data_type: definition.data_type,
             not_null: false,
             unique: definition.unique,
+            check: definition.check.clone(),
         });
         table.schema = Schema::new(columns);
         for row in &mut table.rows {
@@ -449,6 +454,9 @@ impl SqlEngine {
             new_rows.push(row);
         }
 
+        for row in &new_rows {
+            check_row(&table.schema, &table.name, row)?;
+        }
         let inserted = new_rows.len();
         table.rows.extend(new_rows);
         check_unique(&table)?;
@@ -538,6 +546,7 @@ impl SqlEngine {
             for (index, value) in values {
                 row[index] = value;
             }
+            check_row(schema, name, row)?;
             updated += 1;
         }
         if updated > 0 {
@@ -1390,6 +1399,7 @@ fn qualify_table_projected(table: &Table, qualifier: &str, keep: Option<&[String
                 data_type: column.data_type,
                 not_null: column.not_null,
                 unique: column.unique,
+                check: column.check.clone(),
             }
         })
         .collect();
@@ -1415,6 +1425,7 @@ fn qualify_table_schema(table: &Table, qualifier: &str) -> Table {
             data_type: column.data_type,
             not_null: column.not_null,
             unique: column.unique,
+            check: column.check.clone(),
         })
         .collect();
     Table {
@@ -1653,6 +1664,37 @@ fn collect_expr_columns(
 /// terms. `x AND TRUE`, `TRUE AND x`, `x OR FALSE`, and `FALSE OR x` are exact
 /// in SQL three-valued logic. Expressions with columns or aggregates are left
 /// for the binder; evaluation errors are preserved by the fallback.
+/// Evaluates every `CHECK` on one row. `UNKNOWN` passes, `FALSE` rejects.
+fn check_row(schema: &Schema, table_name: &str, row: &[Value]) -> Result<(), SqlError> {
+    for column in &schema.columns {
+        if let Some(text) = &column.check {
+            evaluate_check(schema, table_name, row, text)?;
+        }
+    }
+    for text in &schema.checks {
+        evaluate_check(schema, table_name, row, text)?;
+    }
+    Ok(())
+}
+
+fn evaluate_check(
+    schema: &Schema,
+    table_name: &str,
+    row: &[Value],
+    text: &str,
+) -> Result<(), SqlError> {
+    let expr = crate::parser::parse_expression(text)?;
+    let bound = bind_expr(&expr, schema)?;
+    let value = eval(&bound, schema, row)?;
+    if truth_of(&value)? == TruthValue::False {
+        return Err(SqlError::CheckViolation {
+            table: table_name.to_string(),
+            expression: text.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Rejects duplicate non-`NULL` values in every `UNIQUE` column.
 fn check_unique(table: &Table) -> Result<(), SqlError> {
     for (index, column) in table.schema.columns.iter().enumerate() {
@@ -2105,6 +2147,7 @@ fn build_join_layout(
             data_type: left_column.data_type,
             not_null,
             unique: false,
+            check: None,
         });
         sources.push(JoinSource::Coalesced {
             left: left_index,
@@ -2138,6 +2181,7 @@ fn build_join_layout(
             data_type: column.data_type,
             not_null,
             unique: false,
+            check: None,
         });
         sources.push(JoinSource::Left(index));
         aliases.insert(column.name.clone(), output_index);
@@ -2162,6 +2206,7 @@ fn build_join_layout(
             data_type: column.data_type,
             not_null,
             unique: false,
+            check: None,
         });
         sources.push(JoinSource::Right(index));
         aliases.insert(column.name.clone(), output_index);

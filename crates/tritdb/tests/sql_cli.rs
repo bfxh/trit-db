@@ -437,3 +437,51 @@ fn table_level_unique_group_survives_reopen() {
         "duplicate tuple must fail after reopen"
     );
 }
+
+#[test]
+fn check_constraints_reject_false_and_accept_unknown() {
+    let dir = TempDir::new("sql-check");
+    let db = dir.join("c.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (x INT CHECK (x > 0), y INT, CHECK (y < 100));          INSERT INTO t VALUES (1, 10);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    for insert in [
+        "INSERT INTO t VALUES (-1, 10);",
+        "INSERT INTO t VALUES (1, 200);",
+    ] {
+        let output = run(["sql", "--db", db, "--sql", insert]);
+        assert!(!output.status.success(), "must fail: {insert}");
+    }
+
+    // UNKNOWN passes SQL CHECK semantics.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "INSERT INTO t VALUES (2, NULL);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "UPDATE t SET x = -2 WHERE x = 1;",
+    ]);
+    assert!(!output.status.success(), "update must fail");
+
+    let output = run(["sql", "--db", db, "--sql", "SELECT * FROM t ORDER BY x;"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1	10"), "out: {text}");
+    assert!(text.contains("2	NULL"), "out: {text}");
+}
