@@ -294,6 +294,7 @@ impl SqlEngine {
                 name: definition.name.clone(),
                 data_type: definition.data_type,
                 not_null: definition.not_null,
+                unique: definition.unique,
             });
         }
         let table = Table {
@@ -339,6 +340,7 @@ impl SqlEngine {
             name: definition.name.clone(),
             data_type: definition.data_type,
             not_null: false,
+            unique: definition.unique,
         });
         table.schema = Schema::new(columns);
         for row in &mut table.rows {
@@ -429,6 +431,34 @@ impl SqlEngine {
                 }
             }
             new_rows.push(row);
+        }
+
+        // UNIQUE: collect existing non-NULL values per unique column, then
+        // reject duplicates inside the incoming batch as well.
+        for (column_index, column) in table.schema.columns.iter().enumerate() {
+            if !column.unique {
+                continue;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for row in &table.rows {
+                let value = &row[column_index];
+                if !value.is_null() {
+                    seen.insert(value.clone());
+                }
+            }
+            for row in &new_rows {
+                let value = &row[column_index];
+                if value.is_null() {
+                    continue;
+                }
+                if !seen.insert(value.clone()) {
+                    return Err(SqlError::DuplicateKey {
+                        table: name.to_string(),
+                        column: column.name.clone(),
+                        value: value.display(),
+                    });
+                }
+            }
         }
 
         let inserted = new_rows.len();
@@ -556,7 +586,7 @@ impl SqlEngine {
         let plan = bind_select(&filtered_select, &table)?;
         let result = execute_select(&table, &plan)?;
         match &select.under_repair {
-            Some(key) => filter_under_repair(result, key),
+            Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
         }
     }
@@ -1370,6 +1400,7 @@ fn qualify_table_projected(table: &Table, qualifier: &str, keep: Option<&[String
                 name: format!("{qualifier}.{}", column.name),
                 data_type: column.data_type,
                 not_null: column.not_null,
+                unique: column.unique,
             }
         })
         .collect();
@@ -1394,6 +1425,7 @@ fn qualify_table_schema(table: &Table, qualifier: &str) -> Table {
             name: format!("{qualifier}.{}", column.name),
             data_type: column.data_type,
             not_null: column.not_null,
+            unique: column.unique,
         })
         .collect();
     Table {
@@ -1632,40 +1664,61 @@ fn collect_expr_columns(
 /// terms. `x AND TRUE`, `TRUE AND x`, `x OR FALSE`, and `FALSE OR x` are exact
 /// in SQL three-valued logic. Expressions with columns or aggregates are left
 /// for the binder; evaluation errors are preserved by the fallback.
-/// Certain rows under the functional dependency `key -> other columns`.
+/// Certain rows under the functional dependency `keys -> other columns`.
 ///
 /// A group with conflicting non-key values is discarded entirely: every row in
 /// it can be deleted by some minimal repair. A group whose rows agree on the
 /// non-key values is kept.
-fn filter_under_repair(result: QueryResult, key: &str) -> Result<QueryResult, SqlError> {
+fn filter_under_repair(result: QueryResult, keys: &[String]) -> Result<QueryResult, SqlError> {
     let QueryResult::Rows { columns, rows } = result else {
         return Ok(result);
     };
-    let Some(key_index) = columns.iter().position(|column| column == key) else {
-        return Err(SqlError::UnknownColumn(key.to_string()));
-    };
-    let mut groups: std::collections::HashMap<Value, Vec<usize>> = std::collections::HashMap::new();
+    let key_indices: Vec<usize> = keys
+        .iter()
+        .map(|key| {
+            columns
+                .iter()
+                .position(|column| column == key)
+                .ok_or_else(|| SqlError::UnknownColumn(key.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut groups: std::collections::HashMap<Vec<Value>, Vec<usize>> =
+        std::collections::HashMap::new();
     for (index, row) in rows.iter().enumerate() {
-        groups
-            .entry(row[key_index].clone())
-            .or_default()
-            .push(index);
+        let key: Vec<Value> = key_indices
+            .iter()
+            .map(|&index| row[index].clone())
+            .collect();
+        groups.entry(key).or_default().push(index);
     }
+
     let mut conflict = std::collections::HashSet::new();
-    for (key_value, indices) in groups {
+    for (key, indices) in groups {
         let mut signatures = indices.iter().map(|&index| {
-            let mut rest = rows[index].clone();
-            rest.remove(key_index);
+            let mut rest = Vec::with_capacity(rows[index].len() - key_indices.len());
+            for (column, value) in rows[index].iter().enumerate() {
+                if !key_indices.contains(&column) {
+                    rest.push(value.clone());
+                }
+            }
             rest
         });
         let first = signatures.next().expect("non-empty group");
         if !signatures.all(|signature| signature == first) {
-            conflict.insert(key_value);
+            conflict.insert(key);
         }
     }
+
     let kept = rows
         .into_iter()
-        .filter(|row| !conflict.contains(&row[key_index]))
+        .filter(|row| {
+            let key: Vec<Value> = key_indices
+                .iter()
+                .map(|&index| row[index].clone())
+                .collect();
+            !conflict.contains(&key)
+        })
         .collect();
     Ok(QueryResult::Rows {
         columns,
@@ -2010,6 +2063,7 @@ fn build_join_layout(
             name: name.clone(),
             data_type: left_column.data_type,
             not_null,
+            unique: false,
         });
         sources.push(JoinSource::Coalesced {
             left: left_index,
@@ -2042,6 +2096,7 @@ fn build_join_layout(
             name: column.name.clone(),
             data_type: column.data_type,
             not_null,
+            unique: false,
         });
         sources.push(JoinSource::Left(index));
         aliases.insert(column.name.clone(), output_index);
@@ -2065,6 +2120,7 @@ fn build_join_layout(
             name: column.name.clone(),
             data_type: column.data_type,
             not_null,
+            unique: false,
         });
         sources.push(JoinSource::Right(index));
         aliases.insert(column.name.clone(), output_index);

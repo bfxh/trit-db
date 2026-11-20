@@ -42,6 +42,15 @@ pub enum SqlError {
         /// Column name.
         column: String,
     },
+    /// A `UNIQUE` column received a duplicate non-`NULL` value.
+    DuplicateKey {
+        /// Table name.
+        table: String,
+        /// Column name.
+        column: String,
+        /// Duplicated value in display form.
+        value: String,
+    },
     /// Aggregate expression is nested inside another aggregate.
     NestedAggregate,
     /// A column reference appears outside an aggregate in an aggregate query.
@@ -106,6 +115,11 @@ impl fmt::Display for SqlError {
             SqlError::NotNull { table, column } => {
                 write!(f, "{table}.{column} is NOT NULL")
             }
+            SqlError::DuplicateKey {
+                table,
+                column,
+                value,
+            } => write!(f, "{table}.{column} UNIQUE violated by {value}"),
             SqlError::NestedAggregate => write!(f, "nested aggregate is not supported"),
             SqlError::ColumnOutsideAggregate(name) => {
                 write!(f, "column {name} must appear inside an aggregate")

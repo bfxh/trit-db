@@ -213,10 +213,12 @@ impl Parser {
             } else {
                 false
             };
+            let unique = self.eat_word("unique");
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
                 not_null,
+                unique,
             });
             if self.eat_symbol(Symbol::Comma) {
                 continue;
@@ -270,6 +272,7 @@ impl Parser {
                 name: column_name,
                 data_type,
                 not_null,
+                unique: self.eat_word("unique"),
             },
         })
     }
@@ -492,9 +495,12 @@ impl Parser {
             self.expect_word("repair")?;
             self.expect_keyword(Keyword::On)?;
             self.expect_symbol(Symbol::LParen)?;
-            let key = self.parse_ident()?;
+            let mut keys = vec![self.parse_ident()?];
+            while self.eat_symbol(Symbol::Comma) {
+                keys.push(self.parse_ident()?);
+            }
             self.expect_symbol(Symbol::RParen)?;
-            Some(key)
+            Some(keys)
         } else {
             None
         };
