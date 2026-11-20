@@ -29,10 +29,16 @@ M3 的 `tritdb-exec::ann` 已经有 K3/Belnap 注解、精确模型计数和最�
    - 按距离升序、`id` 升序打破平局；结果按 `T/U/F` 分成 `certain` / `uncertain` / `excluded` 三组，每组最多 `k` 个。
 4. **CLI**
    ```bash
-   tritdb graph reach --nodes 4 --edges 0-1,1-2 [--label 1-2=U] --from 0 --to 2 [--max-hops 4]
-   tritdb graph neighbors --nodes 4 --edges 0-1,1-2 --node 0 [--hops 1]
+   tritdb graph build --wal graph.wal --name g [--nodes N] --edges 0-1,1-2 [--label 1-2=U]
+   tritdb graph load --wal graph.wal --name g
+   tritdb graph reach [--wal graph.wal --name g | --nodes N --edges ...] --from 0 --to 2 [--max-hops 4]
+   tritdb graph neighbors [--wal graph.wal --name g | --nodes N --edges ...] --node 0 [--hops 1]
    tritdb graph knn --points "1,2;3,4" [--labels T,U] --query "1,2" [--k 3]
    ```
+5. **持久化 `TRGR`**
+   - `AnnotatedGraph::encode()` 输出 magic `TRGR`、版本字节、node/edge 计数（`u32` LE）、`node_count + 1` 个 offsets、`edge_count` 个 targets、每条边 1 字节标签（`0` False、`1` Unknown、`2` True）。
+   - `decode()` 校验 magic/version/长度/offsets 单调/行内 target 严格递增/标签码，坏字节返回 `BadEncoding`。
+   - `graph build` 把编码写进 `TxnStore` 的 `graph/<name>` value（单事务提交）；`graph load` 和带 `--wal/--name` 的 `reach/neighbors` 从同一 key 读回。
 
 ## 理由
 
@@ -43,7 +49,7 @@ M3 的 `tritdb-exec::ann` 已经有 K3/Belnap 注解、精确模型计数和最�
 
 ## 后果 / 限制
 
-- **纯内存、无持久化**：CSR 数组还没有写进页文件、WAL 或 manifest；每次 CLI 调用都从边列表重建。
+- **持久化在 `TxnStore`**：整张图是 `graph/<name>` 下的一个 value，不是 pstore 页、没有 manifest/chunk 级增量；每次加载完整解码，不支持局部更新。
 - **没有近似索引**：`annotated_knn` 是精确扫描，不是 HNSW/IVF；维度上限 64，坐标是 `i64`。
 - **边是单标签、无权重**：多重图、边权、节点标签都未支持。
 - **没有递归 SQL 语法**：`graph` 目前只是 CLI/库 API，`WITH RECURSIVE` 之类尚未进 parser。
@@ -62,4 +68,5 @@ cargo fmt --all -- --check
 - CSR：重复边去重、行有序、越界边/节点报错；
 - 三值可达：全 `TRUE` → `certain`、含 `UNKNOWN` → `contingent`、`FALSE` 断边 → `impossible`、`max_hops` 截断、零跳自反；
 - BFS：一跳/两跳层与顺序；
-- k-NN：距离排序、平局按 `id`、T/U/F 分组、维度不一致与 `i128` 溢出。
+- k-NN：距离排序、平局按 `id`、T/U/F 分组、维度不一致与 `i128` 溢出；
+- `TRGR`：往返保持节点/边/标签，坏 magic/版本/长度/标签/offsets 都被拒绝。

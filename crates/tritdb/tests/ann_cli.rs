@@ -2,6 +2,8 @@
 
 use std::process::{Command, Output};
 
+use tritdb_testkit::TempDir;
+
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tritdb"))
         .args(args)
@@ -128,4 +130,68 @@ fn graph_cli_neighbors_and_knn() {
         text.contains("certain=1 uncertain=1 excluded=1"),
         "out: {text}"
     );
+}
+
+#[test]
+fn graph_cli_persists_and_reloads_a_graph() {
+    let dir = TempDir::new("graph-persist");
+    let wal = dir.join("graph.wal");
+    let wal_text = wal.to_str().expect("wal path");
+
+    let output = run(&[
+        "graph", "build", "--wal", wal_text, "--name", "net", "--nodes", "3", "--edges", "0-1,1-2",
+        "--label", "1-2=U",
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("name=net"), "out: {text}");
+    assert!(text.contains("nodes=3"), "out: {text}");
+    assert!(text.contains("edges=2"), "out: {text}");
+
+    // Every CLI call reopens the store; this proves the graph was persisted.
+    let loaded = run(&["graph", "load", "--wal", wal_text, "--name", "net"]);
+    assert!(loaded.status.success(), "stderr: {:?}", loaded);
+    let text = stdout(&loaded);
+    assert!(text.contains("nodes=3"), "out: {text}");
+    assert!(text.contains("edges=2"), "out: {text}");
+
+    let reach = run(&[
+        "graph", "reach", "--wal", wal_text, "--name", "net", "--from", "0", "--to", "2",
+    ]);
+    assert!(reach.status.success(), "stderr: {:?}", reach);
+    let text = stdout(&reach);
+    assert!(text.contains("answer=contingent"), "out: {text}");
+    assert!(text.contains("path=0,1,2"), "out: {text}");
+
+    let neighbors = run(&[
+        "graph",
+        "neighbors",
+        "--wal",
+        wal_text,
+        "--name",
+        "net",
+        "--node",
+        "0",
+        "--hops",
+        "2",
+    ]);
+    assert!(neighbors.status.success(), "stderr: {:?}", neighbors);
+    assert!(stdout(&neighbors).contains("count=2"));
+
+    let missing = run(&["graph", "load", "--wal", wal_text, "--name", "absent"]);
+    assert!(!missing.status.success(), "missing graph must fail");
+
+    let overwrite = run(&[
+        "txn",
+        "put",
+        "--wal",
+        wal_text,
+        "--key",
+        "graph/net",
+        "--value",
+        "bogus",
+    ]);
+    assert!(overwrite.status.success(), "stderr: {:?}", overwrite);
+    let corrupt = run(&["graph", "load", "--wal", wal_text, "--name", "net"]);
+    assert!(!corrupt.status.success(), "corrupt graph must fail");
 }
