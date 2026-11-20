@@ -1948,6 +1948,35 @@ fn explain_sexpr_reports_structured_plan() {
          (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
     );
 
+    let aliased = engine
+        .execute_script("EXPLAIN SEXPR SELECT x.v FROM a AS x;")
+        .expect("explain sexpr aliased scan");
+    let aliased_plan = match &as_rows(&aliased[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        aliased_plan.contains("(scan \"a\" :alias \"x\""),
+        "unexpected plan: {aliased_plan}"
+    );
+
+    let aliased_text = engine
+        .execute_script("EXPLAIN SELECT x.v FROM a AS x WHERE x.id > 1;")
+        .expect("explain aliased scan");
+    let aliased_text_plan = as_rows(&aliased_text[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan line, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        aliased_text_plan.contains("Scan a AS x"),
+        "unexpected plan: {aliased_text_plan}"
+    );
+
     let having = engine
         .execute_script(
             "EXPLAIN SEXPR SELECT a.v, COUNT(*) FROM a \

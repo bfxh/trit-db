@@ -991,7 +991,8 @@ impl SqlEngine {
             .and_then(|stats| stats.scan_filters.get(scan_index).copied())
             .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
         let mut plan = PlanNode::scan(
-            source_label(left.name.as_str(), &left_qualifier),
+            left.name.clone(),
+            source_alias(left.name.as_str(), &left_qualifier),
             left_filtered,
             stats
                 .and_then(|stats| stats.scan_rows.get(scan_index).copied())
@@ -1065,7 +1066,8 @@ impl SqlEngine {
                 .and_then(|stats| stats.scan_filters.get(scan_index).copied())
                 .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
             let right_plan = PlanNode::scan(
-                source_label(right.name.as_str(), &qualifier),
+                right.name.clone(),
+                source_alias(right.name.as_str(), &qualifier),
                 right_filtered,
                 stats
                     .and_then(|stats| stats.scan_rows.get(scan_index).copied())
@@ -2408,12 +2410,8 @@ fn equality_selectivity(left: &ExecExpr, right: &ExecExpr, ndvs: &[u64]) -> f64 
     }
 }
 
-fn source_label(table: &str, qualifier: &str) -> String {
-    if table == qualifier {
-        table.to_string()
-    } else {
-        format!("{table} AS {qualifier}")
-    }
+fn source_alias(table: &str, qualifier: &str) -> Option<String> {
+    (table != qualifier).then(|| qualifier.to_string())
 }
 
 fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {

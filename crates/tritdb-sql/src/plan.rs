@@ -22,7 +22,8 @@ pub(crate) struct PlanNode {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlanKind {
     Scan {
-        label: String,
+        table: String,
+        alias: Option<String>,
         filtered: bool,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
@@ -190,7 +191,8 @@ pub(crate) struct Metrics {
 
 impl PlanNode {
     pub(crate) fn scan(
-        label: String,
+        table: String,
+        alias: Option<String>,
         filtered: bool,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
@@ -198,7 +200,8 @@ impl PlanNode {
     ) -> Self {
         Self {
             kind: PlanKind::Scan {
-                label,
+                table,
+                alias,
                 filtered,
                 actual_rows,
                 est_rows,
@@ -265,13 +268,14 @@ impl PlanNode {
     fn label(&self) -> String {
         match &self.kind {
             PlanKind::Scan {
-                label,
+                table,
+                alias,
                 filtered,
                 actual_rows,
                 est_rows,
                 columns,
             } => {
-                let mut text = format!("Scan {label}");
+                let mut text = format!("Scan {}", scan_name(table, alias.as_deref()));
                 if *filtered {
                     text.push_str(" filtered");
                 }
@@ -365,14 +369,19 @@ impl PlanNode {
         out.push_str(&"  ".repeat(indent));
         match &self.kind {
             PlanKind::Scan {
-                label,
+                table,
+                alias,
                 filtered,
                 actual_rows,
                 est_rows,
                 columns,
             } => {
                 out.push_str("(scan ");
-                push_string(out, label);
+                push_string(out, table);
+                if let Some(alias) = alias {
+                    out.push_str(" :alias ");
+                    push_string(out, alias);
+                }
                 if *filtered {
                     out.push_str(" :filtered #t");
                 }
@@ -886,6 +895,13 @@ fn binary_name(op: BinaryOp) -> &'static str {
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
         BinaryOp::Div => "/",
+    }
+}
+
+fn scan_name(table: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(alias) => format!("{table} AS {alias}"),
+        None => table.to_string(),
     }
 }
 

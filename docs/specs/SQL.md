@@ -176,6 +176,7 @@ EXPLAIN SEXPR SELECT ...;
 - `EXPLAIN SEXPR` 走与 `EXPLAIN` 相同的折叠、下推、列裁剪、绑定和估算路径，但不执行查询；它只把同一棵 `PlanNode` 树用只读括号化形式输出。
 - `SEXPR` 只在 `EXPLAIN` 后按普通单词识别，不是全局关键字；静态 `EXPLAIN SEXPR` 与 `EXPLAIN ANALYZE SEXPR` 共用同一条解析分支，后者额外执行一次查询。
 - 返回单列 `plan`、单行文本；文本内部保留换行和缩进，便于直接作为机器可读的计划值保存。
+- `scan` 节点形如 `(scan "a" :alias "x" :filtered #t :est-rows N :cols ("id" "v"))`；第一个字符串是表名，`:alias` 只在显式别名时输出，文本仍为 `Scan a AS x`。
 - join 节点形如：
   - `ON` hash join：`(join hash inner :keys (("a.id" "b.id")) :est-rows 2 child child)`；每个键是 `("左列" "右列")` 二元列表；
   - `USING` / `NATURAL`：`(join hash left :keys ("id" "code") child child)`；键是共享列名列表；
@@ -191,7 +192,7 @@ EXPLAIN SEXPR SELECT ...;
   - `(project (("v" (col "a.v")) ("n" (sum (col "a.id")))) :est-rows N child)`；每项是 `("输出名" <PlanExpr>)`，顺序与输出列一致，空投影为 `()`。
   - `(sort :keys ((asc (col "a.v")) (desc (sum (col "a.id")))) :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
 - 静态模式只输出估算，不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。`EXPLAIN ANALYZE SEXPR` 在同一个树外增加 `(execution ...)` 汇总，节点改用 actual 字段，见下节。
-- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md)、[`ADR-021`](../ADR/021-structured-filter-predicate.md)、[`ADR-022`](../ADR/022-structured-join-predicate.md)、[`ADR-023`](../ADR/023-structured-having-predicate.md)、[`ADR-024`](../ADR/024-structured-aggregate-shape.md)、[`ADR-025`](../ADR/025-structured-sort-keys.md) 与 [`ADR-026`](../ADR/026-structured-project-items.md)、[`ADR-027`](../ADR/027-structured-join-residual-predicate.md)。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md)、[`ADR-021`](../ADR/021-structured-filter-predicate.md)、[`ADR-022`](../ADR/022-structured-join-predicate.md)、[`ADR-023`](../ADR/023-structured-having-predicate.md)、[`ADR-024`](../ADR/024-structured-aggregate-shape.md)、[`ADR-025`](../ADR/025-structured-sort-keys.md)、[`ADR-026`](../ADR/026-structured-project-items.md)、[`ADR-027`](../ADR/027-structured-join-residual-predicate.md) 与 [`ADR-028`](../ADR/028-structured-scan-identity.md)。
 
 ### EXPLAIN ANALYZE SELECT
 
