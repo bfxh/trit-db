@@ -9,7 +9,7 @@ use std::fmt;
 use crate::TruthValue;
 
 /// Maximum variables accepted by [`count_models`].
-pub const MAX_MODEL_VARS: usize = 20;
+pub const MAX_MODEL_VARS: usize = 32;
 /// Maximum facts accepted by [`under_repair`].
 pub const MAX_REPAIR_FACTS: usize = 64;
 /// Maximum facts inside one connected component of the denial graph.
@@ -250,17 +250,85 @@ pub fn count_models(expr: &BoolExpr, vars: usize) -> Result<u64, AnnError> {
             max: MAX_MODEL_VARS,
         });
     }
-    let mut assignment = vec![false; vars];
-    let mut models = 0u64;
-    for mask in 0..(1u64 << vars) {
-        for (index, value) in assignment.iter_mut().enumerate() {
-            *value = mask & (1 << index) != 0;
-        }
-        if expr.eval(&assignment)? {
-            models += 1;
+    check_vars(expr, vars)?;
+    let mut assignment = vec![None; vars];
+    Ok(count_models_dpll(expr, &mut assignment))
+}
+
+fn check_vars(expr: &BoolExpr, vars: usize) -> Result<(), AnnError> {
+    match expr {
+        BoolExpr::Var(index) if *index >= vars => Err(AnnError::OutOfRange {
+            index: *index,
+            count: vars,
+        }),
+        BoolExpr::Var(_) | BoolExpr::Const(_) => Ok(()),
+        BoolExpr::Not(inner) => check_vars(inner, vars),
+        BoolExpr::And(items) | BoolExpr::Or(items) => {
+            for item in items {
+                check_vars(item, vars)?;
+            }
+            Ok(())
         }
     }
-    Ok(models)
+}
+
+/// DPLL-style exact model counter with partial evaluation and short-circuiting.
+fn count_models_dpll(expr: &BoolExpr, assignment: &mut [Option<bool>]) -> u64 {
+    match eval_partial(expr, assignment) {
+        Some(true) => {
+            let free = assignment.iter().filter(|value| value.is_none()).count();
+            return 1u64 << free;
+        }
+        Some(false) => return 0,
+        None => {}
+    }
+    let Some(index) = assignment.iter().position(|value| value.is_none()) else {
+        return 0;
+    };
+    assignment[index] = Some(true);
+    let mut models = count_models_dpll(expr, assignment);
+    assignment[index] = Some(false);
+    models += count_models_dpll(expr, assignment);
+    assignment[index] = None;
+    models
+}
+
+fn eval_partial(expr: &BoolExpr, assignment: &[Option<bool>]) -> Option<bool> {
+    match expr {
+        BoolExpr::Const(value) => Some(*value),
+        BoolExpr::Var(index) => assignment.get(*index).copied().flatten(),
+        BoolExpr::Not(inner) => eval_partial(inner, assignment).map(|value| !value),
+        BoolExpr::And(items) => {
+            let mut unknown = false;
+            for item in items {
+                match eval_partial(item, assignment) {
+                    Some(false) => return Some(false),
+                    Some(true) => {}
+                    None => unknown = true,
+                }
+            }
+            if unknown {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        BoolExpr::Or(items) => {
+            let mut unknown = false;
+            for item in items {
+                match eval_partial(item, assignment) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => unknown = true,
+                }
+            }
+            if unknown {
+                None
+            } else {
+                Some(false)
+            }
+        }
+    }
 }
 
 /// Answer of a query under all minimal repairs.
@@ -685,6 +753,18 @@ mod tests {
                 max: MAX_MODEL_VARS
             })
         );
+    }
+
+    #[test]
+    fn dpll_counts_models_beyond_the_enumeration_limit() {
+        let vars = 25;
+        let all_true = BoolExpr::And((0..vars).map(BoolExpr::Var).collect());
+        assert_eq!(count_models(&all_true, vars).unwrap(), 1);
+
+        // a0 OR a1 leaves the other 23 variables free.
+        let either = BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(1)]);
+        // Satisfying assignments: 2^25 - 2^23 = 3 * 2^23.
+        assert_eq!(count_models(&either, vars).unwrap(), 3 << 23);
     }
 
     #[test]

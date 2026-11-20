@@ -36,7 +36,7 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 
 `BoolExpr::{Var, Const, Not, And, Or}` + `count_models(expr, vars)`：
 
-- 变量数 ≤ 20，枚举 `2^n` 个赋值，逐个求值；
+- 变量数 ≤ 32，DPLL 精确计数：部分求值 + 短路，已确定的子树按自由变量一次乘回；
 - 精确，不抽样；
 - 超过上限返回 `TooManyVars`，不静默降级。
 
@@ -48,13 +48,13 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 - 每个 denial 是一组不能同时为真的事实；
 - 修复 = 不满足任何 denial 的**最大**事实子集（MCS）；
 - 返回 `Certain`（所有修复满足 query）、`Impossible`（所有修复都不满足）、`Contingent`（部分满足，对应 Belnap `Both`）；
-- 事实数 ≤ 16，枚举 `2^n` 个子集，每个子集检查是否能再加一个事实仍一致。
+- 总事实 ≤ 64；按 denial 连通分量分解，每个分量 ≤ 16，枚举 `2^n` 个子集。
 
 ## 理由
 
 - **语义先行**：注解/计数/修复的语义可以用小规模穷举验证，不需要先把 SQL 方言接完。
 - **可判红**：每个结论都有精确期望值（模型数、`Certain/Impossible/Contingent`），不是「看起来对」。
-- **上限显式**：20 个变量 / 16 个事实是硬边界，超限报错。真正的 #SAT/BDD/CQA 优化留到后续。
+- **上限显式**：32 个变量 / 64 个事实是硬边界，超限报错；BDD 与增量 CQA 留到后续。
 
 ## 后果
 
@@ -67,7 +67,7 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 负面 / 未做：
 
 - **SQL parser 只接了 `count_models`**：`SELECT count_models('<expr>'[, vars])` 已可用；`UNDER REPAIR` 还没有语法，因为需要先有约束（UNIQUE/FD/denial）才能定义修复语义。
-- `count_models` 是 `2^n` 枚举，不是 DPLL/BDD；变量上限 20。
+- `count_models` 用 DPLL，不是 BDD；变量上限 32。
 - `under_repair` 按 denial 连通分量分解：总事实上限 64，单分量上限 16；没有增量修复或更优的 MCS 枚举。
 - 注解还没有进入存储层（列存没有注解列），也没有进入查询执行器。
 

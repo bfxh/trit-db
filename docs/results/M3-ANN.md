@@ -45,7 +45,7 @@ tritdb repair --facts 3 --denial 0,1 --denial 1,2 --query 0,1
 | Łukasiewicz | `[0,1]`，neg `1-x`，meet `min`，join `max` |
 | ℕ | 计数半环：meet 乘法、join 加法、无 neg |
 
-- `count_models`：变量 ≤ 20，精确枚举，超限 `TooManyVars`；
+- `count_models`：变量 ≤ 32，DPLL 精确计数（部分求值 + 短路 + 自由变量一次乘回），超限 `TooManyVars`；
 - `under_repair`：总事实 ≤ 64；按 denial 连通分量分解，每个分量 ≤ 16；修复 = 最大一致子集，返回 `Certain / Impossible / Contingent`。
 
 ## 4. 验收
@@ -59,6 +59,6 @@ cargo test -p tritdb --test ann_cli    # 2 passed
 
 - `UNDER REPAIR` 还没有进 SQL parser：需要先有 UNIQUE/FD/否定约束才能定义“修复”，当前只提供库 API `under_repair`；
 - 注解列存储与执行器接线（当前只在库层与 CLI 使用）；
-- `count_models` 的 DPLL/BDD 优化（当前 `2^n` 枚举，上限 20）；
+- BDD 与组件级计数仍未做（当前 DPLL，变量上限 32）；
 - `under_repair` 的组件分解已做（按 denial 连通分量）；增量修复与更优的 MCS 枚举仍未做；
 - 概率/模糊聚合与 `Łukasiewicz` 的更多 t-norm。
