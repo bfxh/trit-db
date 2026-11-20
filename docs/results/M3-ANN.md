@@ -69,7 +69,7 @@ cargo test -p tritdb --test ann_cli    # 2 passed
 
 ## 6. 还没做
 
-- SQL 支持 `UNDER REPAIR ON (a, b, ...)` 多列函数依赖，冲突组整组丢弃；列级 `UNIQUE` 在 `INSERT` 时拒绝重复非 `NULL` 值；表级多列 UNIQUE/否定约束仍未做；
+- SQL 支持 `UNDER REPAIR ON (a, b, ...)` 多列函数依赖，冲突组整组丢弃；列级 `UNIQUE` 与表级 `UNIQUE (a, b)` 在 `INSERT` / `UPDATE` 时拒绝重复非 `NULL` 值；否定约束/CHECK 仍未做；
 - Ł / ℕ 的专用聚合与 `truth()` 投影（这两类不是布尔，`truth()` 会拒绝）；
 - BDD 与组件级计数仍未做（当前 DPLL，变量上限 32）；
 - `under_repair` 的组件分解已做（按 denial 连通分量）；增量修复与更优的 MCS 枚举仍未做；
