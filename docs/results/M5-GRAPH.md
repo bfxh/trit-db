@@ -1,6 +1,6 @@
 # M5 第一刀：注解图（CSR + 三值可达 + 三值 k-NN）
 
-状态：内存内 CSR、三值可达、BFS 层、三值 k-NN 与 CLI 已实现；持久化、近似索引、递归 SQL 未做
+状态：内存内 CSR、三值可达、BFS 层、三值 k-NN、`TRGR` 持久化（`graph build/load`）与 CLI 已实现；近似索引、递归 SQL 未做
 
 日期：2026-11-21
 
@@ -8,8 +8,9 @@
 
 ```text
 crates/tritdb-exec/src/graph.rs   Csr / AnnotatedGraph / Reach / annotated_knn / GraphError
-crates/tritdb/src/main.rs         graph reach|neighbors|knn
-crates/tritdb/tests/ann_cli.rs    2 个 CLI 端到端测试
+                                  TRGR encode/decode
+crates/tritdb/src/main.rs         graph build|load|reach|neighbors|knn
+crates/tritdb/tests/ann_cli.rs    3 个 graph CLI 端到端测试
 docs/ADR/040-annotated-graphs.md
 ```
 
@@ -19,6 +20,9 @@ docs/ADR/040-annotated-graphs.md
 tritdb graph reach --nodes 4 --edges 0-1,1-2 [--label 1-2=U] --from 0 --to 2 [--max-hops 4]
 tritdb graph neighbors --nodes 4 --edges 0-1,1-2 --node 0 [--hops 1]
 tritdb graph knn --points "1,2;3,4" [--labels T,U] --query "1,2" [--k 3]
+tritdb graph build --wal graph.wal --name g [--nodes N] --edges 0-1,1-2 [--label 1-2=U]
+tritdb graph load --wal graph.wal --name g
+tritdb graph reach --wal graph.wal --name g --from 0 --to 2
 ```
 
 - `--label from-to=T|U|F`（可重复），缺省 `T`；
@@ -35,12 +39,14 @@ tritdb graph knn --points "1,2;3,4" [--labels T,U] --query "1,2" [--k 3]
   - 见证路径是跳数最少的那条；`--max-hops` 是硬上界。
 - `neighbors` 走 `TRUE`/`UNKNOWN` 边，返回 BFS 顺序的 `(node, hops)`，每个节点只出现一次。
 - k-NN 用整数平方欧氏距离（`i128`），按距离、`id` 升序排序，再按标注分到 `certain` / `uncertain` / `excluded` 三组，每组最多 `k` 个。
+- `TRGR` 编码：magic、version、node/edge 计数、`node_count + 1` 个 `u32` offsets、`edge_count` 个 `u32` targets、每边 1 字节标签（`0` False / `1` Unknown / `2` True）。`decode` 校验 magic/version/长度/offsets 单调/行内 target 严格递增/标签码。
+- `graph build` 把 `TRGR` 写进 `TxnStore` 的 `graph/<name>`（单事务提交）；`graph load`、`graph reach --wal`、`graph neighbors --wal` 重开后读回并解码，坏字节返回 `BadEncoding`。
 
 ## 4. 验收
 
 ```bash
-cargo test -p tritdb-exec graph        # 8 passed
-cargo test -p tritdb --test ann_cli    # 4 passed
+cargo test -p tritdb-exec graph        # 10 passed
+cargo test -p tritdb --test ann_cli    # 5 passed
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -50,7 +56,7 @@ cargo fmt --all -- --check
 
 ## 5. 还没做
 
-- **持久化**：CSR 数组、边标签、向量还没有写进页文件/WAL/manifest，每次 CLI 调用都从边列表重建；
+- **持久化只在 `TxnStore`**：整张图是 `graph/<name>` 下的一个 value，没有 pstore 页布局、没有 manifest/chunk 级增量，也不支持局部更新；向量（k-NN 的 `Point`）尚未持久化；
 - **近似索引**：`annotated_knn` 是精确扫描，没有 HNSW/IVF；
 - **边权与多重图**：每条有向边只有一个 `TruthValue`，没有权重、没有平行边；
 - **递归 SQL**：`WITH RECURSIVE`、图模式匹配尚未进 parser；

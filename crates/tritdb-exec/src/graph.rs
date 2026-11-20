@@ -18,6 +18,10 @@ pub const MAX_NODES: usize = 4096;
 pub const MAX_EDGES: usize = 16_384;
 /// Maximum vector dimensions accepted by [`annotated_knn`].
 pub const MAX_DIMENSIONS: usize = 64;
+/// Magic header of the persisted graph encoding.
+pub const TRGR_MAGIC: &[u8; 4] = b"TRGR";
+/// Version of the persisted graph encoding.
+pub const TRGR_VERSION: u8 = 1;
 
 /// Structured graph errors.
 #[derive(Debug)]
@@ -70,6 +74,8 @@ pub enum GraphError {
     },
     /// A squared distance did not fit in `i128`.
     DistanceOverflow,
+    /// A stored `TRGR` graph is malformed.
+    BadEncoding(&'static str),
 }
 
 impl fmt::Display for GraphError {
@@ -104,6 +110,7 @@ impl fmt::Display for GraphError {
             GraphError::DistanceOverflow => {
                 write!(formatter, "squared distance does not fit in i128")
             }
+            GraphError::BadEncoding(reason) => write!(formatter, "bad TRGR graph: {reason}"),
         }
     }
 }
@@ -341,6 +348,117 @@ impl AnnotatedGraph {
         Ok(reached)
     }
 
+    /// Encodes the graph as `TRGR`.
+    ///
+    /// Layout: magic `TRGR`, version byte, node count and edge count (`u32`
+    /// little-endian), then `node_count + 1` offsets (`u32`), `edge_count`
+    /// targets (`u32`), and one label byte per edge (`0` = `FALSE`, `1` =
+    /// `UNKNOWN`, `2` = `TRUE`).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes =
+            Vec::with_capacity(13 + 4 * (self.node_count() + 1) + 5 * self.edge_count());
+        bytes.extend_from_slice(TRGR_MAGIC);
+        bytes.push(TRGR_VERSION);
+        bytes.extend_from_slice(&(self.node_count() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.edge_count() as u32).to_le_bytes());
+        for offset in &self.csr.offsets {
+            bytes.extend_from_slice(&(*offset as u32).to_le_bytes());
+        }
+        for target in &self.csr.targets {
+            bytes.extend_from_slice(&target.to_le_bytes());
+        }
+        for label in &self.labels {
+            bytes.push(label_code(*label));
+        }
+        bytes
+    }
+
+    /// Decodes a `TRGR` graph produced by [`Self::encode`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
+        if bytes.len() < 13 || &bytes[0..4] != TRGR_MAGIC {
+            return Err(GraphError::BadEncoding("bad TRGR header"));
+        }
+        if bytes[4] != TRGR_VERSION {
+            return Err(GraphError::BadEncoding("unsupported TRGR version"));
+        }
+        let node_count = read_u32(bytes, 5) as usize;
+        let edge_count = read_u32(bytes, 9) as usize;
+        if node_count > MAX_NODES {
+            return Err(GraphError::TooManyNodes {
+                nodes: node_count,
+                max: MAX_NODES,
+            });
+        }
+        if edge_count > MAX_EDGES {
+            return Err(GraphError::TooManyEdges {
+                edges: edge_count,
+                max: MAX_EDGES,
+            });
+        }
+
+        let offsets_size = (node_count + 1)
+            .checked_mul(4)
+            .ok_or(GraphError::BadEncoding("TRGR size overflows"))?;
+        let targets_size = edge_count
+            .checked_mul(4)
+            .ok_or(GraphError::BadEncoding("TRGR size overflows"))?;
+        let expected = 13usize
+            .checked_add(offsets_size)
+            .and_then(|size| size.checked_add(targets_size))
+            .and_then(|size| size.checked_add(edge_count))
+            .ok_or(GraphError::BadEncoding("TRGR size overflows"))?;
+        if bytes.len() != expected {
+            return Err(GraphError::BadEncoding("TRGR length mismatch"));
+        }
+
+        let mut cursor = 13;
+        let mut offsets = Vec::with_capacity(node_count + 1);
+        for _ in 0..=node_count {
+            offsets.push(read_u32(bytes, cursor) as usize);
+            cursor += 4;
+        }
+        let mut targets = Vec::with_capacity(edge_count);
+        for _ in 0..edge_count {
+            targets.push(read_u32(bytes, cursor));
+            cursor += 4;
+        }
+        let mut labels = Vec::with_capacity(edge_count);
+        for _ in 0..edge_count {
+            labels.push(
+                label_from_code(bytes[cursor])
+                    .ok_or(GraphError::BadEncoding("bad TRGR edge label"))?,
+            );
+            cursor += 1;
+        }
+
+        if offsets[0] != 0 || offsets[node_count] != edge_count {
+            return Err(GraphError::BadEncoding(
+                "TRGR offsets do not cover the edges",
+            ));
+        }
+        for window in offsets.windows(2) {
+            if window[0] > window[1] {
+                return Err(GraphError::BadEncoding("TRGR offsets decrease"));
+            }
+        }
+        for window in offsets.windows(2) {
+            let mut previous = None;
+            for &target in &targets[window[0]..window[1]] {
+                if target as usize >= node_count {
+                    return Err(GraphError::BadEncoding("TRGR target out of range"));
+                }
+                if matches!(previous, Some(value) if target <= value) {
+                    return Err(GraphError::BadEncoding("TRGR row is not sorted"));
+                }
+                previous = Some(target);
+            }
+        }
+        Ok(Self {
+            csr: Csr { offsets, targets },
+            labels,
+        })
+    }
+
     fn bfs_path(
         &self,
         start: u32,
@@ -483,6 +601,32 @@ pub fn annotated_knn(
         }
     }
     Ok(answer)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+const fn label_code(label: TruthValue) -> u8 {
+    match label {
+        TruthValue::False => 0,
+        TruthValue::Unknown => 1,
+        TruthValue::True => 2,
+    }
+}
+
+const fn label_from_code(code: u8) -> Option<TruthValue> {
+    match code {
+        0 => Some(TruthValue::False),
+        1 => Some(TruthValue::Unknown),
+        2 => Some(TruthValue::True),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -634,5 +778,77 @@ mod tests {
         }];
         let error = annotated_knn(&huge, &[i64::MIN], 1).expect_err("overflow");
         assert!(matches!(error, GraphError::DistanceOverflow));
+    }
+
+    #[test]
+    fn trgr_roundtrips_with_labels() {
+        let original = build(&[
+            (0, 1, TruthValue::True),
+            (0, 2, TruthValue::Unknown),
+            (2, 0, TruthValue::False),
+        ]);
+        let bytes = original.encode();
+        assert_eq!(&bytes[0..4], TRGR_MAGIC);
+        assert_eq!(bytes[4], TRGR_VERSION);
+
+        let restored = AnnotatedGraph::decode(&bytes).expect("decode");
+        assert_eq!(restored, original);
+        assert_eq!(restored.node_count(), 3);
+        assert_eq!(restored.edge_count(), 3);
+        assert_eq!(
+            restored.edge_label(2, 0).expect("label"),
+            Some(TruthValue::False)
+        );
+        assert_eq!(
+            restored.reach(0, 2, 2).expect("reach").answer,
+            RepairAnswer::Contingent
+        );
+    }
+
+    #[test]
+    fn trgr_rejects_corrupt_bytes() {
+        let original = build(&[(0, 1, TruthValue::True)]);
+        let bytes = original.encode();
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            AnnotatedGraph::decode(&bad_magic),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        let mut bad_version = bytes.clone();
+        bad_version[4] = 9;
+        assert!(matches!(
+            AnnotatedGraph::decode(&bad_version),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        assert!(matches!(
+            AnnotatedGraph::decode(&bytes[..5]),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        let mut bad_label = bytes.clone();
+        let last = bad_label.len() - 1;
+        bad_label[last] = 7;
+        assert!(matches!(
+            AnnotatedGraph::decode(&bad_label),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        let mut bad_offsets = bytes.clone();
+        bad_offsets[13] = 1;
+        assert!(matches!(
+            AnnotatedGraph::decode(&bad_offsets),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(matches!(
+            AnnotatedGraph::decode(&truncated),
+            Err(GraphError::BadEncoding(_))
+        ));
     }
 }

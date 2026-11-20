@@ -81,10 +81,14 @@ fn print_help() {
     println!("  sql --db sql.db --file script.sql");
     println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
     println!("  repair --facts 2 --denial 0,1 --query 0");
+    println!("  graph build --wal graph.wal --name g [--nodes N] --edges 0-1,1-2 [--label 1-2=U]");
+    println!("  graph load --wal graph.wal --name g");
     println!(
-        "  graph reach --nodes 4 --edges 0-1,1-2 [--label 1-2=U] --from 0 --to 2 [--max-hops 4]"
+        "  graph reach [--wal graph.wal --name g | --nodes N --edges ...] --from 0 --to 2 [--max-hops 4]"
     );
-    println!("  graph neighbors --nodes 4 --edges 0-1,1-2 --node 0 [--hops 1]");
+    println!(
+        "  graph neighbors [--wal graph.wal --name g | --nodes N --edges ...] --node 0 [--hops 1]"
+    );
     println!("  graph knn --points \"1,2;3,4\" [--labels T,U] --query \"1,2\" [--k 3]");
     println!("  cas put --store dir --file blob");
     println!("  cas get --store dir --hash <hex> --out blob");
@@ -1138,11 +1142,13 @@ fn run_anchor(args: &[String]) -> Result<(), String> {
 
 fn run_graph(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
+        Some("build") => graph_build(args),
+        Some("load") => graph_load(args),
         Some("reach") => graph_reach(args),
         Some("neighbors") => graph_neighbors(args),
         Some("knn") => graph_knn(args),
         Some(other) => Err(format!("unknown graph subcommand: {other}")),
-        None => Err("graph requires `reach`, `neighbors`, or `knn`".to_string()),
+        None => Err("graph requires `build`, `load`, `reach`, `neighbors`, or `knn`".to_string()),
     }
 }
 
@@ -1245,9 +1251,68 @@ fn graph_node_count(args: &[String], edges: &[(u32, u32, TruthValue)]) -> Result
 }
 
 fn build_graph(args: &[String]) -> Result<tritdb_exec::graph::AnnotatedGraph, String> {
+    match arg_value(args, "--wal") {
+        Some(wal) => load_stored_graph(args, &wal),
+        None => build_graph_from_edges(args),
+    }
+}
+
+fn build_graph_from_edges(args: &[String]) -> Result<tritdb_exec::graph::AnnotatedGraph, String> {
     let edges = graph_edges(args)?;
     let nodes = graph_node_count(args, &edges)?;
     tritdb_exec::graph::AnnotatedGraph::from_edges(nodes, &edges).map_err(|error| error.to_string())
+}
+
+fn graph_key(name: &str) -> Vec<u8> {
+    format!("graph/{name}").into_bytes()
+}
+
+fn load_stored_graph(
+    args: &[String],
+    wal: &str,
+) -> Result<tritdb_exec::graph::AnnotatedGraph, String> {
+    let name = required_arg(args, "--name")?;
+    let store = TxnStore::open(std::path::Path::new(wal))
+        .map_err(|error| format!("open {wal}: {error}"))?;
+    let bytes = store
+        .get(&graph_key(&name))
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("graph {name} not found in {wal}"))?;
+    tritdb_exec::graph::AnnotatedGraph::decode(&bytes).map_err(|error| error.to_string())
+}
+
+fn graph_build(args: &[String]) -> Result<(), String> {
+    let graph = build_graph_from_edges(args)?;
+    let wal = required_arg(args, "--wal")?;
+    let name = required_arg(args, "--name")?;
+    let bytes = graph.encode();
+    let store = TxnStore::open(std::path::Path::new(&wal))
+        .map_err(|error| format!("open {wal}: {error}"))?;
+    let mut txn = store.begin().map_err(|error| error.to_string())?;
+    txn.put(&graph_key(&name), &bytes)
+        .map_err(|error| error.to_string())?;
+    let info = txn.commit().map_err(|error| error.to_string())?;
+    println!(
+        "name={name} nodes={} edges={} bytes={} txn={} lsn={}",
+        graph.node_count(),
+        graph.edge_count(),
+        bytes.len(),
+        info.txn_id,
+        info.commit_lsn
+    );
+    Ok(())
+}
+
+fn graph_load(args: &[String]) -> Result<(), String> {
+    let wal = required_arg(args, "--wal")?;
+    let name = required_arg(args, "--name")?;
+    let graph = build_graph(args)?;
+    println!(
+        "name={name} wal={wal} nodes={} edges={}",
+        graph.node_count(),
+        graph.edge_count()
+    );
+    Ok(())
 }
 
 fn graph_reach(args: &[String]) -> Result<(), String> {
