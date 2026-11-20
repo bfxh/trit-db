@@ -282,7 +282,7 @@ cargo run -q -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --k
 
 另有 4 个 `#[ignore]` 压力测试（txn 2、store 2），由 nightly `stress.yml` 在 release 下执行。
 
-> M1 最小 SQL 切片与 GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join、EXPLAIN/EXPLAIN ANALYZE、EXPLAIN ANALYZE SEXPR、ANALYZE 统计与估算、Auto join 代价、`WHERE` 合取项拆分与单源下推、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠与恒真条件简化、投影常量折叠、结构化计划树与 `EXPLAIN SEXPR`、结构化 join 键与残余标志、结构化过滤谓词、结构化 join 谓词、结构化 HAVING 谓词、加法 schema 迁移、逗号 `FROM`、UPDATE、IN/BETWEEN/LIKE、CASE 切片在此基线之上追加 97 个测试（`tritdb-exec` 12、`tritdb-sql` 83、SQL CLI 2），当前全量为 **255 个正常测试 + 4 个 ignored**。SQL 语义与边界见 [`M1-SQL.md`](M1-SQL.md)。
+> M1 最小 SQL 切片与 GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join、EXPLAIN/EXPLAIN ANALYZE、EXPLAIN ANALYZE SEXPR、ANALYZE 统计与估算、Auto join 代价、`WHERE` 合取项拆分与单源下推、源表列裁剪（含无歧义未限定列与零列源表投影）、常量折叠与恒真条件简化、投影常量折叠、结构化计划树与 `EXPLAIN SEXPR`、结构化 join 键与残余标志、结构化过滤谓词、结构化 join 谓词、结构化 join 残余谓词、结构化 join 非键合取项、结构化 HAVING 谓词、结构化 Aggregate 分组键与聚合项、结构化 Sort 键与方向、结构化 Project 项与表达式、结构化 Scan 表名与别名、结构化 Scan 下推谓词、加法 schema 迁移、逗号 `FROM`、UPDATE、IN/BETWEEN/LIKE、CASE 切片在此基线之上追加 97 个测试（`tritdb-exec` 12、`tritdb-sql` 83、SQL CLI 2），当前全量为 **255 个正常测试 + 4 个 ignored**。SQL 语义与边界见 [`M1-SQL.md`](M1-SQL.md)。
 
 测试分层、交叉矩阵、崩溃注入与 CI/CD 细节见 [`docs/testing/README.md`](../testing/README.md)。
 

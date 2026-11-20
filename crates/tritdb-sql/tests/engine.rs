@@ -1942,10 +1942,58 @@ fn explain_sexpr_reports_structured_plan() {
     };
     assert_eq!(
         plan,
-        "(limit :limit 1\n  (sort :keys 1\n    (project (\"v\")\n      \
+        "(limit :limit 1\n  (sort :keys ((asc (col \"a.v\")))\n    (project ((\"v\" (col \"a.v\")))\n      \
          (join hash inner :keys ((\"a.id\" \"b.id\")) \
          :pred (= (col \"a.id\") (col \"b.id\"))\n        \
-         (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
+         (scan \"a\" :filtered #t :filter (<> (col \"a.v\") \"skip\"))\n        (scan \"b\" :cols (\"id\"))))))"
+    );
+
+    let both = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' AND b.w <> 'keep';",
+        )
+        .expect("explain sexpr both scan filters");
+    let both_plan = match &as_rows(&both[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        both_plan.contains("(scan \"a\" :filtered #t :filter (<> (col \"a.v\") \"skip\"))"),
+        "unexpected plan: {both_plan}"
+    );
+    assert!(
+        both_plan.contains("(scan \"b\" :filtered #t :filter (<> (col \"b.w\") \"keep\"))"),
+        "unexpected plan: {both_plan}"
+    );
+
+    let aliased = engine
+        .execute_script("EXPLAIN SEXPR SELECT x.v FROM a AS x;")
+        .expect("explain sexpr aliased scan");
+    let aliased_plan = match &as_rows(&aliased[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        aliased_plan.contains("(scan \"a\" :alias \"x\""),
+        "unexpected plan: {aliased_plan}"
+    );
+
+    let aliased_text = engine
+        .execute_script("EXPLAIN SELECT x.v FROM a AS x WHERE x.id > 1;")
+        .expect("explain aliased scan");
+    let aliased_text_plan = as_rows(&aliased_text[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan line, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        aliased_text_plan.contains("Scan a AS x"),
+        "unexpected plan: {aliased_text_plan}"
     );
 
     let having = engine
@@ -1965,6 +2013,10 @@ fn explain_sexpr_reports_structured_plan() {
         ),
         "unexpected plan: {having_plan}"
     );
+    assert!(
+        having_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ((count :all))"),
+        "unexpected plan: {having_plan}"
+    );
     assert!(!having_plan.contains(":est-groups"), "{having_plan}");
     assert!(!having_plan.contains(":actual-groups"), "{having_plan}");
 
@@ -1981,6 +2033,74 @@ fn explain_sexpr_reports_structured_plan() {
     assert!(
         summed_plan.contains("(having :pred (> (sum (col \"a.id\")) 2)"),
         "unexpected plan: {summed_plan}"
+    );
+    assert!(
+        summed_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ((sum (col \"a.id\")))"),
+        "unexpected plan: {summed_plan}"
+    );
+
+    let global = engine
+        .execute_script("EXPLAIN SEXPR SELECT COUNT(*) FROM a;")
+        .expect("explain sexpr global aggregate");
+    let global_plan = match &as_rows(&global[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        global_plan.contains("(aggregate :keys () :aggregates ((count :all))"),
+        "unexpected plan: {global_plan}"
+    );
+
+    let grouped = engine
+        .execute_script("EXPLAIN SEXPR SELECT a.v FROM a GROUP BY a.v;")
+        .expect("explain sexpr group only");
+    let grouped_plan = match &as_rows(&grouped[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        grouped_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ()"),
+        "unexpected plan: {grouped_plan}"
+    );
+
+    let sorted = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v, SUM(a.id) FROM a GROUP BY a.v \
+             ORDER BY SUM(a.id) DESC, a.v ASC;",
+        )
+        .expect("explain sexpr sorted");
+    let sorted_plan = match &as_rows(&sorted[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        sorted_plan.contains("(sort :keys ((desc (sum (col \"a.id\"))) (asc (col \"a.v\")))"),
+        "unexpected plan: {sorted_plan}"
+    );
+
+    let sorted_source = engine
+        .execute_script("EXPLAIN SEXPR SELECT a.v FROM a ORDER BY a.id DESC;")
+        .expect("explain sexpr sorted source column");
+    let sorted_source_plan = match &as_rows(&sorted_source[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        sorted_source_plan.contains("(sort :keys ((desc (col \"a.id\")))"),
+        "unexpected plan: {sorted_source_plan}"
+    );
+
+    let projected = engine
+        .execute_script("EXPLAIN SEXPR SELECT a.v, SUM(a.id) AS total FROM a GROUP BY a.v;")
+        .expect("explain sexpr projected aggregate");
+    let projected_plan = match &as_rows(&projected[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        projected_plan
+            .contains("(project ((\"v\" (col \"a.v\")) (\"total\" (sum (col \"a.id\"))))"),
+        "unexpected plan: {projected_plan}"
     );
 }
 
@@ -2021,11 +2141,11 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
         "unexpected plan: {plan}"
     );
     assert!(
-        plan.contains("(sort :keys 1 :actual-rows 2 :time-ms "),
+        plan.contains("(sort :keys ((asc (col \"a.v\"))) :actual-rows 2 :time-ms "),
         "unexpected plan: {plan}"
     );
     assert!(
-        plan.contains("(project (\"v\") :actual-rows 2 :time-ms "),
+        plan.contains("(project ((\"v\" (col \"a.v\"))) :actual-rows 2 :time-ms "),
         "unexpected plan: {plan}"
     );
     assert!(
@@ -2038,6 +2158,7 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     assert!(
         plan.contains(
             "(join hash inner :keys ((\"a.id\" \"b.id\")) :residual #t \
+             :residual-pred (<> (col \"b.w\") \"b2x\") \
              :pred (and (= (col \"a.id\") (col \"b.id\")) \
              (<> (col \"b.w\") \"b2x\")) :actual-rows 2 :time-ms "
         ),
@@ -2053,6 +2174,39 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     );
     assert!(!plan.contains(":est-rows"), "unexpected plan: {plan}");
     assert!(!plan.contains("Execution:"), "unexpected plan: {plan}");
+
+    let pushed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SEXPR SELECT a.v FROM a JOIN b ON a.id = b.id \
+             WHERE a.v <> 'skip' ORDER BY a.v LIMIT 1;",
+        )
+        .expect("explain analyze sexpr pushed filter");
+    let pushed_plan = match &as_rows(&pushed[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        pushed_plan.contains(
+            "(scan \"a\" :filtered #t :filter (<> (col \"a.v\") \"skip\") :actual-rows 3)"
+        ),
+        "unexpected plan: {pushed_plan}"
+    );
+
+    let grouped = engine
+        .execute_script("EXPLAIN ANALYZE SEXPR SELECT a.v, COUNT(*) FROM a GROUP BY a.v;")
+        .expect("explain analyze sexpr grouped");
+    let grouped_plan = match &as_rows(&grouped[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        grouped_plan.contains(
+            "(aggregate :keys ((col \"a.v\")) :aggregates ((count :all)) \
+             :actual-groups 3 :time-ms "
+        ),
+        "unexpected plan: {grouped_plan}"
+    );
+    assert!(!grouped_plan.contains(":est-groups"), "{grouped_plan}");
 }
 
 #[test]
@@ -2081,7 +2235,7 @@ fn explain_sexpr_reports_structured_filter_predicate() {
     };
     assert_eq!(
         plan,
-        "(project (\"v\")\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
+        "(project ((\"v\" (col \"a.v\")))\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
          (like (col \"b.w\") \"b%\"))\n    (join hash inner :keys ((\"a.id\" \"b.id\")) \
          :pred (= (col \"a.id\") (col \"b.id\"))\n      \
          (scan \"a\")\n      (scan \"b\"))))"
@@ -2115,6 +2269,10 @@ fn explain_sexpr_reports_structured_join_keys() {
         "unexpected plan: {using}"
     );
     assert!(!using.contains(":details"), "unexpected plan: {using}");
+    assert!(
+        !using.contains(":residual-pred"),
+        "USING join must not invent a residual predicate: {using}"
+    );
 
     let residual = plan_text(
         &mut engine,
@@ -2123,6 +2281,7 @@ fn explain_sexpr_reports_structured_join_keys() {
     assert!(
         residual.contains(
             ":keys ((\"a.id\" \"b.id\")) :residual #t \
+             :residual-pred (<> (col \"b.code\") 0) \
              :pred (and (= (col \"a.id\") (col \"b.id\")) (<> (col \"b.code\") 0))"
         ),
         "unexpected plan: {residual}"
@@ -2130,6 +2289,82 @@ fn explain_sexpr_reports_structured_join_keys() {
     assert!(
         !residual.contains(":details"),
         "unexpected plan: {residual}"
+    );
+
+    let composite = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND a.code = b.code AND b.code <> 0;",
+    );
+    assert!(
+        composite.contains(
+            ":keys ((\"a.id\" \"b.id\") (\"a.code\" \"b.code\")) :residual #t \
+             :residual-pred (<> (col \"b.code\") 0)"
+        ),
+        "unexpected plan: {composite}"
+    );
+
+    let or_residual = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND (b.code <> 0 OR a.code <> 1);",
+    );
+    assert!(
+        or_residual.contains(
+            ":residual #t :residual-pred (or (<> (col \"b.code\") 0) \
+             (<> (col \"a.code\") 1))"
+        ),
+        "unexpected plan: {or_residual}"
+    );
+
+    let pure = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND a.code = b.code;",
+    );
+    assert!(
+        !pure.contains(":residual-pred"),
+        "pure equi join must not carry a residual predicate: {pure}"
+    );
+
+    let same_source = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND a.id = a.code;",
+    );
+    assert!(
+        same_source.contains(
+            ":keys ((\"a.id\" \"b.id\")) \
+             :residual-pred (= (col \"a.id\") (col \"a.code\")) \
+             :pred (and (= (col \"a.id\") (col \"b.id\")) \
+             (= (col \"a.id\") (col \"a.code\")))"
+        ),
+        "same-source equality must still expose its non-key conjunct: {same_source}"
+    );
+    assert!(
+        !same_source.contains(":residual #t"),
+        "historical residual flag must stay unchanged: {same_source}"
+    );
+
+    let same_source_text = engine
+        .execute_script("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id AND a.id = a.code;")
+        .expect("explain same-source join");
+    let same_source_text = as_rows(&same_source_text[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan line, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        same_source_text.contains("HashJoin (inner) keys=(a.id = b.id)"),
+        "unexpected text plan: {same_source_text}"
+    );
+    assert!(
+        !same_source_text.contains("residual=yes"),
+        "text plan must not gain a residual marker: {same_source_text}"
     );
 
     engine.set_join_strategy(JoinStrategy::NestedLoop);
@@ -2145,6 +2380,10 @@ fn explain_sexpr_reports_structured_join_keys() {
         "unexpected plan: {nested}"
     );
     assert!(!nested.contains(":details"), "unexpected plan: {nested}");
+    assert!(
+        !nested.contains(":residual-pred"),
+        "nested-loop join must not carry a residual predicate: {nested}"
+    );
 }
 
 #[test]
@@ -2171,7 +2410,7 @@ fn explain_sexpr_includes_estimates_and_zero_columns() {
     };
     assert_eq!(
         plan,
-        "(project (\"one\") :est-rows 3\n  (scan \"a\" :est-rows 3 :cols ()))"
+        "(project ((\"one\" 1)) :est-rows 3\n  (scan \"a\" :est-rows 3 :cols ()))"
     );
 }
 

@@ -7,10 +7,16 @@ use crate::ast::{
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 
+const MAX_EXPR_DEPTH: usize = 64;
+
 /// Parses a semicolon-separated SQL script.
 pub fn parse_script(sql: &str) -> Result<Vec<Statement>, SqlError> {
     let tokens = Lexer::new(sql).tokenize()?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        expr_depth: 0,
+    };
     let mut statements = Vec::new();
     loop {
         while parser.eat_symbol(Symbol::Semicolon) {}
@@ -28,9 +34,23 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>, SqlError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    expr_depth: usize,
 }
 
 impl Parser {
+    fn with_expr_depth<F>(&mut self, parse: F) -> Result<Expr, SqlError>
+    where
+        F: FnOnce(&mut Self) -> Result<Expr, SqlError>,
+    {
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            return Err(self.error("expression nesting too deep"));
+        }
+        self.expr_depth += 1;
+        let result = parse(self);
+        self.expr_depth -= 1;
+        result
+    }
+
     fn at_end(&self) -> bool {
         self.pos >= self.tokens.len()
     }
@@ -546,7 +566,7 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, SqlError> {
-        self.parse_or()
+        self.with_expr_depth(|parser| parser.parse_or())
     }
 
     fn parse_or(&mut self) -> Result<Expr, SqlError> {
@@ -569,7 +589,7 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expr, SqlError> {
         if self.eat_keyword(Keyword::Not) {
-            Ok(Expr::Not(Box::new(self.parse_not()?)))
+            self.with_expr_depth(|parser| Ok(Expr::Not(Box::new(parser.parse_not()?))))
         } else {
             self.parse_comparison()
         }
@@ -713,11 +733,13 @@ impl Parser {
                 self.pos += 1;
                 return Ok(Expr::Literal(Value::Int(-value)));
             }
-            return Ok(binary(
-                BinaryOp::Sub,
-                Expr::Literal(Value::Int(0)),
-                self.parse_unary()?,
-            ));
+            return self.with_expr_depth(|parser| {
+                Ok(binary(
+                    BinaryOp::Sub,
+                    Expr::Literal(Value::Int(0)),
+                    parser.parse_unary()?,
+                ))
+            });
         }
         self.eat_symbol(Symbol::Plus);
         self.parse_primary()
@@ -1301,6 +1323,34 @@ mod tests {
         assert!(parse_script("SELECT CASE WHEN flag THEN 1 FROM t;").is_err());
         assert!(parse_script("SELECT CASE WHEN flag 1 END FROM t;").is_err());
         assert!(parse_script("SELECT CASE END FROM t;").is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_expression_nesting() {
+        let depth = MAX_EXPR_DEPTH + 16;
+        let nested = format!("SELECT {}1{} FROM t;", "(".repeat(depth), ")".repeat(depth));
+        let error = parse_script(&nested).expect_err("nested parentheses must be rejected");
+        assert!(
+            matches!(error, SqlError::Parse { ref message, .. } if message.contains("too deep")),
+            "{error:?}"
+        );
+
+        let nots = format!("SELECT {}1 FROM t;", "NOT ".repeat(depth));
+        let error = parse_script(&nots).expect_err("NOT chain must be rejected");
+        assert!(
+            matches!(error, SqlError::Parse { ref message, .. } if message.contains("too deep")),
+            "{error:?}"
+        );
+
+        let negatives = format!("SELECT {}1 FROM t;", "- ".repeat(depth));
+        let error = parse_script(&negatives).expect_err("unary minus chain must be rejected");
+        assert!(
+            matches!(error, SqlError::Parse { ref message, .. } if message.contains("too deep")),
+            "{error:?}"
+        );
+
+        let nested = format!("SELECT {}1{} FROM t;", "(".repeat(32), ")".repeat(32));
+        parse_script(&nested).expect("modest nesting must still parse");
     }
 
     #[test]

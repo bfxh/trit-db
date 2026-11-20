@@ -52,6 +52,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo test --workspace
 
+  bench-smoke:
+    name: bench smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run --locked --release -p tritdb-bench -- sql-plan --rows 256 --rounds 1 | tee /tmp/sql-plan.txt
+      - run: grep -q '"bench_id":"sql_plan"' /tmp/sql-plan.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-join --rows 256 --rounds 1 --strategy auto | tee /tmp/sql-join.txt
+      - run: grep -q '"bench_id":"sql_join"' /tmp/sql-join.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-exec --rows 256 --rounds 1 --query filter | tee /tmp/sql-exec.txt
+      - run: grep -q '"bench_id":"sql_exec"' /tmp/sql-exec.txt
+
   python-crosscheck:
     name: python crosscheck (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

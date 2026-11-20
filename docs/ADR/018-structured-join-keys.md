@@ -3,6 +3,8 @@
 状态：已实现（Accepted）；只改变 `PlanNode` 的内部表示，`EXPLAIN` 文本不变；`EXPLAIN SEXPR` 的 join 字段由 ADR-019 升级为结构化输出
 日期：2026-11-20
 
+> 后续：ADR-022 为 `JoinPlan` 增加完整 `pred`；ADR-027 再增加 `residual_pred`，承载 hash 键之外的残余项。
+
 ## 背景
 
 ADR-017 引入了 `PlanNode`，但 `JoinPlan` 仍把 join 的键和残余谓词存成已经渲染好的字符串：

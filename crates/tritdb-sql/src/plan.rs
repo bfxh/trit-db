@@ -22,8 +22,10 @@ pub(crate) struct PlanNode {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlanKind {
     Scan {
-        label: String,
+        table: String,
+        alias: Option<String>,
         filtered: bool,
+        filter: Option<PlanExpr>,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
         columns: Option<Vec<String>>,
@@ -33,19 +35,13 @@ pub(crate) enum PlanKind {
         pred: PlanExpr,
         metrics: Metrics,
     },
-    Aggregate(Metrics),
+    Aggregate(AggregatePlan),
     Having {
         pred: PlanExpr,
         metrics: Metrics,
     },
-    Project {
-        columns: Vec<String>,
-        metrics: Metrics,
-    },
-    Sort {
-        keys: usize,
-        metrics: Metrics,
-    },
+    Project(ProjectPlan),
+    Sort(SortPlan),
     Limit {
         limit: usize,
         actual_rows: Option<u64>,
@@ -104,8 +100,9 @@ pub(crate) enum PlanExpr {
     },
 }
 
-/// Join-specific fields. Keys and residual flags are data; the historical
-/// `keys=...` / `residual=yes` / `on=expr` fragments are rendered on demand.
+/// Join-specific fields. Keys, residual flags, and the residual predicate are
+/// data; the historical `keys=...` / `residual=yes` / `on=expr` fragments are
+/// rendered on demand.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JoinPlan {
     pub(crate) uses_hash: bool,
@@ -113,12 +110,59 @@ pub(crate) struct JoinPlan {
     pub(crate) keys: Option<JoinKeys>,
     /// `true` when an `ON` hash join has a predicate beyond its equi-keys.
     pub(crate) residual: bool,
+    /// The non-key conjuncts of the join predicate, when `residual` is true.
+    /// Equi-key conjuncts are removed; the remaining tree is still a bound
+    /// expression over the combined schema.
+    pub(crate) residual_pred: Option<PlanExpr>,
     /// `true` when a nested-loop `ON` join shows the whole predicate as
     /// `on=expr`.
     pub(crate) on_expr: bool,
     /// Complete bound `ON` / `USING` / `NATURAL` predicate, when one exists.
     pub(crate) pred: Option<PlanExpr>,
     pub(crate) metrics: Metrics,
+}
+
+/// Aggregate-specific fields. `keys` are the bound `GROUP BY` expressions;
+/// `aggregates` are the distinct aggregate calls referenced by the query's
+/// SELECT, HAVING, and ORDER BY expressions. The latter is a query-level
+/// inventory, not a precomputed physical aggregate list.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregatePlan {
+    pub(crate) keys: Vec<PlanExpr>,
+    pub(crate) aggregates: Vec<PlanExpr>,
+    pub(crate) metrics: Metrics,
+}
+
+/// Sort-specific fields. `keys` preserve the bound `ORDER BY` expressions and
+/// their directions; null placement remains the executor's fixed rule (ASC
+/// puts NULL first, DESC puts NULL last) rather than a per-key field.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SortPlan {
+    pub(crate) keys: Vec<SortKey>,
+    pub(crate) metrics: Metrics,
+}
+
+/// One bound `ORDER BY` key.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SortKey {
+    pub(crate) expr: PlanExpr,
+    pub(crate) ascending: bool,
+}
+
+/// Project-specific fields. Each item pairs the caller-visible output name
+/// with the bound expression that computes it; `items` and the text label
+/// therefore stay aligned by construction.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectPlan {
+    pub(crate) items: Vec<ProjectItem>,
+    pub(crate) metrics: Metrics,
+}
+
+/// One projected output column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectItem {
+    pub(crate) name: String,
+    pub(crate) expr: PlanExpr,
 }
 
 /// How a join's keys are displayed. `USING` / `NATURAL` keys are symbolic
@@ -148,16 +192,20 @@ pub(crate) struct Metrics {
 
 impl PlanNode {
     pub(crate) fn scan(
-        label: String,
+        table: String,
+        alias: Option<String>,
         filtered: bool,
+        filter: Option<PlanExpr>,
         actual_rows: Option<u64>,
         est_rows: Option<u64>,
         columns: Option<Vec<String>>,
     ) -> Self {
         Self {
             kind: PlanKind::Scan {
-                label,
+                table,
+                alias,
                 filtered,
+                filter,
                 actual_rows,
                 est_rows,
                 columns,
@@ -223,13 +271,15 @@ impl PlanNode {
     fn label(&self) -> String {
         match &self.kind {
             PlanKind::Scan {
-                label,
+                table,
+                alias,
                 filtered,
+                filter: _,
                 actual_rows,
                 est_rows,
                 columns,
             } => {
-                let mut text = format!("Scan {label}");
+                let mut text = format!("Scan {}", scan_name(table, alias.as_deref()));
                 if *filtered {
                     text.push_str(" filtered");
                 }
@@ -274,9 +324,9 @@ impl PlanNode {
                 push_metrics(&mut text, metrics, "rows");
                 text
             }
-            PlanKind::Aggregate(metrics) => {
+            PlanKind::Aggregate(aggregate) => {
                 let mut text = "Aggregate".to_string();
-                push_metrics(&mut text, metrics, "groups");
+                push_metrics(&mut text, &aggregate.metrics, "groups");
                 text
             }
             PlanKind::Having { metrics, .. } => {
@@ -284,14 +334,19 @@ impl PlanNode {
                 push_metrics(&mut text, metrics, "groups");
                 text
             }
-            PlanKind::Project { columns, metrics } => {
-                let mut text = format!("Project [{}]", columns.join(", "));
-                push_metrics(&mut text, metrics, "rows");
+            PlanKind::Project(project) => {
+                let names = project
+                    .items
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>();
+                let mut text = format!("Project [{}]", names.join(", "));
+                push_metrics(&mut text, &project.metrics, "rows");
                 text
             }
-            PlanKind::Sort { keys, metrics } => {
-                let mut text = format!("Sort ({keys} key(s))");
-                push_metrics(&mut text, metrics, "rows");
+            PlanKind::Sort(sort) => {
+                let mut text = format!("Sort ({} key(s))", sort.keys.len());
+                push_metrics(&mut text, &sort.metrics, "rows");
                 text
             }
             PlanKind::Limit {
@@ -318,16 +373,26 @@ impl PlanNode {
         out.push_str(&"  ".repeat(indent));
         match &self.kind {
             PlanKind::Scan {
-                label,
+                table,
+                alias,
                 filtered,
+                filter,
                 actual_rows,
                 est_rows,
                 columns,
             } => {
                 out.push_str("(scan ");
-                push_string(out, label);
+                push_string(out, table);
+                if let Some(alias) = alias {
+                    out.push_str(" :alias ");
+                    push_string(out, alias);
+                }
                 if *filtered {
                     out.push_str(" :filtered #t");
+                }
+                if let Some(filter) = filter {
+                    out.push_str(" :filter ");
+                    filter.write_sexpr(out);
                 }
                 push_sexpr_metrics(
                     out,
@@ -360,6 +425,10 @@ impl PlanNode {
                 if join.residual {
                     out.push_str(" :residual #t");
                 }
+                if let Some(residual_pred) = &join.residual_pred {
+                    out.push_str(" :residual-pred ");
+                    residual_pred.write_sexpr(out);
+                }
                 if join.on_expr {
                     out.push_str(" :on-expr #t");
                 }
@@ -378,9 +447,12 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Aggregate(metrics) => {
-                out.push_str("(aggregate");
-                push_sexpr_metrics(out, metrics, "groups");
+            PlanKind::Aggregate(aggregate) => {
+                out.push_str("(aggregate :keys ");
+                push_plan_expr_list(out, &aggregate.keys);
+                out.push_str(" :aggregates ");
+                push_plan_expr_list(out, &aggregate.aggregates);
+                push_sexpr_metrics(out, &aggregate.metrics, "groups");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
@@ -391,16 +463,17 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Project { columns, metrics } => {
+            PlanKind::Project(project) => {
                 out.push_str("(project ");
-                push_string_list(out, columns);
-                push_sexpr_metrics(out, metrics, "rows");
+                push_project_items(out, &project.items);
+                push_sexpr_metrics(out, &project.metrics, "rows");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Sort { keys, metrics } => {
-                out.push_str(&format!("(sort :keys {keys}"));
-                push_sexpr_metrics(out, metrics, "rows");
+            PlanKind::Sort(sort) => {
+                out.push_str("(sort :keys ");
+                push_sort_keys(out, &sort.keys);
+                push_sexpr_metrics(out, &sort.metrics, "rows");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
@@ -834,6 +907,13 @@ fn binary_name(op: BinaryOp) -> &'static str {
     }
 }
 
+fn scan_name(table: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(alias) => format!("{table} AS {alias}"),
+        None => table.to_string(),
+    }
+}
+
 fn push_string(out: &mut String, value: &str) {
     out.push('"');
     for ch in value.chars() {
@@ -847,6 +927,47 @@ fn push_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+fn push_project_items(out: &mut String, items: &[ProjectItem]) {
+    out.push('(');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        push_string(out, &item.name);
+        out.push(' ');
+        item.expr.write_sexpr(out);
+        out.push(')');
+    }
+    out.push(')');
+}
+
+fn push_sort_keys(out: &mut String, keys: &[SortKey]) {
+    out.push('(');
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        out.push_str(if key.ascending { "asc" } else { "desc" });
+        out.push(' ');
+        key.expr.write_sexpr(out);
+        out.push(')');
+    }
+    out.push(')');
+}
+
+fn push_plan_expr_list(out: &mut String, exprs: &[PlanExpr]) {
+    out.push('(');
+    for (index, expr) in exprs.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        expr.write_sexpr(out);
+    }
+    out.push(')');
 }
 
 fn push_string_list(out: &mut String, values: &[String]) {

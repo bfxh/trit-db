@@ -16,7 +16,10 @@ use crate::ast::{
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
-use crate::plan::{JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode};
+use crate::plan::{
+    AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode, ProjectItem,
+    ProjectPlan, SortKey, SortPlan,
+};
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
     decode_stats, decode_table, encode_stats, encode_table, stats_key, table_key, STATS_KEY_PREFIX,
@@ -987,9 +990,12 @@ impl SqlEngine {
         let left_filtered = stats
             .and_then(|stats| stats.scan_filters.get(scan_index).copied())
             .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
+        let left_filter = plan_scan_filter(pushdown, scan_index, &left_table.schema)?;
         let mut plan = PlanNode::scan(
-            source_label(left.name.as_str(), &left_qualifier),
+            left.name.clone(),
+            source_alias(left.name.as_str(), &left_qualifier),
             left_filtered,
+            left_filter,
             stats
                 .and_then(|stats| stats.scan_rows.get(scan_index).copied())
                 .map(|rows| rows as u64),
@@ -1061,9 +1067,12 @@ impl SqlEngine {
             let right_filtered = stats
                 .and_then(|stats| stats.scan_filters.get(scan_index).copied())
                 .unwrap_or_else(|| pushdown_filter(pushdown, scan_index).is_some());
+            let right_filter = plan_scan_filter(pushdown, scan_index, &right_table.schema)?;
             let right_plan = PlanNode::scan(
-                source_label(right.name.as_str(), &qualifier),
+                right.name.clone(),
+                source_alias(right.name.as_str(), &qualifier),
                 right_filtered,
+                right_filter,
                 stats
                     .and_then(|stats| stats.scan_rows.get(scan_index).copied())
                     .map(|rows| rows as u64),
@@ -1119,7 +1128,29 @@ impl SqlEngine {
             } else {
                 Metrics::default()
             };
-            plan = PlanNode::unary(PlanKind::Aggregate(metrics), plan);
+            let keys = bound
+                .group_by
+                .iter()
+                .map(|expr| PlanExpr::from_exec(expr, &left_table.schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut aggregates = Vec::new();
+            for item in &bound.items {
+                collect_plan_aggregates(&item.expr, &left_table.schema, &mut aggregates)?;
+            }
+            if let Some(having) = &bound.having {
+                collect_plan_aggregates(having, &left_table.schema, &mut aggregates)?;
+            }
+            for order in &bound.order_by {
+                collect_plan_aggregates(&order.expr, &left_table.schema, &mut aggregates)?;
+            }
+            plan = PlanNode::unary(
+                PlanKind::Aggregate(AggregatePlan {
+                    keys,
+                    aggregates,
+                    metrics,
+                }),
+                plan,
+            );
             if let Some(having) = &bound.having {
                 let metrics = if let Some(stats) = stats {
                     Metrics {
@@ -1140,11 +1171,13 @@ impl SqlEngine {
                 plan = PlanNode::unary(PlanKind::Having { pred, metrics }, plan);
             }
         }
-        let projection_names = bound
-            .items
-            .iter()
-            .map(|item| item.name().to_string())
-            .collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(bound.items.len());
+        for item in &bound.items {
+            items.push(ProjectItem {
+                name: item.name().to_string(),
+                expr: PlanExpr::from_group_expr(&item.expr, &left_table.schema)?,
+            });
+        }
         let metrics = if let Some(stats) = stats {
             Metrics {
                 actual: Some(stats.project_rows as u64),
@@ -1160,13 +1193,7 @@ impl SqlEngine {
         } else {
             Metrics::default()
         };
-        plan = PlanNode::unary(
-            PlanKind::Project {
-                columns: projection_names,
-                metrics,
-            },
-            plan,
-        );
+        plan = PlanNode::unary(PlanKind::Project(ProjectPlan { items, metrics }), plan);
         if !bound.order_by.is_empty() {
             let metrics = if let Some(stats) = stats {
                 Metrics {
@@ -1183,13 +1210,14 @@ impl SqlEngine {
             } else {
                 Metrics::default()
             };
-            plan = PlanNode::unary(
-                PlanKind::Sort {
-                    keys: bound.order_by.len(),
-                    metrics,
-                },
-                plan,
-            );
+            let mut keys = Vec::with_capacity(bound.order_by.len());
+            for order in &bound.order_by {
+                keys.push(SortKey {
+                    expr: PlanExpr::from_group_expr(&order.expr, &left_table.schema)?,
+                    ascending: order.ascending,
+                });
+            }
+            plan = PlanNode::unary(PlanKind::Sort(SortPlan { keys, metrics }), plan);
         }
         if let Some(limit) = bound.limit {
             let actual_rows = stats.map(|stats| stats.output_rows as u64);
@@ -1222,6 +1250,67 @@ impl SqlEngine {
         self.stats.remove(&name);
         Ok(())
     }
+}
+
+/// Collect the distinct aggregate calls referenced by one bound group
+/// expression. The plan reports this as a query-level inventory; the executor
+/// still evaluates each occurrence where it appears.
+fn collect_plan_aggregates(
+    expr: &GroupExpr,
+    schema: &Schema,
+    out: &mut Vec<PlanExpr>,
+) -> Result<(), SqlError> {
+    match expr {
+        GroupExpr::Aggregate { .. } => {
+            let aggregate = PlanExpr::from_group_expr(expr, schema)?;
+            if !out.contains(&aggregate) {
+                out.push(aggregate);
+            }
+        }
+        GroupExpr::Scalar(_) => {}
+        GroupExpr::IsNull { expr, .. } | GroupExpr::IsTruth { expr, .. } => {
+            collect_plan_aggregates(expr, schema, out)?;
+        }
+        GroupExpr::Not(expr) => collect_plan_aggregates(expr, schema, out)?,
+        GroupExpr::InList { expr, values, .. } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            for value in values {
+                collect_plan_aggregates(value, schema, out)?;
+            }
+        }
+        GroupExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            collect_plan_aggregates(low, schema, out)?;
+            collect_plan_aggregates(high, schema, out)?;
+        }
+        GroupExpr::Like { expr, pattern, .. } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            collect_plan_aggregates(pattern, schema, out)?;
+        }
+        GroupExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_plan_aggregates(operand, schema, out)?;
+            }
+            for (when, then) in branches {
+                collect_plan_aggregates(when, schema, out)?;
+                collect_plan_aggregates(then, schema, out)?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_plan_aggregates(else_expr, schema, out)?;
+            }
+        }
+        GroupExpr::Binary { left, right, .. } => {
+            collect_plan_aggregates(left, schema, out)?;
+            collect_plan_aggregates(right, schema, out)?;
+        }
+    }
+    Ok(())
 }
 
 fn qualify_table(table: &Table, qualifier: &str) -> Table {
@@ -1695,6 +1784,21 @@ fn select_with_filter(select: &Select, filter: Option<Expr>) -> Select {
 
 fn pushdown_filter(pushdown: &PushdownPlan, index: usize) -> Option<&Expr> {
     pushdown.filters.get(index).and_then(Option::as_ref)
+}
+
+/// Binds a pushed-down source filter against the full source schema and
+/// converts it to the read-only plan expression shape.
+fn plan_scan_filter(
+    pushdown: &PushdownPlan,
+    index: usize,
+    schema: &Schema,
+) -> Result<Option<PlanExpr>, SqlError> {
+    pushdown_filter(pushdown, index)
+        .map(|filter| {
+            let bound = bind_expr(filter, schema)?;
+            PlanExpr::from_exec(&bound, schema)
+        })
+        .transpose()
 }
 
 fn filter_table(table: Table, filter: &Expr) -> Result<Table, SqlError> {
@@ -2325,12 +2429,8 @@ fn equality_selectivity(left: &ExecExpr, right: &ExecExpr, ndvs: &[u64]) -> f64 
     }
 }
 
-fn source_label(table: &str, qualifier: &str) -> String {
-    if table == qualifier {
-        table.to_string()
-    } else {
-        format!("{table} AS {qualifier}")
-    }
+fn source_alias(table: &str, qualifier: &str) -> Option<String> {
+    (table != qualifier).then(|| qualifier.to_string())
 }
 
 fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {
@@ -2349,6 +2449,44 @@ fn is_pure_equi_conjunction(expr: &ExecExpr) -> bool {
             (ExecExpr::Column(_), ExecExpr::Column(_))
         ),
         _ => false,
+    }
+}
+
+/// Remove the top-level conjuncts already represented by hash keys. The
+/// remaining tree keeps its original conjunction shape and is cloned only at
+/// the leaves that survive.
+fn residual_join_predicate(
+    expr: &ExecExpr,
+    left_len: usize,
+    keys: &[(usize, usize)],
+) -> Option<ExecExpr> {
+    match expr {
+        ExecExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => match (
+            residual_join_predicate(left, left_len, keys),
+            residual_join_predicate(right, left_len, keys),
+        ) {
+            (None, None) => None,
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (Some(left), Some(right)) => Some(ExecExpr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+        },
+        ExecExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => match equi_pair(left, right, left_len) {
+            Some(pair) if keys.contains(&pair) => None,
+            _ => Some(expr.clone()),
+        },
+        _ => Some(expr.clone()),
     }
 }
 
@@ -2413,11 +2551,20 @@ fn join_plan(
     let pred = predicate
         .map(|expr| PlanExpr::from_exec(expr, &pair_schema))
         .transpose()?;
+    let residual_pred = if uses_hash {
+        predicate
+            .and_then(|expr| residual_join_predicate(expr, left.schema.len(), hash_pairs))
+            .map(|expr| PlanExpr::from_exec(&expr, &pair_schema))
+            .transpose()?
+    } else {
+        None
+    };
     Ok(JoinPlan {
         uses_hash,
         kind: join.kind,
         keys,
         residual,
+        residual_pred,
         on_expr,
         pred,
         metrics: Metrics::default(),

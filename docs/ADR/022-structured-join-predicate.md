@@ -3,6 +3,8 @@
 状态：Accepted  
 日期：2026-11-20
 
+> 后续：ADR-027 在不改变 `:pred` 含义的前提下，新增 `:residual-pred` 承载等值键之外的顶层合取项。
+
 ## 背景
 
 ADR-018 把 `JoinPlan.details` 拆成了 `JoinKeys`、`residual`、`on_expr`，ADR-019 又把这些字段暴露到 `EXPLAIN SEXPR`。但 join 自身的谓词仍只有布尔标志：
@@ -43,7 +45,7 @@ ADR-021 已经把 `Filter` 的绑定谓词转成 `PlanExpr`，因此 `Filter :pr
 
 ## 不做什么
 
-- 不把 `:pred` 拆成「等值键部分 / 残余部分」；这需要重写谓词树，留到真正需要规则消费残余条件时再做。
+- 不把 `:pred` 拆成「等值键部分 / 残余部分」；`pred` 本身保持完整。ADR-027 另加 `:residual-pred` 作为并列的残余视图，而不是改变 `:pred` 的含义。
 - 不改变 join 执行路径：`pred` 只用于计划观察，hash / nested-loop 的选择、桶键和行匹配仍走原逻辑。
 - 本切片不结构化 `HAVING` 谓词，也不引入子查询或通用表达式求值；该限制已由 ADR-023 撤销。
 - 不把 `:pred` 渲染成 SQL 文本，也不把 `EXPLAIN` 文本改成 `PlanExpr` 渲染；文本格式是兼容边界。

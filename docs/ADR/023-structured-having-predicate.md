@@ -3,6 +3,8 @@
 状态：Accepted  
 日期：2026-11-20
 
+> 后续：ADR-024 把 `Aggregate` 的 `GROUP BY` 分组键与查询引用到的聚合调用转成 `:keys` / `:aggregates`。
+
 ## 背景
 
 ADR-021 把 `Filter` 的 `WHERE` 谓词转成 `PlanExpr`，ADR-022 又把 join 自身的完整谓词转成同一形状。`Having` 仍只有 `Metrics`：
@@ -41,7 +43,7 @@ Having {
 ```lisp
 (having :pred (and (> (count :all) 1)
                    (is-not-null (col "t.k")))
-  (aggregate
+  (aggregate :keys ((col "t.k")) :aggregates ((count :all))
     (scan "t")))
 ```
 
