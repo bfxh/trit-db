@@ -2311,7 +2311,7 @@ fn analyze_persists_and_explain_uses_estimates() {
         "Limit 2 est rows=1\n  Sort (1 key(s)) est rows=1\n    \
          Project [id, w] est rows=1\n      \
          NestedLoop (inner) on=expr est rows=1\n        \
-         Scan a filtered est rows=1\n        Scan b est rows=3"
+         Scan a filtered est rows=1 cols=id\n        Scan b est rows=3"
     );
     let grouped = engine
         .execute_script(
@@ -2651,6 +2651,172 @@ fn cross_join_handles_empty_inputs_and_validation() {
     assert!(
         matches!(&unknown, SqlError::UnknownTable(name) if name == "missing"),
         "unexpected {unknown:?}"
+    );
+}
+
+#[test]
+fn join_projection_prunes_unused_source_columns() {
+    let dir = TempDir::new("sql-projection");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, v TEXT, spare TEXT); \
+             CREATE TABLE b (id INT NOT NULL, w TEXT, spare TEXT); \
+             INSERT INTO a VALUES (1, 'a1', 'sa1'), (2, 'a2', 'sa2'), (3, 'a3', 'sa3'); \
+             INSERT INTO b VALUES (1, 'b1', 'sb1'), (2, 'b2', 'sb2'), (3, 'b3', 'sb3'); \
+             ANALYZE;",
+        )
+        .expect("seed and analyze");
+
+    let selected = engine
+        .execute_script("SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("select with projection");
+    assert_eq!(
+        as_rows(&selected[0]).1,
+        [vec![
+            Value::Text("a2".to_string()),
+            Value::Text("b2".to_string())
+        ]]
+    );
+
+    let explained = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;")
+        .expect("explain projected join");
+    let plan = as_rows(&explained[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a filtered est rows=1 cols=id,v"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b est rows=3 cols=id,w"),
+        "unexpected plan: {plan}"
+    );
+    assert!(!plan.contains("spare"), "unexpected plan: {plan}");
+
+    let grouped = engine
+        .execute_script(
+            "SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v ORDER BY a.v;",
+        )
+        .expect("grouped projection");
+    assert_eq!(
+        as_rows(&grouped[0]).1,
+        [
+            vec![Value::Text("a1".to_string()), Value::Int(1)],
+            vec![Value::Text("a2".to_string()), Value::Int(1)],
+            vec![Value::Text("a3".to_string()), Value::Int(1)],
+        ]
+    );
+    let grouped_plan = engine
+        .execute_script(
+            "EXPLAIN SELECT a.v, COUNT(*) AS n FROM a JOIN b ON a.id = b.id \
+             GROUP BY a.v ORDER BY a.v;",
+        )
+        .expect("grouped explain");
+    let plan = as_rows(&grouped_plan[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan b est rows=3 cols=id"),
+        "unexpected plan: {plan}"
+    );
+
+    let analyzed = engine
+        .execute_script(
+            "EXPLAIN ANALYZE SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE a.id = 2;",
+        )
+        .expect("explain analyze projected join");
+    let plan = as_rows(&analyzed[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a filtered actual rows=1 cols=id,v"),
+        "unexpected plan: {plan}"
+    );
+    assert!(
+        plan.contains("Scan b actual rows=3 cols=id,w"),
+        "unexpected plan: {plan}"
+    );
+
+    let wildcard = engine
+        .execute_script("EXPLAIN SELECT * FROM a JOIN b ON a.id = b.id;")
+        .expect("wildcard explain");
+    let plan = as_rows(&wildcard[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("cols="), "unexpected plan: {plan}");
+
+    let unqualified = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.id = b.id WHERE v = 'a2';")
+        .expect("unqualified explain");
+    let plan = as_rows(&unqualified[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("cols="), "unexpected plan: {plan}");
+    assert!(plan.contains("Filter"), "unexpected plan: {plan}");
+
+    let using = engine
+        .execute_script("EXPLAIN SELECT a.v, b.w FROM a JOIN b USING (id);")
+        .expect("using explain");
+    let plan = as_rows(&using[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plan.contains("cols="), "unexpected plan: {plan}");
+
+    let single = engine
+        .execute_script("EXPLAIN SELECT a.v FROM a WHERE a.id = 2;")
+        .expect("single table explain");
+    let plan = as_rows(&single[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Scan a est rows=3 cols=id,v"),
+        "unexpected plan: {plan}"
     );
 }
 

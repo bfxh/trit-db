@@ -11,7 +11,7 @@ use tritdb_exec::{
 use tritdb_txn::TxnStore;
 
 use crate::ast::{
-    AggregateKind, Assignment, Expr, Join, JoinCondition, JoinKind, Select, Statement,
+    AggregateKind, Assignment, Expr, Join, JoinCondition, JoinKind, Select, SelectItem, Statement,
 };
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
@@ -95,6 +95,31 @@ struct PushdownPlan {
     filters: Vec<Option<Expr>>,
     /// Part of the original filter that remains above the join.
     residual: Option<Expr>,
+}
+
+/// Columns retained for each source before joining.
+///
+/// `None` means the source cannot be pruned safely; `Some(columns)` is a strict
+/// subset in schema order. This is a conservative physical optimization: the
+/// query must expose every column by an explicit qualifier, and no wildcard,
+/// `USING`, or `NATURAL` join may depend on the original schema.
+#[derive(Clone, Debug, Default)]
+struct ScanProjection {
+    columns: Vec<Option<Vec<String>>>,
+}
+
+impl ScanProjection {
+    fn columns(&self, index: usize) -> Option<&[String]> {
+        self.columns
+            .get(index)
+            .and_then(|columns| columns.as_deref())
+    }
+
+    fn all(count: usize) -> Self {
+        Self {
+            columns: vec![None; count],
+        }
+    }
 }
 
 /// NDV inputs for one join cost decision.
@@ -439,7 +464,8 @@ impl SqlEngine {
 
     fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {
         let pushdown = plan_filter_pushdown(select);
-        let table = self.build_from(select, &pushdown)?;
+        let projection = self.plan_scan_projection(select)?;
+        let table = self.build_from(select, &pushdown, &projection)?;
         let filtered_select = select_with_filter(select, pushdown.residual.clone());
         let plan = bind_select(&filtered_select, &table)?;
         execute_select(&table, &plan)
@@ -486,6 +512,7 @@ impl SqlEngine {
 
     fn explain(&self, select: &Select, analyze: bool) -> Result<QueryResult, SqlError> {
         let pushdown = plan_filter_pushdown(select);
+        let projection = self.plan_scan_projection(select)?;
         let filtered_select = select_with_filter(select, pushdown.residual.clone());
         let estimates = if analyze {
             None
@@ -495,18 +522,18 @@ impl SqlEngine {
         let (plan, stats) = if analyze {
             let start = Instant::now();
             let mut stats = ExecutionStats::default();
-            let table = self.build_from_inner(select, &pushdown, Some(&mut stats))?;
+            let table = self.build_from_inner(select, &pushdown, &projection, Some(&mut stats))?;
             let plan = bind_select(&filtered_select, &table)?;
             let result = execute_select_inner(&table, &plan, Some(&mut stats))?;
             if let QueryResult::Rows { rows, .. } = &result {
                 stats.output_rows = rows.len();
             }
             stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let plan = self.build_plan(select, &pushdown, Some(&stats), None)?;
+            let plan = self.build_plan(select, &pushdown, &projection, Some(&stats), None)?;
             (plan, Some(stats))
         } else {
             (
-                self.build_plan(select, &pushdown, None, estimates.as_ref())?,
+                self.build_plan(select, &pushdown, &projection, None, estimates.as_ref())?,
                 None,
             )
         };
@@ -682,19 +709,106 @@ impl SqlEngine {
         Ok(sources)
     }
 
-    fn build_from(&self, select: &Select, pushdown: &PushdownPlan) -> Result<Table, SqlError> {
-        self.build_from_inner(select, pushdown, None)
+    /// Plans a conservative source-column projection. A query is prunable only
+    /// when every column reference is explicitly qualified, there is no
+    /// wildcard, and no `USING`/`NATURAL` join depends on merged schema names.
+    fn plan_scan_projection(&self, select: &Select) -> Result<ScanProjection, SqlError> {
+        let sources = self.source_tables(select)?;
+        let qualifiers = sources
+            .iter()
+            .map(|(_, qualifier)| qualifier.clone())
+            .collect::<Vec<_>>();
+        let mut keep = vec![BTreeSet::new(); qualifiers.len()];
+        let mut disabled = false;
+        let mut collect = |expr: &Expr| collect_expr_columns(expr, &qualifiers, &mut keep);
+
+        for item in &select.items {
+            match item {
+                SelectItem::Wildcard => disabled = true,
+                SelectItem::Expr { expr, .. } => {
+                    if !collect(expr) {
+                        disabled = true;
+                    }
+                }
+            }
+        }
+        if let Some(filter) = &select.filter {
+            if !collect(filter) {
+                disabled = true;
+            }
+        }
+        for expr in &select.group_by {
+            if !collect(expr) {
+                disabled = true;
+            }
+        }
+        if let Some(having) = &select.having {
+            if !collect(having) {
+                disabled = true;
+            }
+        }
+        for order in &select.order_by {
+            if !collect(&order.expr) {
+                disabled = true;
+            }
+        }
+        for join in &select.joins {
+            match &join.condition {
+                JoinCondition::On(expr) => {
+                    if !collect(expr) {
+                        disabled = true;
+                    }
+                }
+                JoinCondition::Using(_) | JoinCondition::Natural => disabled = true,
+                JoinCondition::None => {}
+            }
+        }
+
+        if disabled {
+            return Ok(ScanProjection::all(sources.len()));
+        }
+
+        let mut columns = Vec::with_capacity(sources.len());
+        for (index, (table, _)) in sources.iter().enumerate() {
+            let available = table
+                .schema
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            let kept = available
+                .iter()
+                .filter(|name| keep[index].contains(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if kept.is_empty() || kept.len() == available.len() {
+                columns.push(None);
+            } else {
+                columns.push(Some(kept));
+            }
+        }
+        Ok(ScanProjection { columns })
+    }
+
+    fn build_from(
+        &self,
+        select: &Select,
+        pushdown: &PushdownPlan,
+        projection: &ScanProjection,
+    ) -> Result<Table, SqlError> {
+        self.build_from_inner(select, pushdown, projection, None)
     }
 
     fn build_from_inner(
         &self,
         select: &Select,
         pushdown: &PushdownPlan,
+        projection: &ScanProjection,
         mut stats: Option<&mut ExecutionStats>,
     ) -> Result<Table, SqlError> {
         let mut sources = self.source_tables(select)?.into_iter();
         let (left, left_qualifier) = sources.next().expect("base table is always present");
-        let mut joined = qualify_table(left, &left_qualifier);
+        let mut joined = qualify_table_projected(left, &left_qualifier, projection.columns(0));
         let left_filtered = pushdown_filter(pushdown, 0).is_some();
         if let Some(filter) = pushdown_filter(pushdown, 0) {
             joined = filter_table(joined, filter)?;
@@ -717,7 +831,8 @@ impl SqlEngine {
             .unwrap_or_default();
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
         {
-            let mut right = qualify_table(right, &qualifier);
+            let mut right =
+                qualify_table_projected(right, &qualifier, projection.columns(join_index + 1));
             let right_filtered = pushdown_filter(pushdown, join_index + 1).is_some();
             if let Some(filter) = pushdown_filter(pushdown, join_index + 1) {
                 right = filter_table(right, filter)?;
@@ -767,6 +882,7 @@ impl SqlEngine {
         &self,
         select: &Select,
         pushdown: &PushdownPlan,
+        projection: &ScanProjection,
         stats: Option<&ExecutionStats>,
         estimates: Option<&PlanEstimate>,
     ) -> Result<String, SqlError> {
@@ -783,6 +899,7 @@ impl SqlEngine {
             estimates,
             scan_index,
             left_filtered,
+            projection.columns(scan_index),
         );
         scan_index += 1;
         for (join_index, (join, (right, qualifier))) in select.joins.iter().zip(sources).enumerate()
@@ -852,6 +969,7 @@ impl SqlEngine {
                 estimates,
                 scan_index,
                 right_filtered,
+                projection.columns(scan_index),
             );
             scan_index += 1;
             plan = format!(
@@ -979,6 +1097,50 @@ fn qualify_table(table: &Table, qualifier: &str) -> Table {
     let mut qualified = qualify_table_schema(table, qualifier);
     qualified.rows = table.rows.clone();
     qualified
+}
+
+/// Qualifies and projects a source table in one pass. When `keep` is `None`,
+/// or does not select a strict subset, this falls back to a full scan copy.
+fn qualify_table_projected(table: &Table, qualifier: &str, keep: Option<&[String]>) -> Table {
+    let Some(keep) = keep else {
+        return qualify_table(table, qualifier);
+    };
+    let indices = table
+        .schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            keep.iter()
+                .any(|name| name == &column.name)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if indices.is_empty() || indices.len() == table.schema.len() {
+        return qualify_table(table, qualifier);
+    }
+
+    let columns = indices
+        .iter()
+        .map(|&index| {
+            let column = &table.schema.columns[index];
+            Column {
+                name: format!("{qualifier}.{}", column.name),
+                data_type: column.data_type,
+                not_null: column.not_null,
+            }
+        })
+        .collect();
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| indices.iter().map(|&index| row[index].clone()).collect())
+        .collect();
+    Table {
+        name: table.name.clone(),
+        schema: Schema::new(columns),
+        rows,
+    }
 }
 
 fn qualify_table_schema(table: &Table, qualifier: &str) -> Table {
@@ -1140,6 +1302,68 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| expr_sources(expr, sources)),
+    }
+}
+
+/// Collects the unqualified column names needed from each source. Returns
+/// `false` when a reference cannot be assigned to exactly one source yet.
+fn collect_expr_columns(expr: &Expr, qualifiers: &[String], keep: &mut [BTreeSet<String>]) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Column {
+            table: Some(table),
+            name,
+        } => match qualifiers.iter().position(|qualifier| qualifier == table) {
+            Some(index) => {
+                keep[index].insert(name.clone());
+                true
+            }
+            None => false,
+        },
+        Expr::Column { table: None, .. } => false,
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+            collect_expr_columns(expr, qualifiers, keep)
+        }
+        Expr::InList { expr, values, .. } => {
+            collect_expr_columns(expr, qualifiers, keep)
+                && values
+                    .iter()
+                    .all(|value| collect_expr_columns(value, qualifiers, keep))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_columns(expr, qualifiers, keep)
+                && collect_expr_columns(low, qualifiers, keep)
+                && collect_expr_columns(high, qualifiers, keep)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_expr_columns(expr, qualifiers, keep)
+                && collect_expr_columns(pattern, qualifiers, keep)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|expr| collect_expr_columns(expr, qualifiers, keep))
+                && branches.iter().all(|(when, then)| {
+                    collect_expr_columns(when, qualifiers, keep)
+                        && collect_expr_columns(then, qualifiers, keep)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|expr| collect_expr_columns(expr, qualifiers, keep))
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_expr_columns(left, qualifiers, keep)
+                && collect_expr_columns(right, qualifiers, keep)
+        }
+        Expr::Aggregate { input, .. } => input
+            .as_deref()
+            .is_none_or(|expr| collect_expr_columns(expr, qualifiers, keep)),
     }
 }
 
@@ -1793,6 +2017,7 @@ fn scan_plan(
     estimates: Option<&PlanEstimate>,
     index: usize,
     filtered: bool,
+    columns: Option<&[String]>,
 ) -> String {
     let mut node = format!("Scan {label}");
     if filtered {
@@ -1802,6 +2027,9 @@ fn scan_plan(
         node.push_str(&format!(" actual rows={rows}"));
     } else if let Some(rows) = estimates.and_then(|estimate| estimate.scan_rows.get(index)) {
         node.push_str(&format!(" est rows={rows}"));
+    }
+    if let Some(columns) = columns {
+        node.push_str(&format!(" cols={}", columns.join(",")));
     }
     node
 }
