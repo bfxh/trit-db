@@ -1,8 +1,8 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
-    AggregateKind, Assignment, ColumnDef, Expr, Join, JoinCondition, JoinKind, OrderBy, Select,
-    SelectItem, Statement,
+    AggregateKind, Assignment, ColumnDef, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy,
+    Select, SelectItem, Statement, With,
 };
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -227,14 +227,66 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Drop)) => self.parse_drop(),
             Some(TokenKind::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(TokenKind::Keyword(Keyword::Select)) => self.parse_select(),
+            Some(TokenKind::Keyword(Keyword::With)) => self.parse_with(),
             Some(TokenKind::Keyword(Keyword::Explain)) => self.parse_explain(),
             Some(TokenKind::Keyword(Keyword::Analyze)) => self.parse_analyze(),
             Some(TokenKind::Keyword(Keyword::Update)) => self.parse_update(),
             Some(TokenKind::Keyword(Keyword::Delete)) => self.parse_delete(),
             Some(_) => Err(self.error(
-                "expected CREATE, ALTER, DROP, INSERT, SELECT, EXPLAIN, ANALYZE, UPDATE, or DELETE",
+                "expected CREATE, ALTER, DROP, INSERT, SELECT, WITH, EXPLAIN, ANALYZE, UPDATE, or DELETE",
             )),
             None => Err(self.error("empty statement")),
+        }
+    }
+
+    fn parse_with(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::With)?;
+        let recursive = self.eat_keyword(Keyword::Recursive);
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.parse_ident()?;
+            let mut columns = Vec::new();
+            if self.eat_symbol(Symbol::LParen) {
+                loop {
+                    columns.push(self.parse_ident()?);
+                    if self.eat_symbol(Symbol::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_symbol(Symbol::RParen)?;
+            }
+            self.expect_keyword(Keyword::As)?;
+            self.expect_symbol(Symbol::LParen)?;
+            let seed = self.parse_select_body()?;
+            self.expect_keyword(Keyword::Union)?;
+            let union_all = self.eat_keyword(Keyword::All);
+            let step = self.parse_select_body()?;
+            self.expect_symbol(Symbol::RParen)?;
+            ctes.push(Cte {
+                name,
+                columns,
+                seed,
+                step,
+                union_all,
+            });
+            if self.eat_symbol(Symbol::Comma) {
+                continue;
+            }
+            break;
+        }
+        let query = self.parse_select_body()?;
+        Ok(Statement::With(Box::new(With {
+            recursive,
+            ctes,
+            query: Box::new(query),
+        })))
+    }
+
+    fn parse_select_body(&mut self) -> Result<Select, SqlError> {
+        match self.parse_select()? {
+            Statement::Select(select) => Ok(select),
+            _ => Err(self.error("expected SELECT")),
         }
     }
 
@@ -1579,5 +1631,43 @@ mod tests {
         assert!(parse_script("SELECT FROM t;").is_err());
         assert!(parse_script("CREATE TABLE t (a);").is_err());
         assert!(parse_script("INSERT INTO t VALUES (1,);").is_err());
+    }
+
+    #[test]
+    fn parses_with_recursive_cte() {
+        let statements = parse_script(
+            "WITH RECURSIVE reach(node) AS (SELECT src FROM edges WHERE src = 0 \
+             UNION SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) \
+             SELECT node FROM reach",
+        )
+        .expect("parse");
+        let Statement::With(with) = &statements[0] else {
+            panic!("expected WITH");
+        };
+        assert!(with.recursive);
+        assert_eq!(with.ctes.len(), 1);
+        assert_eq!(with.ctes[0].name, "reach");
+        assert_eq!(with.ctes[0].columns, vec!["node".to_string()]);
+        assert!(!with.ctes[0].union_all);
+        assert_eq!(with.ctes[0].seed.table, "edges");
+        assert_eq!(with.ctes[0].step.table, "edges");
+        assert_eq!(with.query.table, "reach");
+    }
+
+    #[test]
+    fn parses_union_all_and_multiple_ctes() {
+        let statements = parse_script(
+            "WITH RECURSIVE a(x) AS (SELECT id FROM t UNION ALL SELECT x FROM a), \
+             b(y) AS (SELECT x FROM a UNION SELECT y FROM b) SELECT y FROM b",
+        )
+        .expect("parse");
+        let Statement::With(with) = &statements[0] else {
+            panic!("expected WITH");
+        };
+        assert_eq!(with.ctes.len(), 2);
+        assert!(with.ctes[0].union_all);
+        assert!(!with.ctes[1].union_all);
+        assert_eq!(with.ctes[1].seed.table, "a");
+        assert_eq!(with.query.table, "b");
     }
 }

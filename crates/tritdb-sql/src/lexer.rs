@@ -66,6 +66,10 @@ pub enum Keyword {
     Text,
     Bool,
     Boolean,
+    With,
+    Recursive,
+    Union,
+    All,
 }
 
 impl Keyword {
@@ -134,6 +138,10 @@ impl Keyword {
             "text" => Some(Keyword::Text),
             "bool" => Some(Keyword::Bool),
             "boolean" => Some(Keyword::Boolean),
+            "with" => Some(Keyword::With),
+            "recursive" => Some(Keyword::Recursive),
+            "union" => Some(Keyword::Union),
+            "all" => Some(Keyword::All),
             _ => None,
         }
     }

@@ -5,13 +5,14 @@ use std::str;
 use std::time::Instant;
 
 use tritdb_exec::{
-    compare_values, eval, truth_of, BinaryOp, Column, ExecError, Expr as ExecExpr, Row, Schema,
-    Table, TruthValue, Value,
+    ann::B4, compare_values, eval, truth_of, BinaryOp, Column, DataType, ExecError,
+    Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
 };
 use tritdb_txn::TxnStore;
 
 use crate::ast::{
-    AggregateKind, Assignment, Expr, Join, JoinCondition, JoinKind, Select, SelectItem, Statement,
+    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Select, SelectItem,
+    Statement, With,
 };
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
@@ -52,6 +53,51 @@ pub enum JoinStrategy {
     Hash,
     /// Always use nested loop, for benchmarks and differential tests.
     NestedLoop,
+}
+
+/// Hard cap for recursive CTE fixpoint evaluation.
+const MAX_RECURSIVE_ITERATIONS: usize = 1000;
+/// Hard cap on the materialized size of one recursive CTE.
+const MAX_RECURSIVE_ROWS: usize = 100_000;
+
+fn rows_of(result: QueryResult) -> Result<(Vec<String>, Vec<Row>), SqlError> {
+    match result {
+        QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+        QueryResult::Message(message) => Err(SqlError::Unsupported(format!(
+            "WITH query returned a message: {message}"
+        ))),
+    }
+}
+
+fn infer_schema(names: &[String], rows: &[Row]) -> Schema {
+    let columns = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let data_type = rows
+                .iter()
+                .find_map(|row| match row.get(index) {
+                    Some(Value::Null) | None => None,
+                    Some(value) => Some(value_data_type(value)),
+                })
+                .unwrap_or(DataType::Text);
+            Column::new(name.clone(), data_type)
+        })
+        .collect();
+    Schema::new(columns)
+}
+
+fn value_data_type(value: &Value) -> DataType {
+    match value {
+        Value::Null => DataType::Text,
+        Value::Int(_) => DataType::Int,
+        Value::Text(_) => DataType::Text,
+        Value::Bool(_) => DataType::Bool,
+        Value::Logic(B4::Both) | Value::Logic(B4::Neither) => DataType::Belnap,
+        Value::Logic(_) => DataType::Logic,
+        Value::Lukasiewicz(_) => DataType::Lukasiewicz,
+        Value::Nat(_) => DataType::Nat,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +299,7 @@ impl SqlEngine {
             } => self.insert(table, columns.as_deref(), rows),
             Statement::CountModels { expr, vars } => self.count_models(expr, *vars),
             Statement::Select(select) => self.select(select),
+            Statement::With(with) => self.with_query(with),
             Statement::Explain(select) => self.explain(select, false, ExplainFormat::Text),
             Statement::ExplainSexpr(select) => self.explain(select, false, ExplainFormat::Sexpr),
             Statement::ExplainAnalyze(select) => self.explain(select, true, ExplainFormat::Text),
@@ -573,6 +620,144 @@ impl SqlEngine {
             columns: vec!["models".to_string()],
             rows: vec![vec![Value::Int(models as i64)]],
         })
+    }
+
+    fn with_query(&mut self, with: &With) -> Result<QueryResult, SqlError> {
+        let mut saved: Vec<(String, Option<Table>)> = Vec::new();
+        for cte in &with.ctes {
+            let table = match self.materialize_cte(cte, with.recursive) {
+                Ok(table) => table,
+                Err(error) => {
+                    self.restore_tables(saved);
+                    return Err(error);
+                }
+            };
+            saved.push((
+                cte.name.clone(),
+                self.tables.insert(cte.name.clone(), table),
+            ));
+        }
+        let result = self.select(&with.query);
+        self.restore_tables(saved);
+        result
+    }
+
+    fn restore_tables(&mut self, saved: Vec<(String, Option<Table>)>) {
+        for (name, previous) in saved.into_iter().rev() {
+            match previous {
+                Some(table) => {
+                    self.tables.insert(name, table);
+                }
+                None => {
+                    self.tables.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// Evaluates one CTE to a fixed point.
+    ///
+    /// The recursive step re-reads the CTE table from the catalog, so the
+    /// current accumulated rows are visible under `cte.name`.
+    fn materialize_cte(&mut self, cte: &Cte, recursive: bool) -> Result<Table, SqlError> {
+        let seed = self.select(&cte.seed)?;
+        let (seed_columns, seed_rows) = rows_of(seed)?;
+        if !cte.columns.is_empty() && cte.columns.len() != seed_columns.len() {
+            return Err(SqlError::Unsupported(format!(
+                "CTE {} declares {} column(s) but the seed produces {}",
+                cte.name,
+                cte.columns.len(),
+                seed_columns.len()
+            )));
+        }
+        let names = if cte.columns.is_empty() {
+            seed_columns
+        } else {
+            cte.columns.clone()
+        };
+        let schema = infer_schema(&names, &seed_rows);
+        let mut table = Table {
+            name: cte.name.clone(),
+            schema,
+            rows: seed_rows,
+        };
+
+        if !recursive {
+            let step = self.select(&cte.step)?;
+            let (step_columns, step_rows) = rows_of(step)?;
+            if step_columns.len() != names.len() {
+                return Err(SqlError::Unsupported(format!(
+                    "CTE {} step returns {} column(s), expected {}",
+                    cte.name,
+                    step_columns.len(),
+                    names.len()
+                )));
+            }
+            for row in step_rows {
+                if cte.union_all || !table.rows.contains(&row) {
+                    table.rows.push(row);
+                }
+            }
+            return Ok(table);
+        }
+
+        let step_schema = table.schema.clone();
+        let mut working = table.rows.clone();
+        let mut iterations = 0;
+        loop {
+            if iterations >= MAX_RECURSIVE_ITERATIONS {
+                return Err(SqlError::Unsupported(format!(
+                    "WITH RECURSIVE {} did not reach a fixed point within {} iterations",
+                    cte.name, MAX_RECURSIVE_ITERATIONS
+                )));
+            }
+            iterations += 1;
+
+            // The recursive step sees only the previous round's rows, as in
+            // the SQL standard's working table, not the accumulated result.
+            let step_table = Table {
+                name: cte.name.clone(),
+                schema: step_schema.clone(),
+                rows: working,
+            };
+            let previous = self.tables.insert(cte.name.clone(), step_table);
+            let step = self.select(&cte.step);
+            match previous {
+                Some(previous) => {
+                    self.tables.insert(cte.name.clone(), previous);
+                }
+                None => {
+                    self.tables.remove(&cte.name);
+                }
+            }
+            let (step_columns, step_rows) = rows_of(step?)?;
+            if step_columns.len() != names.len() {
+                return Err(SqlError::Unsupported(format!(
+                    "WITH RECURSIVE {} step returns {} column(s), expected {}",
+                    cte.name,
+                    step_columns.len(),
+                    names.len()
+                )));
+            }
+            let mut next = Vec::new();
+            for row in step_rows {
+                if cte.union_all || !table.rows.contains(&row) {
+                    next.push(row.clone());
+                    table.rows.push(row);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            working = next;
+            if table.rows.len() > MAX_RECURSIVE_ROWS {
+                return Err(SqlError::Unsupported(format!(
+                    "WITH RECURSIVE {} produced more than {} rows",
+                    cte.name, MAX_RECURSIVE_ROWS
+                )));
+            }
+        }
+        Ok(table)
     }
 
     fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {
