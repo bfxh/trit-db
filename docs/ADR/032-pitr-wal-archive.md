@@ -49,7 +49,7 @@ M2 的恢复目标里除了崩溃一致性，还包括时间点恢复（PITR）�
 
 ## 限制
 
-- 归档**没有自动保留策略**：`TxnStore::prune_history` / `txn history --prune` 只做手动清理；不会在 checkpoint 时自动触发。
+- 归档有自动保留策略：`checkpoint_archive` 默认保留最新 8 个（`DEFAULT_ARCHIVE_KEEP`），`checkpoint_archive_keep(n)` / `txn checkpoint --archive --keep n` 可改；`n = 0` 关闭自动清理。
 - 归档 WAL 仍是 TRWL v0 单段文件；没有 WAL 段轮转。
 - 没有时间戳索引；CLI 只提供 `--to-lsn`。
 - `recover_at` 重放时最多读取所有归档 + 当前 WAL，复杂度与历史总量线性相关。

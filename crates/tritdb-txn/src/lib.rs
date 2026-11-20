@@ -241,6 +241,9 @@ pub struct CommitInfo {
     pub op_count: usize,
 }
 
+/// Default number of archived checkpoints kept by [`TxnStore::checkpoint_archive`].
+pub const DEFAULT_ARCHIVE_KEEP: usize = 8;
+
 /// Result of a successful key/value checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointInfo {
@@ -258,6 +261,8 @@ pub struct CheckpointInfo {
     pub archived_wal_bytes: Option<u64>,
     /// Bytes copied into `<wal>.history/<lsn>.snap`; `None` for a plain checkpoint.
     pub archived_snapshot_bytes: Option<u64>,
+    /// Archived checkpoints removed by the retention policy (`0` when off).
+    pub pruned_archives: usize,
 }
 
 /// State reconstructed at a requested historical LSN.
@@ -424,7 +429,7 @@ impl TxnStore {
     /// happens between those two steps, recovery loads the snapshot and skips
     /// the old WAL records it already covers.
     pub fn checkpoint(&self) -> Result<CheckpointInfo, TxnError> {
-        self.checkpoint_impl(false)
+        self.checkpoint_impl(false, 0)
     }
 
     /// Like [`TxnStore::checkpoint`], but first copies the snapshot and the
@@ -434,10 +439,19 @@ impl TxnStore {
     /// checkpoint discards the WAL it reset and therefore cannot be used as a
     /// point-in-time base.
     pub fn checkpoint_archive(&self) -> Result<CheckpointInfo, TxnError> {
-        self.checkpoint_impl(true)
+        self.checkpoint_impl(true, DEFAULT_ARCHIVE_KEEP)
     }
 
-    fn checkpoint_impl(&self, archive: bool) -> Result<CheckpointInfo, TxnError> {
+    /// Like [`TxnStore::checkpoint_archive`], but keeps only the newest `keep`
+    /// archived checkpoints. `keep = 0` disables automatic pruning.
+    ///
+    /// Pruning runs after the new archive is written, so the newest checkpoint
+    /// is always kept and a failed archive leaves the previous history intact.
+    pub fn checkpoint_archive_keep(&self, keep: usize) -> Result<CheckpointInfo, TxnError> {
+        self.checkpoint_impl(true, keep)
+    }
+
+    fn checkpoint_impl(&self, archive: bool, keep: usize) -> Result<CheckpointInfo, TxnError> {
         let mut wal = self.wal.lock().map_err(|_| TxnError::Poisoned)?;
         // Check under the WAL lock. A `begin` increments `active_txns` before
         // appending its `Begin`; if it increments after this check it cannot
@@ -458,15 +472,20 @@ impl TxnStore {
         let entries = state.len() as u64;
         let snapshot_bytes = write_snapshot(&self.snapshot_path, checkpoint_lsn, &state)?;
 
-        let (archived_wal_bytes, archived_snapshot_bytes) = if archive {
+        let (archived_wal_bytes, archived_snapshot_bytes, pruned_archives) = if archive {
             let history = history_dir_for(&self.path);
             fs::create_dir_all(&history)?;
             let (snap_path, wal_path) = archive_paths(&history, checkpoint_lsn);
             let snap_bytes = archive_file(&self.snapshot_path, &snap_path)?;
             let wal_bytes = archive_file(&self.path, &wal_path)?;
-            (Some(wal_bytes), Some(snap_bytes))
+            let pruned = if keep > 0 {
+                Self::prune_history(&self.path, keep)?.removed.len()
+            } else {
+                0
+            };
+            (Some(wal_bytes), Some(snap_bytes), pruned)
         } else {
-            (None, None)
+            (None, None, 0)
         };
 
         wal.reset(checkpoint_lsn.saturating_add(1).max(1))?;
@@ -480,6 +499,7 @@ impl TxnStore {
             snapshot_bytes,
             archived_wal_bytes,
             archived_snapshot_bytes,
+            pruned_archives,
         })
     }
 

@@ -176,3 +176,55 @@ fn prune_history_keeps_only_the_newest_archives() {
     let view = TxnStore::recover_at(&wal, last_lsn).expect("newest archive survives");
     assert_eq!(view.entries.len(), 6);
 }
+
+#[test]
+fn checkpoint_archive_keep_prunes_older_archives() {
+    let dir = TempDir::new("txn-pitr-auto-gc");
+    let wal = dir.join("pitr.wal");
+    let store = TxnStore::open(&wal).expect("open");
+
+    for round in 0..5 {
+        let mut txn = store.begin().expect("begin");
+        txn.put(format!("k{round}").as_bytes(), b"v").expect("put");
+        txn.commit().expect("commit");
+        let info = store.checkpoint_archive_keep(2).expect("archive");
+        assert!(info.archived_wal_bytes.is_some());
+    }
+    drop(store);
+
+    let mut history = wal.as_os_str().to_os_string();
+    history.push(".history");
+    let history = std::path::PathBuf::from(history);
+    let wals = std::fs::read_dir(&history)
+        .expect("history dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("wal"))
+        .count();
+    assert_eq!(wals, 2);
+}
+
+#[test]
+fn checkpoint_archive_keep_zero_disables_pruning() {
+    let dir = TempDir::new("txn-pitr-auto-gc-off");
+    let wal = dir.join("pitr.wal");
+    let store = TxnStore::open(&wal).expect("open");
+
+    for round in 0..3 {
+        let mut txn = store.begin().expect("begin");
+        txn.put(format!("k{round}").as_bytes(), b"v").expect("put");
+        txn.commit().expect("commit");
+        let info = store.checkpoint_archive_keep(0).expect("archive");
+        assert_eq!(info.pruned_archives, 0);
+    }
+    drop(store);
+
+    let mut history = wal.as_os_str().to_os_string();
+    history.push(".history");
+    let history = std::path::PathBuf::from(history);
+    let wals = std::fs::read_dir(&history)
+        .expect("history dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("wal"))
+        .count();
+    assert_eq!(wals, 3);
+}
