@@ -604,6 +604,14 @@ impl TxnStore {
         Self::recover_at(path, lsn)
     }
 
+    /// Like [`TxnStore::recover_at`], but holds the WAL writer lock while
+    /// reading, so a concurrent checkpoint cannot swap the snapshot/archive
+    /// base under the replay.
+    pub fn recover_at_consistent(&self, target_lsn: u64) -> Result<PitrView, TxnError> {
+        let _wal = self.wal.lock().map_err(|_| TxnError::Poisoned)?;
+        Self::recover_at(&self.path, target_lsn)
+    }
+
     /// Removes the oldest archived checkpoints, keeping the newest `keep`.
     ///
     /// Only complete archive pairs are considered. Removing an archive means

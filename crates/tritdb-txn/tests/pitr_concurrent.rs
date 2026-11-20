@@ -94,7 +94,7 @@ fn recover_at_survives_concurrent_checkpoints() {
     for _ in 0..80 {
         // A checkpoint can still win the race with a truncation that is not a
         // torn tail; the next attempt must recover.
-        if let Ok(view) = TxnStore::recover_at(&wal, u64::MAX) {
+        if let Ok(view) = store.recover_at_consistent(u64::MAX) {
             assert!(
                 view.entries.len() >= last,
                 "entries shrank: {last} -> {}",
@@ -107,6 +107,8 @@ fn recover_at_survives_concurrent_checkpoints() {
 
     writer.join().expect("writer");
     checkpointer.join().expect("checkpointer");
-    let view = TxnStore::recover_at(&wal, u64::MAX).expect("final recover");
+    let view = store
+        .recover_at_consistent(u64::MAX)
+        .expect("final recover");
     assert_eq!(view.entries.len(), 205);
 }

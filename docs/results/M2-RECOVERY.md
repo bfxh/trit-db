@@ -63,4 +63,4 @@ pitr_cli: 2 passed
 - 自动 GC 的保留数默认 8（`checkpoint_archive_keep` / `--keep` 可改，0 关闭）；
 - 时间索引只能写入时维护，无法从 WAL 重建；崩溃可能落后最后几条；
 - WAL 段轮转已在同一文件内实现（ADR-033），但不能按段释放文件空间；
-- 并发 append 下读取是安全前缀；`recover_at` 读 live WAL 时对并发 checkpoint 的截断重试 3 次（`pitr_concurrent` 覆盖持续写者和写者+checkpoint 两种压力）。
+- 并发 append 下 `recover_at` 读安全前缀，并对 checkpoint 截断重试 3 次；需要跨 checkpoint 的线性一致视图时用 `TxnStore::recover_at_consistent`（持 WAL 锁）。`pitr_concurrent` 覆盖两种压力。
