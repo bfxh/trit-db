@@ -1942,7 +1942,7 @@ fn explain_sexpr_reports_structured_plan() {
     };
     assert_eq!(
         plan,
-        "(limit :limit 1\n  (sort :keys ((asc (col \"a.v\")))\n    (project (\"v\")\n      \
+        "(limit :limit 1\n  (sort :keys ((asc (col \"a.v\")))\n    (project ((\"v\" (col \"a.v\")))\n      \
          (join hash inner :keys ((\"a.id\" \"b.id\")) \
          :pred (= (col \"a.id\") (col \"b.id\"))\n        \
          (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
@@ -2041,6 +2041,19 @@ fn explain_sexpr_reports_structured_plan() {
         sorted_source_plan.contains("(sort :keys ((desc (col \"a.id\")))"),
         "unexpected plan: {sorted_source_plan}"
     );
+
+    let projected = engine
+        .execute_script("EXPLAIN SEXPR SELECT a.v, SUM(a.id) AS total FROM a GROUP BY a.v;")
+        .expect("explain sexpr projected aggregate");
+    let projected_plan = match &as_rows(&projected[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        projected_plan
+            .contains("(project ((\"v\" (col \"a.v\")) (\"total\" (sum (col \"a.id\"))))"),
+        "unexpected plan: {projected_plan}"
+    );
 }
 
 #[test]
@@ -2084,7 +2097,7 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
         "unexpected plan: {plan}"
     );
     assert!(
-        plan.contains("(project (\"v\") :actual-rows 2 :time-ms "),
+        plan.contains("(project ((\"v\" (col \"a.v\"))) :actual-rows 2 :time-ms "),
         "unexpected plan: {plan}"
     );
     assert!(
@@ -2156,7 +2169,7 @@ fn explain_sexpr_reports_structured_filter_predicate() {
     };
     assert_eq!(
         plan,
-        "(project (\"v\")\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
+        "(project ((\"v\" (col \"a.v\")))\n  (filter :pred (or (<> (col \"a.v\") \"skip\") \
          (like (col \"b.w\") \"b%\"))\n    (join hash inner :keys ((\"a.id\" \"b.id\")) \
          :pred (= (col \"a.id\") (col \"b.id\"))\n      \
          (scan \"a\")\n      (scan \"b\"))))"
@@ -2246,7 +2259,7 @@ fn explain_sexpr_includes_estimates_and_zero_columns() {
     };
     assert_eq!(
         plan,
-        "(project (\"one\") :est-rows 3\n  (scan \"a\" :est-rows 3 :cols ()))"
+        "(project ((\"one\" 1)) :est-rows 3\n  (scan \"a\" :est-rows 3 :cols ()))"
     );
 }
 

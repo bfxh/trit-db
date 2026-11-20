@@ -38,10 +38,7 @@ pub(crate) enum PlanKind {
         pred: PlanExpr,
         metrics: Metrics,
     },
-    Project {
-        columns: Vec<String>,
-        metrics: Metrics,
-    },
+    Project(ProjectPlan),
     Sort(SortPlan),
     Limit {
         limit: usize,
@@ -143,6 +140,22 @@ pub(crate) struct SortPlan {
 pub(crate) struct SortKey {
     pub(crate) expr: PlanExpr,
     pub(crate) ascending: bool,
+}
+
+/// Project-specific fields. Each item pairs the caller-visible output name
+/// with the bound expression that computes it; `items` and the text label
+/// therefore stay aligned by construction.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectPlan {
+    pub(crate) items: Vec<ProjectItem>,
+    pub(crate) metrics: Metrics,
+}
+
+/// One projected output column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectItem {
+    pub(crate) name: String,
+    pub(crate) expr: PlanExpr,
 }
 
 /// How a join's keys are displayed. `USING` / `NATURAL` keys are symbolic
@@ -308,9 +321,14 @@ impl PlanNode {
                 push_metrics(&mut text, metrics, "groups");
                 text
             }
-            PlanKind::Project { columns, metrics } => {
-                let mut text = format!("Project [{}]", columns.join(", "));
-                push_metrics(&mut text, metrics, "rows");
+            PlanKind::Project(project) => {
+                let names = project
+                    .items
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>();
+                let mut text = format!("Project [{}]", names.join(", "));
+                push_metrics(&mut text, &project.metrics, "rows");
                 text
             }
             PlanKind::Sort(sort) => {
@@ -418,10 +436,10 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Project { columns, metrics } => {
+            PlanKind::Project(project) => {
                 out.push_str("(project ");
-                push_string_list(out, columns);
-                push_sexpr_metrics(out, metrics, "rows");
+                push_project_items(out, &project.items);
+                push_sexpr_metrics(out, &project.metrics, "rows");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
@@ -875,6 +893,21 @@ fn push_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+fn push_project_items(out: &mut String, items: &[ProjectItem]) {
+    out.push('(');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        push_string(out, &item.name);
+        out.push(' ');
+        item.expr.write_sexpr(out);
+        out.push(')');
+    }
+    out.push(')');
 }
 
 fn push_sort_keys(out: &mut String, keys: &[SortKey]) {

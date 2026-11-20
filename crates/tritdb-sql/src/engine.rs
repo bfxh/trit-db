@@ -17,8 +17,8 @@ use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr}
 use crate::error::SqlError;
 use crate::parser::parse_script;
 use crate::plan::{
-    AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode, SortKey,
-    SortPlan,
+    AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode, ProjectItem,
+    ProjectPlan, SortKey, SortPlan,
 };
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
@@ -1165,11 +1165,13 @@ impl SqlEngine {
                 plan = PlanNode::unary(PlanKind::Having { pred, metrics }, plan);
             }
         }
-        let projection_names = bound
-            .items
-            .iter()
-            .map(|item| item.name().to_string())
-            .collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(bound.items.len());
+        for item in &bound.items {
+            items.push(ProjectItem {
+                name: item.name().to_string(),
+                expr: PlanExpr::from_group_expr(&item.expr, &left_table.schema)?,
+            });
+        }
         let metrics = if let Some(stats) = stats {
             Metrics {
                 actual: Some(stats.project_rows as u64),
@@ -1185,13 +1187,7 @@ impl SqlEngine {
         } else {
             Metrics::default()
         };
-        plan = PlanNode::unary(
-            PlanKind::Project {
-                columns: projection_names,
-                metrics,
-            },
-            plan,
-        );
+        plan = PlanNode::unary(PlanKind::Project(ProjectPlan { items, metrics }), plan);
         if !bound.order_by.is_empty() {
             let metrics = if let Some(stats) = stats {
                 Metrics {

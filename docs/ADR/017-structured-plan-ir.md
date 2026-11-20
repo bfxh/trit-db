@@ -22,7 +22,7 @@ Lisp 的可借之处不是括号或运行时，而是同像性（homoiconicity�
 2. `build_plan` 从返回 `String` 改为返回 `PlanNode`；`PlanNode::to_text()` 负责历史文本格式。现有 `EXPLAIN` 文本必须逐字保持不变，由既有的整段 `assert_eq!` 计划测试守护。
 3. `PlanNode::to_sexpr()` 输出只读的括号化计划树；新增 `EXPLAIN SEXPR SELECT ...`，返回一列 `plan`、一行文本值。它不是 Lisp 解释器，也不接受用户自定义表达式或函数。
 4. `EXPLAIN SEXPR` 只做静态计划；本 ADR 当时不支持 `EXPLAIN ANALYZE SEXPR`，由 parser 明确拒绝。该限制已由 ADR-020 撤销：`EXPLAIN SEXPR` 仍只输出估算（`:est-rows` / `:est-groups`），`EXPLAIN ANALYZE SEXPR` 走真实执行并只输出 actual 字段和 `(execution ...)` 汇总；`EXPLAIN ANALYZE` 文本路径不变。
-5. S-expression 的字段是稳定的最小集合：节点名、扫描标签/是否下推过滤/估算行数/裁剪列、join 算法/连接类型/键或残余谓词、投影列、排序键数、limit 值。join 的 `details` 当时保留为已渲染的键/残余片段，避免把当前 join 条件分析复制成第二套逻辑；ADR-018 已把该字段替换为结构化 `JoinKeys` / `residual` / `on_expr`，文本保持不变；ADR-019 随后把 S-expression 的 join 输出升级为 `:keys` / `:residual` / `:on-expr`；ADR-021 又把 `Filter` 的绑定谓词转成 `:pred` 的 `PlanExpr`；ADR-022 进一步把 join 的完整 `ON` / `USING` / `NATURAL` 谓词转成同一形状的 `:pred`；ADR-023 把 `Having` 的 `GroupExpr` 也转成 `:pred`；ADR-024 再把 `Aggregate` 的分组键与引用聚合调用转成 `:keys` / `:aggregates`；ADR-025 再把 `Sort` 的排序键表达式与升降序转成结构化 `:keys`。
+5. S-expression 的字段是稳定的最小集合：节点名、扫描标签/是否下推过滤/估算行数/裁剪列、join 算法/连接类型/键或残余谓词、投影列、排序键数、limit 值。join 的 `details` 当时保留为已渲染的键/残余片段，避免把当前 join 条件分析复制成第二套逻辑；ADR-018 已把该字段替换为结构化 `JoinKeys` / `residual` / `on_expr`，文本保持不变；ADR-019 随后把 S-expression 的 join 输出升级为 `:keys` / `:residual` / `:on-expr`；ADR-021 又把 `Filter` 的绑定谓词转成 `:pred` 的 `PlanExpr`；ADR-022 进一步把 join 的完整 `ON` / `USING` / `NATURAL` 谓词转成同一形状的 `:pred`；ADR-023 把 `Having` 的 `GroupExpr` 也转成 `:pred`；ADR-024 再把 `Aggregate` 的分组键与引用聚合调用转成 `:keys` / `:aggregates`；ADR-025 再把 `Sort` 的排序键表达式与升降序转成结构化 `:keys`；ADR-026 再把 `Project` 的输出名与计算表达式转成结构化项列表。
 6. 明确不做：完整逻辑/物理计划分层、规则注册表、代价搜索、join 重排、表达式级列下推、Lisp/Scheme 方言、运行时宏展开、通用 `eval`、把 SQL parser 改成 s-expression reader。
 7. `EXPLAIN SEXPR` 不改变执行路径、统计、错误语义、结果行集或列标签；它只在 `EXPLAIN` 的输出格式分支上生效。
 
@@ -32,11 +32,11 @@ Lisp 的可借之处不是括号或运行时，而是同像性（homoiconicity�
 - 正结果：现有文本计划由 `to_text` 统一生成，格式化逻辑从 `build_plan` 中抽离；既有整段文本断言仍通过。
 - 正结果：`EXPLAIN SEXPR` 给 AI/脚本一个明确的树形输入，例如：
   ```lisp
-  (project ("one") :est-rows 3
+  (project (("one" 1)) :est-rows 3
     (scan "a" :est-rows 3 :cols ()))
   ```
 - 正结果：零列投影、谓词下推、列裁剪、join 算法和估算都能在同一棵树里被观察，不需要额外解析规则。
-- 负结果：`PlanNode` 目前只覆盖 `EXPLAIN` 的物理可观察节点，不是完整逻辑计划；ADR-018 已把 `JoinPlan` 的键和残余标志结构化为 `JoinKeys` / `residual` / `on_expr`，ADR-019 在 `EXPLAIN SEXPR` 暴露这些字段，ADR-022 补上完整 join `:pred`，ADR-023 补上 `Having :pred`，ADR-024 补上 `Aggregate :keys` / `:aggregates`、ADR-025 补上 `Sort :keys`，但 join 的 residual-only 谓词仍不单独承载，规则还不能直接重写所有谓词。
+- 负结果：`PlanNode` 目前只覆盖 `EXPLAIN` 的物理可观察节点，不是完整逻辑计划；ADR-018 已把 `JoinPlan` 的键和残余标志结构化为 `JoinKeys` / `residual` / `on_expr`，ADR-019 在 `EXPLAIN SEXPR` 暴露这些字段，ADR-022 补上完整 join `:pred`，ADR-023 补上 `Having :pred`，ADR-024 补上 `Aggregate :keys` / `:aggregates`、ADR-025 补上 `Sort :keys`、ADR-026 补上 `Project` 的输出项与表达式，但 join 的 residual-only 谓词仍不单独承载，规则还不能直接重写所有谓词。
 - 负结果：没有规则引擎和代价模型，`PlanNode` 只是“可被规则处理的输入”，不会自动产生更优计划。
 - 负结果：新增 `Statement::ExplainSexpr` 会让外部对 `Statement` 做穷举匹配的调用方需要处理新分支；当前仓库没有外部下游，先接受这个兼容成本。
 - 负结果：`EXPLAIN SEXPR` 返回单行多行文本，CLI 打印时仍按一个单元格显示；这是有意的机器可读格式，不追求和文本计划逐行对齐。

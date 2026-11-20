@@ -188,9 +188,10 @@ EXPLAIN SEXPR SELECT ...;
 - `(filter :est-rows N child)`、`(aggregate :keys ((col "a.v")) :aggregates ((count :all)) :est-groups N child)`、`(having :pred <PlanExpr> :est-groups N child)`；
   - `:keys` 是 `GROUP BY` 的绑定表达式，全局聚合为 `()`；`:aggregates` 是 SELECT / HAVING / ORDER BY 引用到的去重聚合调用，只分组不聚合时为 `()`；两项始终输出。
   - `sort` 的 `:keys` 是 `(asc <PlanExpr>)` / `(desc <PlanExpr>)` 的有序列表；`NULL` 仍按 ASC 最前、DESC 最后排列，不作为每个键的字段输出。排序键按执行器排序输入（投影前）的 schema 还原，`Sort -> Project` 的节点顺序沿用文本计划，不承诺 `Sort` 消费投影后的列。
-  - `(project ("v" "n") :est-rows N child)`、`(sort :keys ((asc (col "a.v")) (desc (sum (col "a.id")))) :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
+  - `(project (("v" (col "a.v")) ("n" (sum (col "a.id")))) :est-rows N child)`；每项是 `("输出名" <PlanExpr>)`，顺序与输出列一致，空投影为 `()`。
+  - `(sort :keys ((asc (col "a.v")) (desc (sum (col "a.id")))) :est-rows N child)`、`(limit :limit 2 :est-rows N child)`。
 - 静态模式只输出估算，不输出 `actual` / `time-ms` 字段；节点、列、连接算法和估算与 `EXPLAIN` 共享同一份 `PlanNode`，不另建计划逻辑。`EXPLAIN ANALYZE SEXPR` 在同一个树外增加 `(execution ...)` 汇总，节点改用 actual 字段，见下节。
-- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md)、[`ADR-021`](../ADR/021-structured-filter-predicate.md)、[`ADR-022`](../ADR/022-structured-join-predicate.md)、[`ADR-023`](../ADR/023-structured-having-predicate.md)、[`ADR-024`](../ADR/024-structured-aggregate-shape.md) 与 [`ADR-025`](../ADR/025-structured-sort-keys.md)。
+- 该格式不引入 Lisp/Scheme 运行时、宏展开或 `eval`；它是只读序列化，不是 SQL 方言。规则和边界见 [`ADR-017`](../ADR/017-structured-plan-ir.md)、[`ADR-018`](../ADR/018-structured-join-keys.md)、[`ADR-019`](../ADR/019-structured-join-sexpr.md)、[`ADR-021`](../ADR/021-structured-filter-predicate.md)、[`ADR-022`](../ADR/022-structured-join-predicate.md)、[`ADR-023`](../ADR/023-structured-having-predicate.md)、[`ADR-024`](../ADR/024-structured-aggregate-shape.md)、[`ADR-025`](../ADR/025-structured-sort-keys.md) 与 [`ADR-026`](../ADR/026-structured-project-items.md)。
 
 ### EXPLAIN ANALYZE SELECT
 
@@ -218,7 +219,7 @@ EXPLAIN ANALYZE SEXPR SELECT ...;
 - 与 `EXPLAIN ANALYZE` 走同一次真实执行、同一套节点统计和同一棵 `PlanNode` 树，但不返回查询结果行，只返回单列 `plan`、单行文本。
 - 顶层增加执行汇总：`(execution :rows N :time-ms X`，其中 `N` 是最终输出行数，`X` 是从构建 FROM 到完成投影/排序/截断的总墙钟时间；汇总字段与文本格式末行 `Execution:` 同源。
 - 节点只输出实际字段：`Scan` 为 `:actual-rows`，`HashJoin` / `NestedLoop` 为 `:actual-rows` 和 `:time-ms`，`Filter` / `Project` / `Sort` 为 `:actual-rows` 和 `:time-ms`，`Aggregate` / `Having` 为 `:actual-groups` 和 `:time-ms`，`Limit` 只有 `:actual-rows`；`Scan` 不单独计时。
-- 不再输出 `:est-rows` / `:est-groups`，避免估算与实际混在同一棵树；join 的 `:keys` / `:residual` / `:on-expr` / `:pred` 仍按 ADR-019 / ADR-022 输出，`aggregate` 的 `:keys` / `:aggregates` 仍按 ADR-024 输出，`having` 的 `:pred` 仍按 ADR-023 输出，`sort` 的 `:keys` 表达式与方向仍按 ADR-025 输出。
+- 不再输出 `:est-rows` / `:est-groups`，避免估算与实际混在同一棵树；join 的 `:keys` / `:residual` / `:on-expr` / `:pred` 仍按 ADR-019 / ADR-022 输出，`aggregate` 的 `:keys` / `:aggregates` 仍按 ADR-024 输出，`having` 的 `:pred` 仍按 ADR-023 输出，`sort` 的 `:keys` 表达式与方向仍按 ADR-025 输出，`project` 的输出名与表达式仍按 ADR-026 输出。
 - 格式和边界见 [`ADR-020`](../ADR/020-explain-analyze-sexpr.md)。
 
 ### 查询语义
