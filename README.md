@@ -6,7 +6,7 @@
 2. `tritdb-page`：8 KiB 页 + 头 + CRC32；坏 magic/版本/长度/校验和/半写检测。
 3. `tritdb-format`：TRBL 块格式；20 字节头 + CRC32 + canonical padding 校验。
 4. `tritdb-wal`：TRWL 日志；32 字节段头/记录头 + CRC32；torn tail 检测与截断；LSN 单调性。
-5. `tritdb-txn`：单 WAL 写者 + 多个并发逻辑事务；`Begin/Put/Delete/Commit/Abort`；提交组让一批 `Commit` 共享一次 fsync；恢复只应用已提交事务；checkpoint 把已提交键值写进 `<wal>.snap` 后重置 WAL。
+5. `tritdb-txn`：单 WAL 写者 + 多个并发逻辑事务；`Begin/Put/Delete/Commit/Abort`；提交组让一批 `Commit` 共享一次 fsync；恢复只应用已提交事务；checkpoint 把已提交键值写进 `<wal>.snap` 后重置 WAL；`checkpoint --archive` 把 snapshot/WAL 归档到 `<wal>.history/<lsn>.{snap,wal}`，`txn recover --to-lsn` 可只读地回到历史 LSN。
 6. `tritdb-store`：8 KiB 页文件 + 页缓存（M0 无淘汰、无上限）+ WAL 页镜像 redo；提交先 fsync WAL 再写页文件；只重放已提交页；崩溃留下的半页尾会被截断；checkpoint 把已落盘页写入 `<data>.ckpt` 后重置单段 WAL。
 7. `tritdb` / `tritdb-bench`：CLI 与微基准；6 轮交错、min/median/max；带 `bin-u8` / `bin-u2` 二进制基线。
 8. `tritdb-testkit`：零依赖测试工具；唯一临时目录、确定性 xorshift64*、hex 编解码。
@@ -14,7 +14,7 @@
 10. `tritdb-exec`：SQL 值、schema、三值逻辑真值表、比较/算术表达式求值。
 11. `tritdb-sql`：最小 lexer/parser/binder/executor；`CREATE/INSERT/SELECT/UPDATE/DELETE/DROP`、加法 schema 迁移 `ALTER TABLE ... ADD [COLUMN]`、`WHERE/ORDER BY/LIMIT`、`IN/BETWEEN/LIKE` 谓词、`CASE` 表达式、`GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN`、`JOIN ... USING (col, ...)`、等值 JOIN 的 hash join 执行（非等值条件回退 nested loop）、基于 `ANALYZE` 统计的 `Auto` join 代价选择、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、无 `*` / `USING` / `NATURAL` 且列引用可唯一归属时的源表列裁剪（含无歧义未限定列与零列源表投影）、计划入口的常量折叠、投影常量折叠与恒真条件简化、结构化 `PlanNode`（含 join 键/残余标志/非键合取项/过滤谓词/完整 join 谓词/HAVING 谓词/Scan 表名、别名与下推谓词）、只读 `EXPLAIN SEXPR` 与带执行汇总的 `EXPLAIN ANALYZE SEXPR`、逗号分隔 `FROM`（表别名 + 限定列）、分组聚合与聚合结果排序、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 静态计划与统计估算；表以 `TRSQ` 整表 value 存进 `TxnStore`，统计以 `TRSS` value 存在 `sql/stats/` 下。`ALTER TABLE ADD COLUMN` 只允许追加可空列，旧行回填 `NULL`，整表在单事务中重写并在成功后使统计失效；不支持 `DROP` / `RENAME` / `ALTER TYPE`。
 
-**还没有做**：子查询、窗口函数、全局优化器、pgwire、MVCC、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、跨进程文件锁、带默认值的非空列迁移、`DROP/RENAME/ALTER COLUMN` 等破坏性 schema 变更、schema 迁移版本历史。不要把这个骨架当成数据库。
+**还没有做**：子查询、窗口函数、全局优化器、pgwire、MVCC、Parquet/Iceberg、复制、WAL 段轮转、后台 checkpoint、归档自动清理、时间戳到 LSN 的索引、跨进程文件锁、带默认值的非空列迁移、`DROP/RENAME/ALTER COLUMN` 等破坏性 schema 变更、schema 迁移版本历史。不要把这个骨架当成数据库。
 
 ## 发布
 
@@ -38,6 +38,9 @@ cargo run -p tritdb -- txn put --wal test.wal --key alpha --value one
 cargo run -p tritdb -- txn get --wal test.wal --key alpha
 cargo run -p tritdb -- txn dump --wal test.wal
 cargo run -p tritdb -- txn checkpoint --wal test.wal
+cargo run -p tritdb -- txn checkpoint --wal test.wal --archive
+cargo run -p tritdb -- txn history --wal test.wal
+cargo run -p tritdb -- txn recover --wal test.wal --to-lsn 10
 cargo run -p tritdb -- wal inspect --in test.wal
 cargo run -p tritdb -- pstore alloc --data pstore.pages --wal pstore.wal --text "hello"
 cargo run -p tritdb -- pstore get --data pstore.pages --wal pstore.wal --id 0
