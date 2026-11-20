@@ -16,7 +16,9 @@ use crate::ast::{
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
 use crate::parser::parse_script;
-use crate::plan::{JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode};
+use crate::plan::{
+    AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode,
+};
 use crate::stats::{analyze_table, TableStats};
 use crate::storage::{
     decode_stats, decode_table, encode_stats, encode_table, stats_key, table_key, STATS_KEY_PREFIX,
@@ -1119,7 +1121,29 @@ impl SqlEngine {
             } else {
                 Metrics::default()
             };
-            plan = PlanNode::unary(PlanKind::Aggregate(metrics), plan);
+            let keys = bound
+                .group_by
+                .iter()
+                .map(|expr| PlanExpr::from_exec(expr, &left_table.schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut aggregates = Vec::new();
+            for item in &bound.items {
+                collect_plan_aggregates(&item.expr, &left_table.schema, &mut aggregates)?;
+            }
+            if let Some(having) = &bound.having {
+                collect_plan_aggregates(having, &left_table.schema, &mut aggregates)?;
+            }
+            for order in &bound.order_by {
+                collect_plan_aggregates(&order.expr, &left_table.schema, &mut aggregates)?;
+            }
+            plan = PlanNode::unary(
+                PlanKind::Aggregate(AggregatePlan {
+                    keys,
+                    aggregates,
+                    metrics,
+                }),
+                plan,
+            );
             if let Some(having) = &bound.having {
                 let metrics = if let Some(stats) = stats {
                     Metrics {
@@ -1222,6 +1246,67 @@ impl SqlEngine {
         self.stats.remove(&name);
         Ok(())
     }
+}
+
+/// Collect the distinct aggregate calls referenced by one bound group
+/// expression. The plan reports this as a query-level inventory; the executor
+/// still evaluates each occurrence where it appears.
+fn collect_plan_aggregates(
+    expr: &GroupExpr,
+    schema: &Schema,
+    out: &mut Vec<PlanExpr>,
+) -> Result<(), SqlError> {
+    match expr {
+        GroupExpr::Aggregate { .. } => {
+            let aggregate = PlanExpr::from_group_expr(expr, schema)?;
+            if !out.contains(&aggregate) {
+                out.push(aggregate);
+            }
+        }
+        GroupExpr::Scalar(_) => {}
+        GroupExpr::IsNull { expr, .. } | GroupExpr::IsTruth { expr, .. } => {
+            collect_plan_aggregates(expr, schema, out)?;
+        }
+        GroupExpr::Not(expr) => collect_plan_aggregates(expr, schema, out)?,
+        GroupExpr::InList { expr, values, .. } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            for value in values {
+                collect_plan_aggregates(value, schema, out)?;
+            }
+        }
+        GroupExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            collect_plan_aggregates(low, schema, out)?;
+            collect_plan_aggregates(high, schema, out)?;
+        }
+        GroupExpr::Like { expr, pattern, .. } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            collect_plan_aggregates(pattern, schema, out)?;
+        }
+        GroupExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_plan_aggregates(operand, schema, out)?;
+            }
+            for (when, then) in branches {
+                collect_plan_aggregates(when, schema, out)?;
+                collect_plan_aggregates(then, schema, out)?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_plan_aggregates(else_expr, schema, out)?;
+            }
+        }
+        GroupExpr::Binary { left, right, .. } => {
+            collect_plan_aggregates(left, schema, out)?;
+            collect_plan_aggregates(right, schema, out)?;
+        }
+    }
+    Ok(())
 }
 
 fn qualify_table(table: &Table, qualifier: &str) -> Table {

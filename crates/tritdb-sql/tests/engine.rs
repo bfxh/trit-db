@@ -1965,6 +1965,10 @@ fn explain_sexpr_reports_structured_plan() {
         ),
         "unexpected plan: {having_plan}"
     );
+    assert!(
+        having_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ((count :all))"),
+        "unexpected plan: {having_plan}"
+    );
     assert!(!having_plan.contains(":est-groups"), "{having_plan}");
     assert!(!having_plan.contains(":actual-groups"), "{having_plan}");
 
@@ -1981,6 +1985,34 @@ fn explain_sexpr_reports_structured_plan() {
     assert!(
         summed_plan.contains("(having :pred (> (sum (col \"a.id\")) 2)"),
         "unexpected plan: {summed_plan}"
+    );
+    assert!(
+        summed_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ((sum (col \"a.id\")))"),
+        "unexpected plan: {summed_plan}"
+    );
+
+    let global = engine
+        .execute_script("EXPLAIN SEXPR SELECT COUNT(*) FROM a;")
+        .expect("explain sexpr global aggregate");
+    let global_plan = match &as_rows(&global[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        global_plan.contains("(aggregate :keys () :aggregates ((count :all))"),
+        "unexpected plan: {global_plan}"
+    );
+
+    let grouped = engine
+        .execute_script("EXPLAIN SEXPR SELECT a.v FROM a GROUP BY a.v;")
+        .expect("explain sexpr group only");
+    let grouped_plan = match &as_rows(&grouped[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        grouped_plan.contains("(aggregate :keys ((col \"a.v\")) :aggregates ()"),
+        "unexpected plan: {grouped_plan}"
     );
 }
 
@@ -2053,6 +2085,22 @@ fn explain_analyze_sexpr_reports_actual_metrics() {
     );
     assert!(!plan.contains(":est-rows"), "unexpected plan: {plan}");
     assert!(!plan.contains("Execution:"), "unexpected plan: {plan}");
+
+    let grouped = engine
+        .execute_script("EXPLAIN ANALYZE SEXPR SELECT a.v, COUNT(*) FROM a GROUP BY a.v;")
+        .expect("explain analyze sexpr grouped");
+    let grouped_plan = match &as_rows(&grouped[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        grouped_plan.contains(
+            "(aggregate :keys ((col \"a.v\")) :aggregates ((count :all)) \
+             :actual-groups 3 :time-ms "
+        ),
+        "unexpected plan: {grouped_plan}"
+    );
+    assert!(!grouped_plan.contains(":est-groups"), "{grouped_plan}");
 }
 
 #[test]

@@ -33,7 +33,7 @@ pub(crate) enum PlanKind {
         pred: PlanExpr,
         metrics: Metrics,
     },
-    Aggregate(Metrics),
+    Aggregate(AggregatePlan),
     Having {
         pred: PlanExpr,
         metrics: Metrics,
@@ -118,6 +118,17 @@ pub(crate) struct JoinPlan {
     pub(crate) on_expr: bool,
     /// Complete bound `ON` / `USING` / `NATURAL` predicate, when one exists.
     pub(crate) pred: Option<PlanExpr>,
+    pub(crate) metrics: Metrics,
+}
+
+/// Aggregate-specific fields. `keys` are the bound `GROUP BY` expressions;
+/// `aggregates` are the distinct aggregate calls referenced by the query's
+/// SELECT, HAVING, and ORDER BY expressions. The latter is a query-level
+/// inventory, not a precomputed physical aggregate list.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregatePlan {
+    pub(crate) keys: Vec<PlanExpr>,
+    pub(crate) aggregates: Vec<PlanExpr>,
     pub(crate) metrics: Metrics,
 }
 
@@ -274,9 +285,9 @@ impl PlanNode {
                 push_metrics(&mut text, metrics, "rows");
                 text
             }
-            PlanKind::Aggregate(metrics) => {
+            PlanKind::Aggregate(aggregate) => {
                 let mut text = "Aggregate".to_string();
-                push_metrics(&mut text, metrics, "groups");
+                push_metrics(&mut text, &aggregate.metrics, "groups");
                 text
             }
             PlanKind::Having { metrics, .. } => {
@@ -378,9 +389,12 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Aggregate(metrics) => {
-                out.push_str("(aggregate");
-                push_sexpr_metrics(out, metrics, "groups");
+            PlanKind::Aggregate(aggregate) => {
+                out.push_str("(aggregate :keys ");
+                push_plan_expr_list(out, &aggregate.keys);
+                out.push_str(" :aggregates ");
+                push_plan_expr_list(out, &aggregate.aggregates);
+                push_sexpr_metrics(out, &aggregate.metrics, "groups");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
@@ -847,6 +861,17 @@ fn push_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+fn push_plan_expr_list(out: &mut String, exprs: &[PlanExpr]) {
+    out.push('(');
+    for (index, expr) in exprs.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        expr.write_sexpr(out);
+    }
+    out.push(')');
 }
 
 fn push_string_list(out: &mut String, values: &[String]) {
