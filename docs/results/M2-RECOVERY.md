@@ -8,7 +8,7 @@
 
 ```text
 crates/tritdb-txn/src/lib.rs        checkpoint_archive / recover_at / PitrView
-crates/tritdb/src/main.rs           txn history / txn recover / txn checkpoint --archive
+crates/tritdb/src/main.rs           txn history / txn recover / txn checkpoint --archive --keep
 crates/tritdb-txn/tests/pitr.rs      5 个库级测试
 crates/tritdb-txn/tests/pitr_time.rs 3 个时间索引测试
 crates/tritdb/tests/pitr_cli.rs      2 个 CLI 端到端测试
@@ -21,7 +21,8 @@ docs/ADR/034-time-index.md           时间索引
 
 ```bash
 # 归档 checkpoint：写 snapshot + 把旧 WAL / snapshot 复制到 <wal>.history/<lsn>.{snap,wal}
-tritdb txn checkpoint --wal test.wal --archive
+# 默认只保留最新 8 个归档；--keep 0 关闭自动清理
+tritdb txn checkpoint --wal test.wal --archive --keep 5
 
 # 列出可用历史
 tritdb txn history --wal test.wal
@@ -59,7 +60,7 @@ pitr_cli: 2 passed
 
 ## 5. 还没做
 
-- 自动触发的归档 GC（当前只提供手动 `prune_history` / `txn history --prune`）；
+- 自动 GC 的保留数默认 8（`checkpoint_archive_keep` / `--keep` 可改，0 关闭）；
 - 时间索引只能写入时维护，无法从 WAL 重建；崩溃可能落后最后几条；
 - WAL 段轮转已在同一文件内实现（ADR-033），但不能按段释放文件空间；
 - 在 `TxnStore` 打开状态下提供一致性快照读（当前 `recover_at` 读取 live WAL 时假设没有并发写者）。

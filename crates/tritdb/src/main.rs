@@ -60,7 +60,7 @@ fn print_help() {
     println!("  txn put --wal test.wal --key k --value v");
     println!("  txn get --wal test.wal --key k");
     println!("  txn dump --wal test.wal");
-    println!("  txn checkpoint --wal test.wal [--archive]");
+    println!("  txn checkpoint --wal test.wal [--archive] [--keep N]");
     println!("  txn history --wal test.wal [--prune --keep N]");
     println!("  txn recover --wal test.wal --to-lsn 42 | --to-time-ms 1700000000000");
     println!("  txn writer --wal test.wal --txns 1000 --keys-per-txn 4 --sleep-ms 1");
@@ -365,15 +365,16 @@ fn txn_dump(args: &[String]) -> Result<(), String> {
 fn txn_checkpoint(args: &[String]) -> Result<(), String> {
     let wal = required_arg(args, "--wal")?;
     let archive = args.iter().any(|arg| arg == "--archive");
+    let keep = arg_usize(args, "--keep", tritdb_txn::DEFAULT_ARCHIVE_KEEP);
     let store = open_store(&wal)?;
     let info = if archive {
-        store.checkpoint_archive()
+        store.checkpoint_archive_keep(keep)
     } else {
         store.checkpoint()
     }
     .map_err(|error| error.to_string())?;
     println!(
-        "checkpoint_lsn={} entries={} wal_bytes_before={} wal_bytes_after={} snapshot={} snapshot_bytes={} archived_wal={} archived_snapshot={}",
+        "checkpoint_lsn={} entries={} wal_bytes_before={} wal_bytes_after={} snapshot={} snapshot_bytes={} archived_wal={} archived_snapshot={} pruned_archives={}",
         info.checkpoint_lsn,
         info.entries,
         info.wal_bytes_before,
@@ -382,7 +383,8 @@ fn txn_checkpoint(args: &[String]) -> Result<(), String> {
         info.snapshot_bytes,
         info.archived_wal_bytes.map_or("-".to_string(), |n| n.to_string()),
         info.archived_snapshot_bytes
-            .map_or("-".to_string(), |n| n.to_string())
+            .map_or("-".to_string(), |n| n.to_string()),
+        info.pruned_archives
     );
     Ok(())
 }
