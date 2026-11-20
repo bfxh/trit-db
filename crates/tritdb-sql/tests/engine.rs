@@ -2327,6 +2327,46 @@ fn explain_sexpr_reports_structured_join_keys() {
         "pure equi join must not carry a residual predicate: {pure}"
     );
 
+    let same_source = plan_text(
+        &mut engine,
+        "EXPLAIN SEXPR SELECT a.id FROM a JOIN b \
+         ON a.id = b.id AND a.id = a.code;",
+    );
+    assert!(
+        same_source.contains(
+            ":keys ((\"a.id\" \"b.id\")) \
+             :residual-pred (= (col \"a.id\") (col \"a.code\")) \
+             :pred (and (= (col \"a.id\") (col \"b.id\")) \
+             (= (col \"a.id\") (col \"a.code\")))"
+        ),
+        "same-source equality must still expose its non-key conjunct: {same_source}"
+    );
+    assert!(
+        !same_source.contains(":residual #t"),
+        "historical residual flag must stay unchanged: {same_source}"
+    );
+
+    let same_source_text = engine
+        .execute_script("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id AND a.id = a.code;")
+        .expect("explain same-source join");
+    let same_source_text = as_rows(&same_source_text[0])
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Text(line) => line.clone(),
+            other => panic!("expected plan line, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        same_source_text.contains("HashJoin (inner) keys=(a.id = b.id)"),
+        "unexpected text plan: {same_source_text}"
+    );
+    assert!(
+        !same_source_text.contains("residual=yes"),
+        "text plan must not gain a residual marker: {same_source_text}"
+    );
+
     engine.set_join_strategy(JoinStrategy::NestedLoop);
     let nested = plan_text(
         &mut engine,

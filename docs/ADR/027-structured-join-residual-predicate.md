@@ -4,6 +4,8 @@
 
 日期：2026-11-20
 
+> 后续：ADR-030 把 `:residual-pred` 的计算与历史 `:residual` 标志解耦；同源列等值等非键合取项现在也能输出，但文本 `residual=yes` 保持不变。
+
 ## 背景
 
 ADR-022 已经让 `JoinPlan.pred` 携带完整的 `ON` / `USING` / `NATURAL` 谓词，但 hash join 仍只有 `residual: bool`：

@@ -2551,7 +2551,7 @@ fn join_plan(
     let pred = predicate
         .map(|expr| PlanExpr::from_exec(expr, &pair_schema))
         .transpose()?;
-    let residual_pred = if residual {
+    let residual_pred = if uses_hash {
         predicate
             .and_then(|expr| residual_join_predicate(expr, left.schema.len(), hash_pairs))
             .map(|expr| PlanExpr::from_exec(&expr, &pair_schema))
