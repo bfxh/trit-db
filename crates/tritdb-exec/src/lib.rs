@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 
 /// A SQL scalar value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     /// SQL `NULL`, also boolean `UNKNOWN`.
     Null,

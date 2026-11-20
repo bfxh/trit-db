@@ -1730,6 +1730,64 @@ fn natural_and_using_joins_merge_columns_through_outer_joins() {
 }
 
 #[test]
+fn hash_join_handles_composite_null_and_residual_predicates() {
+    let dir = TempDir::new("sql-hash-join");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE h1 (id INT, code INT, v TEXT); \
+             CREATE TABLE h2 (id INT, code INT, w TEXT); \
+             INSERT INTO h1 VALUES (1, 10, 'a1'), (1, 20, 'a2'), (NULL, 10, 'n1'), \
+                 (2, NULL, 'n2'), (3, 30, 'a3'); \
+             INSERT INTO h2 VALUES (1, 10, 'b1'), (1, 20, 'b2'), (2, 20, 'b3'), \
+                 (NULL, 10, 'bn'), (4, 40, 'b4');",
+        )
+        .expect("seed");
+
+    let matched = engine
+        .execute_script(
+            "SELECT h1.v, h2.w FROM h1 JOIN h2 \
+             ON h1.id = h2.id AND h1.code = h2.code ORDER BY h1.v;",
+        )
+        .expect("composite hash join");
+    assert_eq!(
+        as_rows(&matched[0]).1,
+        [
+            vec![Value::Text("a1".to_string()), Value::Text("b1".to_string())],
+            vec![Value::Text("a2".to_string()), Value::Text("b2".to_string())],
+        ]
+    );
+
+    let residual = engine
+        .execute_script(
+            "SELECT h1.v, h2.w FROM h1 LEFT JOIN h2 \
+             ON h1.id = h2.id AND h1.code = h2.code AND h2.w <> 'b2' ORDER BY h1.v;",
+        )
+        .expect("residual predicate");
+    assert_eq!(
+        as_rows(&residual[0]).1,
+        [
+            vec![Value::Text("a1".to_string()), Value::Text("b1".to_string())],
+            vec![Value::Text("a2".to_string()), Value::Null],
+            vec![Value::Text("a3".to_string()), Value::Null],
+            vec![Value::Text("n1".to_string()), Value::Null],
+            vec![Value::Text("n2".to_string()), Value::Null],
+        ]
+    );
+
+    let fallback = engine
+        .execute_script("SELECT COUNT(*) FROM h1 JOIN h2 ON h1.id < h2.id;")
+        .expect("non-equi fallback");
+    assert_eq!(as_rows(&fallback[0]).1, [vec![Value::Int(6)]]);
+
+    let full = engine
+        .execute_script("SELECT COUNT(*) FROM h1 FULL JOIN h2 ON h1.id = h2.id;")
+        .expect("full hash join with null keys");
+    assert_eq!(as_rows(&full[0]).1, [vec![Value::Int(9)]]);
+}
+
+#[test]
 fn natural_join_without_common_columns_is_cross_join_and_validates_using() {
     let dir = TempDir::new("sql-natural-using-errors");
     let db = dir.join("sql.db");

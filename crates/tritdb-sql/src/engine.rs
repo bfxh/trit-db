@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::str;
 
@@ -599,6 +599,154 @@ fn project_join_row(left: &Row, right: &Row, sources: &[JoinSource]) -> Row {
         .collect()
 }
 
+fn equi_pair(left: &ExecExpr, right: &ExecExpr, left_len: usize) -> Option<(usize, usize)> {
+    match (left, right) {
+        (ExecExpr::Column(left_index), ExecExpr::Column(right_index))
+            if *left_index < left_len && *right_index >= left_len =>
+        {
+            Some((*left_index, *right_index - left_len))
+        }
+        (ExecExpr::Column(left_index), ExecExpr::Column(right_index))
+            if *right_index < left_len && *left_index >= left_len =>
+        {
+            Some((*right_index, *left_index - left_len))
+        }
+        _ => None,
+    }
+}
+
+fn collect_equi_pairs(expr: &ExecExpr, left_len: usize, pairs: &mut Vec<(usize, usize)>) {
+    match expr {
+        ExecExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_equi_pairs(left, left_len, pairs);
+            collect_equi_pairs(right, left_len, pairs);
+        }
+        ExecExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            if let Some(pair) = equi_pair(left, right, left_len) {
+                if !pairs.contains(&pair) {
+                    pairs.push(pair);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn equi_join_pairs(expr: &ExecExpr, left_len: usize) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    collect_equi_pairs(expr, left_len, &mut pairs);
+    pairs
+}
+
+fn hash_key(row: &Row, keys: &[usize]) -> Option<Vec<Value>> {
+    let mut key = Vec::with_capacity(keys.len());
+    for &index in keys {
+        if row[index].is_null() {
+            return None;
+        }
+        key.push(row[index].clone());
+    }
+    Some(key)
+}
+
+fn hash_join_rows(
+    left: &Table,
+    right: &Table,
+    sources: &[JoinSource],
+    kind: JoinKind,
+    predicate: Option<&ExecExpr>,
+    pair_schema: &Schema,
+    pairs: &[(usize, usize)],
+) -> Result<Vec<Row>, SqlError> {
+    let left_keys: Vec<usize> = pairs.iter().map(|&(left_index, _)| left_index).collect();
+    let right_keys: Vec<usize> = pairs.iter().map(|&(_, right_index)| right_index).collect();
+    let mut buckets: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+    for (index, right_row) in right.rows.iter().enumerate() {
+        if let Some(key) = hash_key(right_row, &right_keys) {
+            buckets.entry(key).or_default().push(index);
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut right_matched = vec![false; right.rows.len()];
+    let null_left = vec![Value::Null; left.schema.len()];
+    let null_right = vec![Value::Null; right.schema.len()];
+    for left_row in &left.rows {
+        let mut matched = false;
+        let key = hash_key(left_row, &left_keys);
+        if let Some(candidates) = key.as_ref().and_then(|key| buckets.get(key)) {
+            for &index in candidates {
+                let right_row = &right.rows[index];
+                let mut pair = left_row.clone();
+                pair.extend(right_row.iter().cloned());
+                if passes_filter(predicate, pair_schema, &pair)? {
+                    matched = true;
+                    right_matched[index] = true;
+                    rows.push(project_join_row(left_row, right_row, sources));
+                }
+            }
+        }
+        if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
+            rows.push(project_join_row(left_row, &null_right, sources));
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (index, right_row) in right.rows.iter().enumerate() {
+            if right_matched[index] {
+                continue;
+            }
+            rows.push(project_join_row(&null_left, right_row, sources));
+        }
+    }
+    Ok(rows)
+}
+
+fn nested_loop_join_rows(
+    left: &Table,
+    right: &Table,
+    sources: &[JoinSource],
+    kind: JoinKind,
+    predicate: Option<&ExecExpr>,
+    pair_schema: &Schema,
+) -> Result<Vec<Row>, SqlError> {
+    let mut rows = Vec::new();
+    let mut right_matched = vec![false; right.rows.len()];
+    let null_left = vec![Value::Null; left.schema.len()];
+    let null_right = vec![Value::Null; right.schema.len()];
+    for left_row in &left.rows {
+        let mut matched = false;
+        for (index, right_row) in right.rows.iter().enumerate() {
+            let mut pair = left_row.clone();
+            pair.extend(right_row.iter().cloned());
+            if passes_filter(predicate, pair_schema, &pair)? {
+                matched = true;
+                right_matched[index] = true;
+                rows.push(project_join_row(left_row, right_row, sources));
+            }
+        }
+        if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
+            rows.push(project_join_row(left_row, &null_right, sources));
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (index, right_row) in right.rows.iter().enumerate() {
+            if right_matched[index] {
+                continue;
+            }
+            rows.push(project_join_row(&null_left, right_row, sources));
+        }
+    }
+    Ok(rows)
+}
+
 fn join_tables(
     left: &Table,
     right: &Table,
@@ -626,33 +774,34 @@ fn join_tables(
         }
         JoinCondition::None => None,
     };
-    let mut rows = Vec::new();
-    let mut right_matched = vec![false; right.rows.len()];
-    let null_left = vec![Value::Null; left.schema.len()];
-    let null_right = vec![Value::Null; right.schema.len()];
-    for left_row in &left.rows {
-        let mut matched = false;
-        for (index, right_row) in right.rows.iter().enumerate() {
-            let mut pair = left_row.clone();
-            pair.extend(right_row.iter().cloned());
-            if passes_filter(predicate.as_ref(), &pair_schema, &pair)? {
-                matched = true;
-                right_matched[index] = true;
-                rows.push(project_join_row(left_row, right_row, &sources));
-            }
-        }
-        if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
-            rows.push(project_join_row(left_row, &null_right, &sources));
-        }
-    }
-    if matches!(kind, JoinKind::Right | JoinKind::Full) {
-        for (index, right_row) in right.rows.iter().enumerate() {
-            if right_matched[index] {
-                continue;
-            }
-            rows.push(project_join_row(&null_left, right_row, &sources));
-        }
-    }
+    let hash_pairs = match condition {
+        JoinCondition::Using(_) | JoinCondition::Natural => pairs.clone(),
+        JoinCondition::On(_) => predicate
+            .as_ref()
+            .map(|expr| equi_join_pairs(expr, left.schema.len()))
+            .unwrap_or_default(),
+        JoinCondition::None => Vec::new(),
+    };
+    let rows = if hash_pairs.is_empty() {
+        nested_loop_join_rows(
+            left,
+            right,
+            &sources,
+            kind,
+            predicate.as_ref(),
+            &pair_schema,
+        )?
+    } else {
+        hash_join_rows(
+            left,
+            right,
+            &sources,
+            kind,
+            predicate.as_ref(),
+            &pair_schema,
+            &hash_pairs,
+        )?
+    };
     Ok(Table {
         name: format!("{}+{}", left.name, right.name),
         schema,
