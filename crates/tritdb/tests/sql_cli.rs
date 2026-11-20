@@ -316,3 +316,54 @@ fn lukasiewicz_and_nat_columns_roundtrip() {
     let text = stdout(&output);
     assert!(text.contains("1	0.500	7"), "reopen: {text}");
 }
+
+#[test]
+fn unique_column_rejects_duplicates_and_survives_reopen() {
+    let dir = TempDir::new("sql-unique");
+    let db = dir.join("u.db");
+    let db = db.to_str().expect("path");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL UNIQUE, name TEXT);          INSERT INTO t VALUES (1, 'a');",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run(["sql", "--db", db, "--sql", "INSERT INTO t VALUES (1, 'b');"]);
+    assert!(!output.status.success(), "duplicate must fail");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "INSERT INTO t VALUES (2, 'c'); SELECT * FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1	a"), "out: {text}");
+    assert!(text.contains("2	c"), "out: {text}");
+}
+
+#[test]
+fn under_repair_accepts_multiple_key_columns() {
+    let dir = TempDir::new("sql-under-repair-multi");
+    let db = dir.join("ur.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (tenant INT NOT NULL, id INT NOT NULL, x INT);          INSERT INTO t VALUES (1,1,10),(1,1,20),(1,2,30),(2,1,40);          SELECT * FROM t UNDER REPAIR ON (tenant, id);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1	2	30"), "out: {text}");
+    assert!(text.contains("2	1	40"), "out: {text}");
+    assert!(!text.contains("1	1	10"), "out: {text}");
+    assert!(!text.contains("1	1	20"), "out: {text}");
+}

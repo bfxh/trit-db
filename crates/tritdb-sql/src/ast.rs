@@ -120,6 +120,8 @@ pub struct ColumnDef {
     pub data_type: DataType,
     /// Reject `NULL`.
     pub not_null: bool,
+    /// Reject duplicate non-`NULL` values.
+    pub unique: bool,
 }
 
 /// Select-list item.
@@ -208,9 +210,9 @@ pub struct Select {
     pub order_by: Vec<OrderBy>,
     /// Optional limit.
     pub limit: Option<usize>,
-    /// `UNDER REPAIR ON (col)`: keep rows that are certain in every minimal
-    /// repair of the functional dependency `col -> other columns`.
-    pub under_repair: Option<String>,
+    /// `UNDER REPAIR ON (col, ...)`: keep rows that are certain in every
+    /// minimal repair of the functional dependency `cols -> other columns`.
+    pub under_repair: Option<Vec<String>>,
 }
 
 /// One `SET` assignment in an `UPDATE`.

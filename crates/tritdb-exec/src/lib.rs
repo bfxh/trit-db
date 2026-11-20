@@ -156,6 +156,8 @@ pub struct Column {
     pub data_type: DataType,
     /// Reject `NULL` on insert.
     pub not_null: bool,
+    /// Reject duplicate non-`NULL` values.
+    pub unique: bool,
 }
 
 impl Column {
@@ -165,6 +167,7 @@ impl Column {
             name: name.into(),
             data_type,
             not_null: false,
+            unique: false,
         }
     }
 }

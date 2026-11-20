@@ -9,7 +9,7 @@ pub const TABLE_KEY_PREFIX: &str = "sql/table/";
 pub const STATS_KEY_PREFIX: &str = "sql/stats/";
 
 const TABLE_MAGIC: [u8; 4] = *b"TRSQ";
-const TABLE_VERSION: u8 = 0;
+const TABLE_VERSION: u8 = 1;
 const STATS_MAGIC: [u8; 4] = *b"TRSS";
 const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
@@ -91,6 +91,7 @@ pub fn encode_table(table: &Table) -> Result<Vec<u8>, SqlError> {
     for column in &table.schema.columns {
         out.push(type_tag(column.data_type));
         out.push(u8::from(column.not_null));
+        out.push(u8::from(column.unique));
         put_text(&mut out, &column.name)?;
     }
     out.extend_from_slice(&(table.rows.len() as u64).to_le_bytes());
@@ -252,7 +253,7 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
     }
     reader.pos = 4;
     let version = reader.u8().ok_or_else(|| corrupt("missing version"))?;
-    if version != TABLE_VERSION {
+    if version > TABLE_VERSION {
         return Err(corrupt("unsupported version"));
     }
     let column_count = reader
@@ -266,6 +267,11 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
         let type_tag = reader.u8().ok_or_else(|| corrupt("missing column type"))?;
         let data_type = type_from_tag(type_tag).ok_or_else(|| corrupt("invalid column type"))?;
         let not_null = reader.u8().ok_or_else(|| corrupt("missing null flag"))? != 0;
+        let unique = if version >= 1 {
+            reader.u8().ok_or_else(|| corrupt("missing unique flag"))? != 0
+        } else {
+            false
+        };
         let name_len = reader
             .u32()
             .ok_or_else(|| corrupt("missing column name length"))? as usize;
@@ -276,6 +282,7 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
             name: column_name,
             data_type,
             not_null,
+            unique,
         });
     }
     let row_count = reader.u64().ok_or_else(|| corrupt("missing row count"))?;
@@ -408,6 +415,7 @@ mod tests {
                     name: "name".to_string(),
                     data_type: DataType::Text,
                     not_null: true,
+                    unique: true,
                 },
                 Column::new("ok", DataType::Bool),
             ]),
