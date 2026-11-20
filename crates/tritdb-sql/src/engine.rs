@@ -249,6 +249,7 @@ impl SqlEngine {
                 columns,
                 rows,
             } => self.insert(table, columns.as_deref(), rows),
+            Statement::CountModels { expr, vars } => self.count_models(expr, *vars),
             Statement::Select(select) => self.select(select),
             Statement::Explain(select) => self.explain(select, false, ExplainFormat::Text),
             Statement::ExplainSexpr(select) => self.explain(select, false, ExplainFormat::Sexpr),
@@ -527,6 +528,23 @@ impl SqlEngine {
         Ok(QueryResult::Message(format!(
             "updated {updated} row(s) in {name}"
         )))
+    }
+
+    fn count_models(&self, expr: &str, vars: usize) -> Result<QueryResult, SqlError> {
+        let (parsed, inferred) = tritdb_exec::ann::parse_bool_expr(expr)
+            .map_err(|error| SqlError::Unsupported(error.to_string()))?;
+        let vars = if vars == 0 { inferred } else { vars };
+        if inferred > vars {
+            return Err(SqlError::Unsupported(format!(
+                "expression uses {inferred} variables, only {vars} declared"
+            )));
+        }
+        let models = tritdb_exec::ann::count_models(&parsed, vars)
+            .map_err(|error| SqlError::Unsupported(error.to_string()))?;
+        Ok(QueryResult::Rows {
+            columns: vec!["models".to_string()],
+            rows: vec![vec![Value::Int(models as i64)]],
+        })
     }
 
     fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {

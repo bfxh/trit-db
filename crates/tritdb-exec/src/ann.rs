@@ -11,7 +11,9 @@ use crate::TruthValue;
 /// Maximum variables accepted by [`count_models`].
 pub const MAX_MODEL_VARS: usize = 20;
 /// Maximum facts accepted by [`under_repair`].
-pub const MAX_REPAIR_FACTS: usize = 16;
+pub const MAX_REPAIR_FACTS: usize = 64;
+/// Maximum facts inside one connected component of the denial graph.
+pub const MAX_COMPONENT_FACTS: usize = 16;
 
 /// Belnap four-valued truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +164,8 @@ pub enum AnnError {
         /// Declared count.
         count: usize,
     },
+    /// A boolean expression could not be parsed.
+    Parse(String),
 }
 
 impl fmt::Display for AnnError {
@@ -183,6 +187,7 @@ impl fmt::Display for AnnError {
             AnnError::OutOfRange { index, count } => {
                 write!(formatter, "index {index} is outside 0..{count}")
             }
+            AnnError::Parse(reason) => write!(formatter, "bad boolean expression: {reason}"),
         }
     }
 }
@@ -304,6 +309,56 @@ pub fn under_repair(
         }
     }
 
+    // Denials only connect facts inside one component. Answers compose
+    // independently, so each component is enumerated on its own.
+    let mut any_impossible = false;
+    let mut any_contingent = false;
+    for component in components(facts, denials) {
+        let position: std::collections::BTreeMap<usize, usize> = component
+            .iter()
+            .enumerate()
+            .map(|(local, &fact)| (fact, local))
+            .collect();
+        let local_denials: Vec<Vec<usize>> = denials
+            .iter()
+            .filter(|denial| {
+                denial
+                    .first()
+                    .is_some_and(|first| position.contains_key(first))
+            })
+            .map(|denial| denial.iter().map(|fact| position[fact]).collect())
+            .collect();
+        let local_query: Vec<usize> = query
+            .iter()
+            .filter_map(|fact| position.get(fact).copied())
+            .collect();
+        match component_answer(component.len(), &local_denials, &local_query)? {
+            RepairAnswer::Impossible => any_impossible = true,
+            RepairAnswer::Contingent => any_contingent = true,
+            RepairAnswer::Certain => {}
+        }
+    }
+
+    Ok(if any_impossible {
+        RepairAnswer::Impossible
+    } else if any_contingent {
+        RepairAnswer::Contingent
+    } else {
+        RepairAnswer::Certain
+    })
+}
+
+fn component_answer(
+    facts: usize,
+    denials: &[Vec<usize>],
+    query: &[usize],
+) -> Result<RepairAnswer, AnnError> {
+    if facts > MAX_COMPONENT_FACTS {
+        return Err(AnnError::TooManyFacts {
+            facts,
+            max: MAX_COMPONENT_FACTS,
+        });
+    }
     let mut certain = true;
     let mut possible = false;
     for mask in 0..(1u64 << facts) {
@@ -317,7 +372,6 @@ pub fn under_repair(
             certain = false;
         }
     }
-
     Ok(if certain {
         RepairAnswer::Certain
     } else if possible {
@@ -325,6 +379,37 @@ pub fn under_repair(
     } else {
         RepairAnswer::Impossible
     })
+}
+
+fn components(facts: usize, denials: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn find(parent: &mut [usize], mut value: usize) -> usize {
+        while parent[value] != value {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        value
+    }
+
+    let mut parent: Vec<usize> = (0..facts).collect();
+    for denial in denials {
+        if let Some(&first) = denial.first() {
+            for &other in &denial[1..] {
+                let left = find(&mut parent, first);
+                let right = find(&mut parent, other);
+                if left != right {
+                    parent[left] = right;
+                }
+            }
+        }
+    }
+
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for fact in 0..facts {
+        let root = find(&mut parent, fact);
+        groups.entry(root).or_default().push(fact);
+    }
+    groups.into_values().collect()
 }
 
 fn consistent(mask: u64, denials: &[Vec<usize>]) -> bool {
@@ -335,6 +420,188 @@ fn consistent(mask: u64, denials: &[Vec<usize>]) -> bool {
 
 fn maximal(mask: u64, facts: usize, denials: &[Vec<usize>]) -> bool {
     (0..facts).all(|index| mask & (1 << index) != 0 || !consistent(mask | (1 << index), denials))
+}
+
+/// Parses a boolean expression over `a`..`z`, `vN`, or `N` variables.
+///
+/// Returns the expression and the minimal variable count (maximum index + 1).
+pub fn parse_bool_expr(text: &str) -> Result<(BoolExpr, usize), AnnError> {
+    let expr = BoolParser::new(text).parse()?;
+    let mut max_index = None;
+    collect_vars(&expr, &mut max_index);
+    let vars = max_index.map_or(0, |index| index + 1);
+    if vars > MAX_MODEL_VARS {
+        return Err(AnnError::TooManyVars {
+            vars,
+            max: MAX_MODEL_VARS,
+        });
+    }
+    Ok((expr, vars))
+}
+
+fn collect_vars(expr: &BoolExpr, max_index: &mut Option<usize>) {
+    match expr {
+        BoolExpr::Var(index) => {
+            *max_index = Some(max_index.map_or(*index, |current| current.max(*index)));
+        }
+        BoolExpr::Const(_) => {}
+        BoolExpr::Not(inner) => collect_vars(inner, max_index),
+        BoolExpr::And(items) | BoolExpr::Or(items) => {
+            for item in items {
+                collect_vars(item, max_index);
+            }
+        }
+    }
+}
+
+struct BoolParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BoolParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.as_bytes(),
+            position: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<BoolExpr, AnnError> {
+        let expr = self.parse_or()?;
+        self.skip_ws();
+        if self.position < self.input.len() {
+            return Err(AnnError::Parse(format!(
+                "unexpected input at byte {}",
+                self.position
+            )));
+        }
+        Ok(expr)
+    }
+
+    fn parse_or(&mut self) -> Result<BoolExpr, AnnError> {
+        let mut items = vec![self.parse_and()?];
+        loop {
+            self.skip_ws();
+            if self.eat_word("OR") || self.eat("||") {
+                items.push(self.parse_and()?);
+            } else {
+                break;
+            }
+        }
+        if items.len() == 1 {
+            Ok(items.pop().expect("one item"))
+        } else {
+            Ok(BoolExpr::Or(items))
+        }
+    }
+
+    fn parse_and(&mut self) -> Result<BoolExpr, AnnError> {
+        let mut items = vec![self.parse_not()?];
+        loop {
+            self.skip_ws();
+            if self.eat_word("AND") || self.eat("&&") {
+                items.push(self.parse_not()?);
+            } else {
+                break;
+            }
+        }
+        if items.len() == 1 {
+            Ok(items.pop().expect("one item"))
+        } else {
+            Ok(BoolExpr::And(items))
+        }
+    }
+
+    fn parse_not(&mut self) -> Result<BoolExpr, AnnError> {
+        self.skip_ws();
+        if self.eat_word("NOT") || self.eat("!") {
+            return Ok(BoolExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_atom()
+    }
+
+    fn parse_atom(&mut self) -> Result<BoolExpr, AnnError> {
+        self.skip_ws();
+        if self.eat("(") {
+            let expr = self.parse_or()?;
+            self.skip_ws();
+            if !self.eat(")") {
+                return Err(AnnError::Parse("missing ')'".to_string()));
+            }
+            return Ok(expr);
+        }
+        if self.eat_word("TRUE") {
+            return Ok(BoolExpr::Const(true));
+        }
+        if self.eat_word("FALSE") {
+            return Ok(BoolExpr::Const(false));
+        }
+        let name = self.ident()?;
+        Ok(BoolExpr::Var(parse_var_name(&name)?))
+    }
+
+    fn ident(&mut self) -> Result<String, AnnError> {
+        self.skip_ws();
+        let start = self.position;
+        while self.position < self.input.len()
+            && (self.input[self.position].is_ascii_alphanumeric()
+                || self.input[self.position] == b'_')
+        {
+            self.position += 1;
+        }
+        if start == self.position {
+            return Err(AnnError::Parse(format!(
+                "expected a variable at byte {start}"
+            )));
+        }
+        Ok(String::from_utf8_lossy(&self.input[start..self.position]).into_owned())
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        let bytes = token.as_bytes();
+        if self.input[self.position..].starts_with(bytes) {
+            self.position += bytes.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        self.skip_ws();
+        let bytes = word.as_bytes();
+        if !self.input[self.position..].starts_with(bytes) {
+            return false;
+        }
+        let end = self.position + bytes.len();
+        if end < self.input.len()
+            && (self.input[end].is_ascii_alphanumeric() || self.input[end] == b'_')
+        {
+            return false;
+        }
+        self.position = end;
+        true
+    }
+
+    fn skip_ws(&mut self) {
+        while self.position < self.input.len() && self.input[self.position].is_ascii_whitespace() {
+            self.position += 1;
+        }
+    }
+}
+
+fn parse_var_name(name: &str) -> Result<usize, AnnError> {
+    if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() {
+        return Ok(usize::from(name.as_bytes()[0] - b'a'));
+    }
+    if let Some(rest) = name.strip_prefix('v') {
+        return rest
+            .parse::<usize>()
+            .map_err(|_| AnnError::Parse(format!("invalid variable: {name}")));
+    }
+    name.parse::<usize>()
+        .map_err(|_| AnnError::Parse(format!("invalid variable: {name}")))
 }
 
 #[cfg(test)]
@@ -447,6 +714,38 @@ mod tests {
         assert_eq!(
             under_repair(3, &[vec![0, 1], vec![1, 2]], &[0, 1]).unwrap(),
             RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn repairs_decompose_into_connected_components() {
+        // 20 facts, two independent conflicts. Only the first component is
+        // contested; the second one is irrelevant to these queries.
+        let denials = vec![vec![0, 1], vec![10, 11]];
+        assert_eq!(
+            under_repair(20, &denials, &[0]).unwrap(),
+            RepairAnswer::Contingent
+        );
+        assert_eq!(
+            under_repair(20, &denials, &[2]).unwrap(),
+            RepairAnswer::Certain
+        );
+        assert_eq!(
+            under_repair(20, &denials, &[0, 1]).unwrap(),
+            RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn repairs_reject_an_oversized_component() {
+        let facts = MAX_COMPONENT_FACTS + 1;
+        let denials: Vec<Vec<usize>> = (0..facts - 1).map(|i| vec![i, i + 1]).collect();
+        assert_eq!(
+            under_repair(facts, &denials, &[0]),
+            Err(AnnError::TooManyFacts {
+                facts,
+                max: MAX_COMPONENT_FACTS
+            })
         );
     }
 
