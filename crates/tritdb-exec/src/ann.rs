@@ -162,6 +162,8 @@ pub enum AnnError {
         /// Declared count.
         count: usize,
     },
+    /// A boolean expression could not be parsed.
+    Parse(String),
 }
 
 impl fmt::Display for AnnError {
@@ -183,6 +185,7 @@ impl fmt::Display for AnnError {
             AnnError::OutOfRange { index, count } => {
                 write!(formatter, "index {index} is outside 0..{count}")
             }
+            AnnError::Parse(reason) => write!(formatter, "bad boolean expression: {reason}"),
         }
     }
 }
@@ -335,6 +338,188 @@ fn consistent(mask: u64, denials: &[Vec<usize>]) -> bool {
 
 fn maximal(mask: u64, facts: usize, denials: &[Vec<usize>]) -> bool {
     (0..facts).all(|index| mask & (1 << index) != 0 || !consistent(mask | (1 << index), denials))
+}
+
+/// Parses a boolean expression over `a`..`z`, `vN`, or `N` variables.
+///
+/// Returns the expression and the minimal variable count (maximum index + 1).
+pub fn parse_bool_expr(text: &str) -> Result<(BoolExpr, usize), AnnError> {
+    let expr = BoolParser::new(text).parse()?;
+    let mut max_index = None;
+    collect_vars(&expr, &mut max_index);
+    let vars = max_index.map_or(0, |index| index + 1);
+    if vars > MAX_MODEL_VARS {
+        return Err(AnnError::TooManyVars {
+            vars,
+            max: MAX_MODEL_VARS,
+        });
+    }
+    Ok((expr, vars))
+}
+
+fn collect_vars(expr: &BoolExpr, max_index: &mut Option<usize>) {
+    match expr {
+        BoolExpr::Var(index) => {
+            *max_index = Some(max_index.map_or(*index, |current| current.max(*index)));
+        }
+        BoolExpr::Const(_) => {}
+        BoolExpr::Not(inner) => collect_vars(inner, max_index),
+        BoolExpr::And(items) | BoolExpr::Or(items) => {
+            for item in items {
+                collect_vars(item, max_index);
+            }
+        }
+    }
+}
+
+struct BoolParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BoolParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.as_bytes(),
+            position: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<BoolExpr, AnnError> {
+        let expr = self.parse_or()?;
+        self.skip_ws();
+        if self.position < self.input.len() {
+            return Err(AnnError::Parse(format!(
+                "unexpected input at byte {}",
+                self.position
+            )));
+        }
+        Ok(expr)
+    }
+
+    fn parse_or(&mut self) -> Result<BoolExpr, AnnError> {
+        let mut items = vec![self.parse_and()?];
+        loop {
+            self.skip_ws();
+            if self.eat_word("OR") || self.eat("||") {
+                items.push(self.parse_and()?);
+            } else {
+                break;
+            }
+        }
+        if items.len() == 1 {
+            Ok(items.pop().expect("one item"))
+        } else {
+            Ok(BoolExpr::Or(items))
+        }
+    }
+
+    fn parse_and(&mut self) -> Result<BoolExpr, AnnError> {
+        let mut items = vec![self.parse_not()?];
+        loop {
+            self.skip_ws();
+            if self.eat_word("AND") || self.eat("&&") {
+                items.push(self.parse_not()?);
+            } else {
+                break;
+            }
+        }
+        if items.len() == 1 {
+            Ok(items.pop().expect("one item"))
+        } else {
+            Ok(BoolExpr::And(items))
+        }
+    }
+
+    fn parse_not(&mut self) -> Result<BoolExpr, AnnError> {
+        self.skip_ws();
+        if self.eat_word("NOT") || self.eat("!") {
+            return Ok(BoolExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_atom()
+    }
+
+    fn parse_atom(&mut self) -> Result<BoolExpr, AnnError> {
+        self.skip_ws();
+        if self.eat("(") {
+            let expr = self.parse_or()?;
+            self.skip_ws();
+            if !self.eat(")") {
+                return Err(AnnError::Parse("missing ')'".to_string()));
+            }
+            return Ok(expr);
+        }
+        if self.eat_word("TRUE") {
+            return Ok(BoolExpr::Const(true));
+        }
+        if self.eat_word("FALSE") {
+            return Ok(BoolExpr::Const(false));
+        }
+        let name = self.ident()?;
+        Ok(BoolExpr::Var(parse_var_name(&name)?))
+    }
+
+    fn ident(&mut self) -> Result<String, AnnError> {
+        self.skip_ws();
+        let start = self.position;
+        while self.position < self.input.len()
+            && (self.input[self.position].is_ascii_alphanumeric()
+                || self.input[self.position] == b'_')
+        {
+            self.position += 1;
+        }
+        if start == self.position {
+            return Err(AnnError::Parse(format!(
+                "expected a variable at byte {start}"
+            )));
+        }
+        Ok(String::from_utf8_lossy(&self.input[start..self.position]).into_owned())
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        let bytes = token.as_bytes();
+        if self.input[self.position..].starts_with(bytes) {
+            self.position += bytes.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        self.skip_ws();
+        let bytes = word.as_bytes();
+        if !self.input[self.position..].starts_with(bytes) {
+            return false;
+        }
+        let end = self.position + bytes.len();
+        if end < self.input.len()
+            && (self.input[end].is_ascii_alphanumeric() || self.input[end] == b'_')
+        {
+            return false;
+        }
+        self.position = end;
+        true
+    }
+
+    fn skip_ws(&mut self) {
+        while self.position < self.input.len() && self.input[self.position].is_ascii_whitespace() {
+            self.position += 1;
+        }
+    }
+}
+
+fn parse_var_name(name: &str) -> Result<usize, AnnError> {
+    if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() {
+        return Ok(usize::from(name.as_bytes()[0] - b'a'));
+    }
+    if let Some(rest) = name.strip_prefix('v') {
+        return rest
+            .parse::<usize>()
+            .map_err(|_| AnnError::Parse(format!("invalid variable: {name}")));
+    }
+    name.parse::<usize>()
+        .map_err(|_| AnnError::Parse(format!("invalid variable: {name}")))
 }
 
 #[cfg(test)]

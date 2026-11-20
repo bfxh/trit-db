@@ -66,7 +66,7 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 
 负面 / 未做：
 
-- **没有接 SQL parser**：`SELECT COUNT MODELS ...` / `UNDER REPAIR` 语法尚未实现。
+- **SQL parser 只接了 `count_models`**：`SELECT count_models('<expr>'[, vars])` 已可用；`UNDER REPAIR` 还没有语法，因为需要先有约束（UNIQUE/FD/denial）才能定义修复语义。
 - `count_models` 是 `2^n` 枚举，不是 DPLL/BDD；变量上限 20。
 - `under_repair` 是 `2^n * n * d` 枚举，事实上限 16；没有增量/组件分解。
 - 注解还没有进入存储层（列存没有注解列），也没有进入查询执行器。

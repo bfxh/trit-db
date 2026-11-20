@@ -256,6 +256,14 @@ pub enum Statement {
         /// Rows of expressions.
         rows: Vec<Vec<Expr>>,
     },
+    /// `SELECT count_models('<expr>'[, vars])`: exact model count over a
+    /// boolean expression. This is rule-level, not `COUNT(*)`.
+    CountModels {
+        /// Boolean expression over `a..z` / `vN` / `N`.
+        expr: String,
+        /// Declared variable count; `0` infers the maximum index + 1.
+        vars: usize,
+    },
     /// `SELECT`.
     Select(Select),
     /// `EXPLAIN SELECT`.

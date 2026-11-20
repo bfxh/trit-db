@@ -108,3 +108,32 @@ fn sql_cli_reads_file_and_reports_errors() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("unknown table"));
 }
+
+#[test]
+fn sql_count_models_returns_exact_model_count() {
+    let dir = TempDir::new("sql-count-models");
+    let db = dir.join("ann.db");
+    let db = db.to_str().expect("path");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT count_models('a AND (NOT b OR c)');",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("models"), "out: {text}");
+    assert!(text.contains('3'), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT count_models('a OR b', 3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains('6'));
+}

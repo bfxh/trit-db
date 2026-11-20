@@ -59,6 +59,10 @@ impl Parser {
         self.tokens.get(self.pos)
     }
 
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset)
+    }
+
     fn offset(&self) -> usize {
         self.peek().map_or(0, |token| token.offset)
     }
@@ -323,6 +327,25 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Statement, SqlError> {
         self.expect_keyword(Keyword::Select)?;
+
+        // `SELECT count_models('<expr>'[, vars])` is a rule-level statement
+        // without a `FROM` clause. Check the second token so a column named
+        // `count_models` still parses as an ordinary select item.
+        if let Some(Token {
+            kind: TokenKind::Word(name),
+            ..
+        }) = self.peek()
+        {
+            let is_call = name.eq_ignore_ascii_case("count_models")
+                && matches!(
+                    self.peek_at(1).map(|token| &token.kind),
+                    Some(TokenKind::Symbol(Symbol::LParen))
+                );
+            if is_call {
+                return self.parse_count_models();
+            }
+        }
+
         let mut items = Vec::new();
         if self.eat_symbol(Symbol::Star) {
             items.push(SelectItem::Wildcard);
@@ -509,6 +532,43 @@ impl Parser {
             order_by,
             limit,
         }))
+    }
+
+    fn parse_count_models(&mut self) -> Result<Statement, SqlError> {
+        self.bump(); // count_models
+        self.expect_symbol(Symbol::LParen)?;
+        let expr = match self.bump() {
+            Some(Token {
+                kind: TokenKind::String(value),
+                ..
+            }) => value,
+            Some(token) => {
+                return Err(SqlError::parse(
+                    "count_models expects a string literal",
+                    token.offset,
+                ))
+            }
+            None => return Err(self.error("count_models expects a string literal")),
+        };
+        let vars = if self.eat_symbol(Symbol::Comma) {
+            match self.bump() {
+                Some(Token {
+                    kind: TokenKind::Number(value),
+                    ..
+                }) if value >= 0 => value as usize,
+                Some(token) => {
+                    return Err(SqlError::parse(
+                        "count_models variable count must be a non-negative integer",
+                        token.offset,
+                    ))
+                }
+                None => return Err(self.error("count_models expects a variable count")),
+            }
+        } else {
+            0
+        };
+        self.expect_symbol(Symbol::RParen)?;
+        Ok(Statement::CountModels { expr, vars })
     }
 
     fn parse_table_ref(&mut self) -> Result<(String, Option<String>), SqlError> {

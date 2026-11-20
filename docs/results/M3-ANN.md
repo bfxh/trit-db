@@ -20,6 +20,11 @@ docs/ADR/035-annotated-relations.md  决策与边界
 tritdb models --vars 3 --expr "a AND (NOT b OR c)"
 # vars=3 models=3
 
+# SQL 形式：无 FROM，规则级计数
+tritdb sql --db ann.db --sql "SELECT count_models('a AND (NOT b OR c)');"
+# models
+# 3
+
 # 两个冲突事实（0 与 1 不能同时为真），查询 0 是否必然成立
 tritdb repair --facts 2 --denial 0,1 --query 0
 # facts=2 denials=1 query=0 answer=contingent
@@ -52,7 +57,7 @@ cargo test -p tritdb --test ann_cli    # 2 passed
 
 ## 5. 还没做
 
-- SQL 语法：`SELECT COUNT MODELS ...`、`UNDER REPAIR` 还没有进 parser/binder；
+- `UNDER REPAIR` 还没有进 SQL parser：需要先有 UNIQUE/FD/否定约束才能定义“修复”，当前只提供库 API `under_repair`；
 - 注解列存储与执行器接线（当前只在库层与 CLI 使用）；
 - `count_models` 的 DPLL/BDD 优化（当前 `2^n` 枚举，上限 20）；
 - `under_repair` 的增量/组件分解（当前 `2^n * n * d`，上限 16）；
