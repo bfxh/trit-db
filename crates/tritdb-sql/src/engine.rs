@@ -226,6 +226,11 @@ impl SqlEngine {
                 if_not_exists,
                 columns,
             } => self.create_table(name, *if_not_exists, columns),
+            Statement::AlterTableAddColumn {
+                name,
+                if_not_exists,
+                column,
+            } => self.alter_table_add_column(name, *if_not_exists, column),
             Statement::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
             Statement::Insert {
                 table,
@@ -281,6 +286,52 @@ impl SqlEngine {
         };
         self.put_table(table)?;
         Ok(QueryResult::Message(format!("created table {name}")))
+    }
+
+    fn alter_table_add_column(
+        &mut self,
+        name: &str,
+        if_not_exists: bool,
+        definition: &crate::ast::ColumnDef,
+    ) -> Result<QueryResult, SqlError> {
+        let Some(existing) = self.tables.get(name) else {
+            return Err(SqlError::UnknownTable(name.to_string()));
+        };
+        if existing
+            .schema
+            .columns
+            .iter()
+            .any(|column| column.name == definition.name)
+        {
+            if if_not_exists {
+                return Ok(QueryResult::Message(format!(
+                    "column {} already exists in table {name}",
+                    definition.name
+                )));
+            }
+            return Err(SqlError::DuplicateColumn(definition.name.clone()));
+        }
+        if definition.not_null {
+            return Err(SqlError::Unsupported(
+                "ALTER TABLE ADD COLUMN does not support NOT NULL without a default".to_string(),
+            ));
+        }
+        let mut table = existing.clone();
+        let mut columns = table.schema.columns.clone();
+        columns.push(Column {
+            name: definition.name.clone(),
+            data_type: definition.data_type,
+            not_null: false,
+        });
+        table.schema = Schema::new(columns);
+        for row in &mut table.rows {
+            row.push(Value::Null);
+        }
+        self.put_table(table)?;
+        Ok(QueryResult::Message(format!(
+            "added column {} to table {name}",
+            definition.name
+        )))
     }
 
     fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<QueryResult, SqlError> {

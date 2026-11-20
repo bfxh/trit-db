@@ -238,6 +238,15 @@ pub enum Statement {
         /// Skip when the table is absent.
         if_exists: bool,
     },
+    /// `ALTER TABLE ... ADD [COLUMN] ...`.
+    AlterTableAddColumn {
+        /// Table name.
+        name: String,
+        /// Skip when the column already exists.
+        if_not_exists: bool,
+        /// Appended column definition.
+        column: ColumnDef,
+    },
     /// `INSERT INTO ... VALUES`.
     Insert {
         /// Table name.

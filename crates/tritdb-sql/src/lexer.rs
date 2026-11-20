@@ -5,6 +5,8 @@ use crate::error::SqlError;
 pub enum Keyword {
     Create,
     Table,
+    Alter,
+    Add,
     If,
     Not,
     Exists,
@@ -69,6 +71,8 @@ impl Keyword {
         match word {
             "create" => Some(Keyword::Create),
             "table" => Some(Keyword::Table),
+            "alter" => Some(Keyword::Alter),
+            "add" => Some(Keyword::Add),
             "if" => Some(Keyword::If),
             "not" => Some(Keyword::Not),
             "exists" => Some(Keyword::Exists),

@@ -65,6 +65,18 @@ impl Parser {
         }
     }
 
+    fn eat_word(&mut self, word: &str) -> bool {
+        if self
+            .peek()
+            .is_some_and(|token| matches!(&token.kind, TokenKind::Word(value) if value == word))
+        {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn expect_keyword(&mut self, keyword: Keyword) -> Result<(), SqlError> {
         if self.eat_keyword(keyword) {
             Ok(())
@@ -121,6 +133,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, SqlError> {
         match self.peek().map(|token| &token.kind) {
             Some(TokenKind::Keyword(Keyword::Create)) => self.parse_create(),
+            Some(TokenKind::Keyword(Keyword::Alter)) => self.parse_alter(),
             Some(TokenKind::Keyword(Keyword::Drop)) => self.parse_drop(),
             Some(TokenKind::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(TokenKind::Keyword(Keyword::Select)) => self.parse_select(),
@@ -129,7 +142,7 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Update)) => self.parse_update(),
             Some(TokenKind::Keyword(Keyword::Delete)) => self.parse_delete(),
             Some(_) => Err(self.error(
-                "expected CREATE, DROP, INSERT, SELECT, EXPLAIN, ANALYZE, UPDATE, or DELETE",
+                "expected CREATE, ALTER, DROP, INSERT, SELECT, EXPLAIN, ANALYZE, UPDATE, or DELETE",
             )),
             None => Err(self.error("empty statement")),
         }
@@ -184,6 +197,37 @@ impl Parser {
         }
         let name = self.parse_ident()?;
         Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Add)?;
+        self.eat_word("column");
+        let mut if_not_exists = false;
+        if self.eat_keyword(Keyword::If) {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            if_not_exists = true;
+        }
+        let column_name = self.parse_ident()?;
+        let data_type = self.parse_type()?;
+        let not_null = if self.eat_keyword(Keyword::Not) {
+            self.expect_keyword(Keyword::Null)?;
+            true
+        } else {
+            false
+        };
+        Ok(Statement::AlterTableAddColumn {
+            name,
+            if_not_exists,
+            column: ColumnDef {
+                name: column_name,
+                data_type,
+                not_null,
+            },
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement, SqlError> {
@@ -788,6 +832,43 @@ mod tests {
             Statement::Insert { table, rows, .. } => {
                 assert_eq!(table, "t");
                 assert_eq!(rows.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_alter_table_add_column() {
+        let statements = parse_script(
+            "ALTER TABLE t ADD COLUMN score INT; \
+             ALTER TABLE t ADD IF NOT EXISTS flag BOOL NOT NULL;",
+        )
+        .expect("parse alter");
+        match &statements[0] {
+            Statement::AlterTableAddColumn {
+                name,
+                if_not_exists,
+                column,
+            } => {
+                assert_eq!(name, "t");
+                assert!(!if_not_exists);
+                assert_eq!(column.name, "score");
+                assert_eq!(column.data_type, DataType::Int);
+                assert!(!column.not_null);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &statements[1] {
+            Statement::AlterTableAddColumn {
+                name,
+                if_not_exists,
+                column,
+            } => {
+                assert_eq!(name, "t");
+                assert!(if_not_exists);
+                assert_eq!(column.name, "flag");
+                assert_eq!(column.data_type, DataType::Bool);
+                assert!(column.not_null);
             }
             other => panic!("unexpected {other:?}"),
         }

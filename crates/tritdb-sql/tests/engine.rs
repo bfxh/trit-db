@@ -63,6 +63,138 @@ fn create_insert_select_and_reopen() {
 }
 
 #[test]
+fn alter_table_add_column_migrates_old_rows_and_invalidates_stats() {
+    let dir = TempDir::new("sql-alter-add-column");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    let seeded = engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL); \
+             INSERT INTO t VALUES (1), (2), (3); \
+             ANALYZE; \
+             EXPLAIN SELECT id FROM t;",
+        )
+        .expect("seed");
+    let plan_text = |result: &QueryResult| {
+        let (_, rows) = as_rows(result);
+        rows.iter()
+            .map(|row| match &row[0] {
+                Value::Text(text) => text.clone(),
+                other => panic!("unexpected plan value: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        plan_text(&seeded[3]).contains("est rows"),
+        "expected stats-backed estimates before migration"
+    );
+
+    let altered = engine
+        .execute_script("ALTER TABLE t ADD COLUMN note TEXT;")
+        .expect("alter");
+    assert_eq!(message(&altered[0]), "added column note to table t");
+    assert!(
+        !plan_text(
+            &engine
+                .execute_script("EXPLAIN SELECT id FROM t;")
+                .expect("explain")[0]
+        )
+        .contains("est rows"),
+        "migration must invalidate stored stats"
+    );
+
+    let migrated = engine
+        .execute_script("SELECT * FROM t ORDER BY id;")
+        .expect("select migrated");
+    let (columns, rows) = as_rows(&migrated[0]);
+    assert_eq!(columns, ["id", "note"]);
+    assert_eq!(
+        rows,
+        [
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Null],
+        ]
+    );
+
+    let inserted = engine
+        .execute_script("INSERT INTO t (id, note) VALUES (4, 'd');")
+        .expect("insert after alter");
+    assert_eq!(message(&inserted[0]), "inserted 1 row(s) into t");
+
+    let duplicate = engine
+        .execute_script("ALTER TABLE t ADD COLUMN IF NOT EXISTS note TEXT;")
+        .expect("idempotent alter");
+    assert_eq!(
+        message(&duplicate[0]),
+        "column note already exists in table t"
+    );
+    let duplicate_error = engine
+        .execute_script("ALTER TABLE t ADD COLUMN note TEXT;")
+        .expect_err("duplicate without IF NOT EXISTS");
+    assert!(duplicate_error
+        .to_string()
+        .contains("duplicate column: note"));
+    let not_null = engine
+        .execute_script("ALTER TABLE t ADD COLUMN required INT NOT NULL;")
+        .expect_err("NOT NULL must be rejected");
+    assert!(not_null.to_string().contains("NOT NULL"));
+    let unknown = engine
+        .execute_script("ALTER TABLE missing ADD COLUMN note TEXT;")
+        .expect_err("unknown table");
+    assert!(unknown.to_string().contains("unknown table: missing"));
+
+    let after_failures = engine
+        .execute_script("SELECT * FROM t ORDER BY id;")
+        .expect("select after rejected migrations");
+    let (columns, rows) = as_rows(&after_failures[0]);
+    assert_eq!(columns, ["id", "note"]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[3], vec![Value::Int(4), Value::Text("d".to_string())]);
+
+    let empty = engine
+        .execute_script(
+            "CREATE TABLE empty (id INT); \
+             ALTER TABLE empty ADD COLUMN note TEXT; \
+             SELECT * FROM empty;",
+        )
+        .expect("migrate empty table");
+    assert_eq!(message(&empty[1]), "added column note to table empty");
+    let (columns, rows) = as_rows(&empty[2]);
+    assert_eq!(columns, ["id", "note"]);
+    assert!(rows.is_empty());
+
+    let empty_not_null = engine
+        .execute_script(
+            "CREATE TABLE empty_required (id INT); \
+             ALTER TABLE empty_required ADD COLUMN required INT NOT NULL;",
+        )
+        .expect_err("NOT NULL must be rejected even on an empty table");
+    assert!(empty_not_null.to_string().contains("NOT NULL"));
+
+    drop(engine);
+    let mut reopened = SqlEngine::open(&db).expect("reopen");
+    assert!(
+        !plan_text(
+            &reopened
+                .execute_script("EXPLAIN SELECT id FROM t;")
+                .expect("explain")[0]
+        )
+        .contains("est rows"),
+        "migration must leave no stale stats after reopen"
+    );
+    let persisted = reopened
+        .execute_script("SELECT * FROM t ORDER BY id;")
+        .expect("select after reopen");
+    let (columns, rows) = as_rows(&persisted[0]);
+    assert_eq!(columns, ["id", "note"]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], vec![Value::Int(1), Value::Null]);
+    assert_eq!(rows[3], vec![Value::Int(4), Value::Text("d".to_string())]);
+}
+
+#[test]
 fn three_valued_where_only_keeps_true() {
     let dir = TempDir::new("sql-3vl");
     let db = dir.join("sql.db");

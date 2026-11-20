@@ -1,6 +1,6 @@
 # trit-db 测试矩阵与 CI/CD
 
-M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE 语义拆开验证。当前工作区有 **244 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE/加法 schema 迁移语义拆开验证。当前工作区有 **246 个正常测试 + 4 个 `#[ignore]` 压力测试**。
 
 ## 1. 分层与计数
 
@@ -13,9 +13,9 @@ M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引�
 | `tritdb-txn` | 14 | 11 model | 25 | 随机事务 + checkpoint/reopen、提交组、读者单调性、snapshot-only reopen LSN |
 | `tritdb-store` | 12 | 9 model | 21 | 页模型、abort、sidecar 截断/损坏、并发读者 |
 | `tritdb-exec` | 12 | — | 12 | 三值 AND/OR/NOT 真值表、NULL 比较、算术、IN/BETWEEN/LIKE 三值语义、CASE 短路/简单式/缺省 NULL、非布尔谓词 |
-| `tritdb-sql` | 25 | 47 engine | 72 | parser、TRSQ/TRSS 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join/非等值回退、`ANALYZE` 统计持久化与 DML 失效、`Auto` join 成本选择、`WHERE` 合取项拆分与单源下推、源表列裁剪、常量折叠与恒真条件简化、`EXPLAIN` 估算/`EXPLAIN ANALYZE` 实际行数与耗时/策略开关、逗号 `FROM`、空表、IN/BETWEEN/LIKE、CASE（投影/WHERE/聚合/JOIN/UPDATE）、UPDATE、聚合排序、DELETE/reopen |
+| `tritdb-sql` | 26 | 48 engine | 74 | parser、TRSQ/TRSS 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join/非等值回退、`ANALYZE` 统计持久化与 DML 失效、`Auto` join 成本选择、`WHERE` 合取项拆分与单源下推、源表列裁剪、常量折叠与恒真条件简化、加法 schema 迁移（旧行 `NULL` 回填/重开持久化/统计失效/`IF NOT EXISTS` 幂等/`NOT NULL` 拒绝）、`EXPLAIN` 估算/`EXPLAIN ANALYZE` 实际行数与耗时/策略开关、逗号 `FROM`、空表、IN/BETWEEN/LIKE、CASE（投影/WHERE/聚合/JOIN/UPDATE）、UPDATE、聚合排序、DELETE/reopen |
 | `tritdb`（集成） | — | — | 16 | CLI 4、SQL CLI 2、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
-| **合计** | **114** | **114** | **244** | 另有 4 个 ignored 压力测试 |
+| **合计** | **115** | **115** | **246** | 另有 4 个 ignored 压力测试 |
 
 `vectors` 的 5 个测试覆盖 `radix.txt`、`trbl.txt`、`page.txt`、`wal.txt`、`snapshot.txt`。向量由 Python 参考实现生成，Rust 只负责解码、重编码和语义恢复。
 
@@ -90,7 +90,7 @@ cargo test -p tritdb-store --test stress -- --ignored --nocapture
 | `test` | Ubuntu / Windows / macOS | `cargo test --workspace` |
 | `msrv` | Ubuntu / Windows | Rust 1.88.0 `cargo test --workspace` |
 | `python-crosscheck` | Ubuntu / Windows / macOS | 构建 CLI、`gen_vectors.py --check`、`check_cli.py`（含 framed bridge）、`sql_oracle.py`（SQLite 3VL 对拍） |
-| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 73.19%，UPDATE 后 73.65%，谓词后 74.48%，CASE 后 75.41%，RIGHT/FULL JOIN 后 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；后续 NATURAL/USING、hash join、EXPLAIN、ANALYZE、谓词下推、合取拆分、源表列裁剪与常量折叠未重跑 |
+| `coverage` | Ubuntu | `cargo llvm-cov --workspace --all-targets`，行覆盖门禁 65%，上传 `lcov.info`；M0 首轮 3253/4791 = 67.9%，SQL 3VL 71.81%，GROUP BY 后 72.39%，INNER JOIN 后 73.02%，LEFT JOIN 后 73.19%，UPDATE 后 73.65%，谓词后 74.48%，CASE 后 75.41%，RIGHT/FULL JOIN 后 75.59%，CROSS JOIN/逗号 FROM 后 **5859/7737 = 75.73%**；后续 NATURAL/USING、hash join、EXPLAIN、ANALYZE、谓词下推、合取拆分、源表列裁剪、常量折叠与加法 schema 迁移未重跑 |
 | `docs` | Ubuntu | `cargo doc --workspace --no-deps`，`RUSTDOCFLAGS=-D warnings` |
 
 `.github/workflows/stress.yml`：每天 04:00 UTC + 手动触发；release 模式跑 txn/store ignored 压力测试，以及 crash matrix / 两个硬杀恢复测试。

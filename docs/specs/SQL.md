@@ -1,6 +1,6 @@
 # SQL：M1 最小三值查询层
 
-状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪、计划入口的常量折叠与恒真条件简化、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
+状态：已实现最小 parser / binder / executor / CLI / SQLite 对拍、单表 `GROUP BY`/`HAVING`、多表 `INNER JOIN` / `CROSS JOIN` / 逗号 `FROM` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN` / `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` / `JOIN ... USING`（表别名 + 限定列）、等值 JOIN 的 hash join 执行 / 非等值 nested loop 回退、基于统计的 `Auto` join 代价选择、`ANALYZE` 表/列统计、`EXPLAIN SELECT` 文本计划与统计估算、`EXPLAIN ANALYZE` 实际行数/耗时、内连接/交叉连接的 `WHERE` 合取项拆分与单源下推、源表列裁剪、计划入口的常量折叠与恒真条件简化、加法 schema 迁移（`ALTER TABLE ... ADD [COLUMN]`）、`JoinStrategy` 执行策略开关、`UPDATE ... SET ...`、`IN`/`BETWEEN`/`LIKE` 谓词、`CASE` 表达式；子查询、pgwire、全局优化器仍未做。
 
 ## 1. 范围
 
@@ -35,14 +35,15 @@ SELECT id FROM t WHERE id IN (1, 2) AND score BETWEEN 10 AND 20 AND name LIKE 'a
 SELECT id, CASE WHEN score IS NULL THEN -1 ELSE score END AS s FROM t ORDER BY id;
 SELECT id, CASE flag WHEN TRUE THEN 'yes' ELSE 'no' END AS f FROM t ORDER BY id;
 UPDATE t SET name = 'b', flag = NULL WHERE id = 2;
+ALTER TABLE t ADD COLUMN note TEXT;
 DELETE FROM t WHERE id < 2;
 DROP TABLE t;
 ```
 
-- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；显式限定列且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪；计划入口会折叠不含列/聚合的常量表达式，并移除恒真的 `WHERE` / `HAVING`；不支持子查询。
+- 支持表别名、多表 `INNER JOIN`、`CROSS JOIN`、逗号分隔 `FROM`、`LEFT [OUTER] JOIN`、`RIGHT [OUTER] JOIN`、`FULL [OUTER] JOIN`、`NATURAL [INNER|LEFT|RIGHT|FULL] JOIN` 和 `JOIN ... USING (col, ...)`；`ANALYZE [table]` 收集表/列统计，`EXPLAIN SELECT` 输出绑定后的文本计划并在有统计时显示估算，`EXPLAIN ANALYZE SELECT` 输出实际行数/分组数与耗时；内连接/交叉连接支持拆分 `WHERE` 顶层 `AND` 合取项并把单源项下推到扫描；显式限定列且无 `*` / `USING` / `NATURAL` 时支持源表列裁剪；计划入口会折叠不含列/聚合的常量表达式，并移除恒真的 `WHERE` / `HAVING`；`ALTER TABLE ... ADD [COLUMN]` 只做加法迁移，只允许可空列并整表原子重写；不支持子查询。
 - `GROUP BY` 只接受列引用（可带表限定），不接受表达式、位置序号或 GROUPING SETS。
 - 每个语句自动提交；脚本不是一个大事务。
-- 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE 重写整张表。
+- 表整表保存在 `TxnStore` 的一个 value 里；每次 INSERT/DELETE/UPDATE/ALTER 重写整张表。
 - 没有 pgwire、没有全局优化器、没有索引、没有 MVCC。
 - 类型严格：不会把 TEXT 隐式转成 INT。
 
@@ -67,6 +68,21 @@ CREATE TABLE [IF NOT EXISTS] name (
 
 类型：`INT` / `INTEGER` / `BIGINT`、`TEXT` / `VARCHAR` / `STRING`、`BOOL` / `BOOLEAN`。
 `INT` 全部落入 `i64`，`VARCHAR` 不带长度。
+
+### ALTER TABLE
+
+```sql
+ALTER TABLE name ADD [COLUMN] [IF NOT EXISTS] column type;
+```
+
+- 只支持追加一个列，不支持 `DROP` / `RENAME` / `ALTER COLUMN TYPE`，也不支持一次追加多列。
+- `COLUMN` 是可省略的普通词；未引用标识符 `column` 作为列名时要写成 `"column"`。
+- 新列必须是可空列；声明 `NOT NULL` 会报 `unsupported SQL`，因为当前没有 `DEFAULT` 回填机制。
+- 旧行的新列统一填 `NULL`，新列排在原 schema 最后；空表只改 schema。
+- 不带 `IF NOT EXISTS` 的重复列报 `duplicate column`；带 `IF NOT EXISTS` 时返回 `column c already exists in table t`，不写表。
+- 迁移按整表 value 单事务重写：先完整编码新表，再提交；失败不会留下半张表，内存表只在 commit 成功返回后切换。提交成功后自动删除该表统计，下一次 `EXPLAIN` 不再显示估算，直到重新 `ANALYZE`。
+- 成功消息为 `added column c to table t`；未知表报 `unknown table`。
+- 已提交的迁移没有自动回滚；需要回退时使用迁移前备份或另做显式 DDL。完整取舍见 [`ADR-013`](../ADR/013-additive-schema-migration.md)。
 
 ### INSERT
 

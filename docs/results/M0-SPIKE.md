@@ -282,7 +282,7 @@ cargo run -q -p tritdb-bench --release -- txn-group --txns 1024 --threads 16 --k
 
 另有 4 个 `#[ignore]` 压力测试（txn 2、store 2），由 nightly `stress.yml` 在 release 下执行。
 
-> M1 最小 SQL 切片与 GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join、EXPLAIN/EXPLAIN ANALYZE、ANALYZE 统计与估算、Auto join 代价、`WHERE` 合取项拆分与单源下推、源表列裁剪、常量折叠与恒真条件简化、逗号 `FROM`、UPDATE、IN/BETWEEN/LIKE、CASE 切片在此基线之上追加 86 个测试（`tritdb-exec` 12、`tritdb-sql` 72、SQL CLI 2），当前全量为 **244 个正常测试 + 4 个 ignored**。SQL 语义与边界见 [`M1-SQL.md`](M1-SQL.md)。
+> M1 最小 SQL 切片与 GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join、EXPLAIN/EXPLAIN ANALYZE、ANALYZE 统计与估算、Auto join 代价、`WHERE` 合取项拆分与单源下推、源表列裁剪、常量折叠与恒真条件简化、加法 schema 迁移、逗号 `FROM`、UPDATE、IN/BETWEEN/LIKE、CASE 切片在此基线之上追加 88 个测试（`tritdb-exec` 12、`tritdb-sql` 74、SQL CLI 2），当前全量为 **246 个正常测试 + 4 个 ignored**。SQL 语义与边界见 [`M1-SQL.md`](M1-SQL.md)。
 
 测试分层、交叉矩阵、崩溃注入与 CI/CD 细节见 [`docs/testing/README.md`](../testing/README.md)。
 
