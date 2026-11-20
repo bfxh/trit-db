@@ -870,6 +870,7 @@ fn push_plan_value(out: &mut String, value: &Value) {
         Value::Text(value) => push_string(out, value),
         Value::Bool(true) => out.push_str("#t"),
         Value::Bool(false) => out.push_str("#f"),
+        Value::Logic(value) => out.push_str(value.as_str()),
     }
 }
 

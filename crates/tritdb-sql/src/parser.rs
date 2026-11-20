@@ -158,11 +158,14 @@ impl Parser {
             TokenKind::Word(name) => name,
             _ => return Err(SqlError::parse("expected type name", token.offset)),
         };
-        let data_type = DataType::from_name(&name)
+        let mut data_type = DataType::from_name(&name)
             .ok_or_else(|| SqlError::parse(format!("unknown type: {name}"), token.offset))?;
-        // `LOGIC K3` is the only annotation domain accepted today.
         if data_type == DataType::Logic {
-            self.eat_word("k3");
+            if self.eat_word("belnap") {
+                data_type = DataType::Belnap;
+            } else {
+                self.eat_word("k3");
+            }
         }
         Ok(data_type)
     }
@@ -840,6 +843,12 @@ impl Parser {
             TokenKind::Number(value) => Ok(Expr::Literal(Value::Int(value))),
             TokenKind::String(value) => Ok(Expr::Literal(Value::Text(value))),
             TokenKind::Word(name) | TokenKind::QuotedIdent(name) => {
+                if name.eq_ignore_ascii_case("both") {
+                    return Ok(Expr::Literal(Value::Logic(tritdb_exec::ann::B4::Both)));
+                }
+                if name.eq_ignore_ascii_case("neither") {
+                    return Ok(Expr::Literal(Value::Logic(tritdb_exec::ann::B4::Neither)));
+                }
                 // `truth(x)` is sugar for a three-valued projection:
                 // NULL -> UNKNOWN, TRUE -> TRUE, FALSE -> FALSE.
                 if name.eq_ignore_ascii_case("truth")
