@@ -16,7 +16,7 @@ pub const MAX_REPAIR_FACTS: usize = 64;
 pub const MAX_COMPONENT_FACTS: usize = 16;
 
 /// Belnap four-valued truth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum B4 {
     /// True in every model.
     True,
@@ -29,6 +29,46 @@ pub enum B4 {
 }
 
 impl B4 {
+    /// Stable numeric code used by storage and ordering.
+    pub const fn code(self) -> u8 {
+        match self {
+            B4::False => 0,
+            B4::Neither => 1,
+            B4::Both => 2,
+            B4::True => 3,
+        }
+    }
+
+    /// Parses [`B4::code`].
+    pub const fn from_code(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(B4::False),
+            1 => Some(B4::Neither),
+            2 => Some(B4::Both),
+            3 => Some(B4::True),
+            _ => None,
+        }
+    }
+
+    /// Maps a two-valued boolean into Belnap.
+    pub const fn from_bool(value: bool) -> Self {
+        if value {
+            B4::True
+        } else {
+            B4::False
+        }
+    }
+
+    /// Stable display text.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            B4::True => "TRUE",
+            B4::False => "FALSE",
+            B4::Both => "BOTH",
+            B4::Neither => "NEITHER",
+        }
+    }
+
     /// Belnap negation: `True <-> False`, `Both` and `Neither` are fixed.
     #[allow(clippy::should_implement_trait)]
     pub const fn neg(self) -> Self {
@@ -60,6 +100,18 @@ impl B4 {
             (B4::Neither, B4::Neither) => B4::Neither,
             _ => B4::True,
         }
+    }
+}
+
+impl PartialOrd for B4 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for B4 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.code().cmp(&other.code())
     }
 }
 

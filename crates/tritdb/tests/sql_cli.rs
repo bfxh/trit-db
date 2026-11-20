@@ -231,3 +231,59 @@ fn logic_column_is_unknown_filterable() {
     assert!(!text.contains("\n1"), "out: {text}");
     assert!(!text.contains("\n2"), "out: {text}");
 }
+
+#[test]
+fn belnap_column_roundtrips_all_four_values() {
+    let dir = TempDir::new("sql-belnap");
+    let db = dir.join("b.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, status LOGIC BELNAP); \
+         INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, BOTH), (4, NEITHER); \
+         SELECT id, status FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\tTRUE", "2\tFALSE", "3\tBOTH", "4\tNEITHER"] {
+        assert!(text.contains(expected), "missing {expected} in {text}");
+    }
+
+    // Reopen: the TRSQ decoder must accept the Belnap value tag.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, status FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("3\tBOTH"), "out: {text}");
+    assert!(text.contains("4\tNEITHER"), "out: {text}");
+}
+
+#[test]
+fn belnap_both_and_neither_project_to_unknown() {
+    let dir = TempDir::new("sql-belnap-unknown");
+    let db = dir.join("b.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, status LOGIC BELNAP); \
+         INSERT INTO t VALUES (1, TRUE), (2, BOTH), (3, NEITHER), (4, NULL); \
+         SELECT id FROM t WHERE status IS UNKNOWN ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["\n2", "\n3", "\n4"] {
+        assert!(text.contains(expected), "missing {expected} in {text}");
+    }
+    assert!(!text.contains("\n1"), "TRUE must not be UNKNOWN: {text}");
+}

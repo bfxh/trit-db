@@ -8,6 +8,8 @@
 pub mod ann;
 
 use std::cmp::Ordering;
+
+use crate::ann::B4;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -23,6 +25,8 @@ pub enum Value {
     Text(String),
     /// Boolean.
     Bool(bool),
+    /// Belnap four-valued logic (`LOGIC BELNAP`).
+    Logic(B4),
 }
 
 impl Value {
@@ -33,6 +37,7 @@ impl Value {
             Value::Int(_) => "INT",
             Value::Text(_) => "TEXT",
             Value::Bool(_) => "BOOL",
+            Value::Logic(_) => "BELNAP",
         }
     }
 
@@ -49,6 +54,7 @@ impl Value {
             Value::Text(value) => value.clone(),
             Value::Bool(true) => "TRUE".to_string(),
             Value::Bool(false) => "FALSE".to_string(),
+            Value::Logic(value) => value.as_str().to_string(),
         }
     }
 }
@@ -64,6 +70,8 @@ pub enum DataType {
     Bool,
     /// K3 annotation column (`LOGIC K3`). Stored as `TRUE`/`FALSE`/`NULL`.
     Logic,
+    /// Belnap four-valued annotation column (`LOGIC BELNAP`).
+    Belnap,
 }
 
 impl DataType {
@@ -74,6 +82,7 @@ impl DataType {
             "TEXT" | "VARCHAR" | "STRING" => Some(DataType::Text),
             "BOOL" | "BOOLEAN" => Some(DataType::Bool),
             "LOGIC" | "K3" => Some(DataType::Logic),
+            "BELNAP" | "B4" => Some(DataType::Belnap),
             _ => None,
         }
     }
@@ -85,6 +94,7 @@ impl DataType {
             DataType::Text => "TEXT",
             DataType::Bool => "BOOL",
             DataType::Logic => "LOGIC",
+            DataType::Belnap => "BELNAP",
         }
     }
 
@@ -97,6 +107,16 @@ impl DataType {
             (DataType::Text, Value::Text(value)) => Ok(Value::Text(value)),
             (DataType::Bool, Value::Bool(value)) => Ok(Value::Bool(value)),
             (DataType::Logic, Value::Bool(value)) => Ok(Value::Bool(value)),
+            (DataType::Logic, Value::Logic(value)) => match value {
+                B4::True => Ok(Value::Bool(true)),
+                B4::False => Ok(Value::Bool(false)),
+                B4::Both | B4::Neither => Err(ExecError::TypeMismatch {
+                    expected: "LOGIC K3",
+                    actual: "LOGIC BELNAP",
+                }),
+            },
+            (DataType::Belnap, Value::Logic(value)) => Ok(Value::Logic(value)),
+            (DataType::Belnap, Value::Bool(value)) => Ok(Value::Logic(B4::from_bool(value))),
             (expected, actual) => Err(ExecError::TypeMismatch {
                 expected: expected.name(),
                 actual: actual.type_name(),
@@ -469,6 +489,9 @@ pub fn truth_of(value: &Value) -> Result<TruthValue, ExecError> {
         Value::Bool(true) => Ok(TruthValue::True),
         Value::Bool(false) => Ok(TruthValue::False),
         Value::Null => Ok(TruthValue::Unknown),
+        Value::Logic(B4::True) => Ok(TruthValue::True),
+        Value::Logic(B4::False) => Ok(TruthValue::False),
+        Value::Logic(B4::Both | B4::Neither) => Ok(TruthValue::Unknown),
         other => Err(ExecError::NonBooleanPredicate {
             actual: other.type_name(),
         }),
@@ -480,6 +503,9 @@ pub fn truth_of(value: &Value) -> Result<TruthValue, ExecError> {
 pub fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, ExecError> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
+        (Value::Logic(left), Value::Logic(right)) => Ok(Some(left.cmp(right))),
+        (Value::Bool(left), Value::Logic(right)) => Ok(Some(B4::from_bool(*left).cmp(right))),
+        (Value::Logic(left), Value::Bool(right)) => Ok(Some(left.cmp(&B4::from_bool(*right)))),
         (Value::Int(left), Value::Int(right)) => Ok(Some(left.cmp(right))),
         (Value::Text(left), Value::Text(right)) => Ok(Some(left.cmp(right))),
         (Value::Bool(left), Value::Bool(right)) => Ok(Some(left.cmp(right))),

@@ -57,6 +57,7 @@ fn type_tag(data_type: DataType) -> u8 {
         DataType::Text => 1,
         DataType::Bool => 2,
         DataType::Logic => 3,
+        DataType::Belnap => 4,
     }
 }
 
@@ -66,6 +67,7 @@ fn type_from_tag(tag: u8) -> Option<DataType> {
         1 => Some(DataType::Text),
         2 => Some(DataType::Bool),
         3 => Some(DataType::Logic),
+        4 => Some(DataType::Belnap),
         _ => None,
     }
 }
@@ -149,6 +151,11 @@ fn encode_value(
             out.push(u8::from(*value));
             Ok(())
         }
+        Value::Logic(value) if data_type == DataType::Belnap => {
+            out.push(4);
+            out.push(value.code());
+            Ok(())
+        }
         other => Err(SqlError::CorruptTable {
             table: table.to_string(),
             reason: format!(
@@ -206,6 +213,18 @@ impl<'a> Reader<'a> {
 }
 
 /// Decodes a table value, checking that it belongs to `name`.
+fn value_matches(value: &Value, data_type: DataType) -> bool {
+    matches!(
+        (data_type, value),
+        (_, Value::Null)
+            | (DataType::Int, Value::Int(_))
+            | (DataType::Text, Value::Text(_))
+            | (DataType::Bool, Value::Bool(_))
+            | (DataType::Logic, Value::Bool(_))
+            | (DataType::Belnap, Value::Logic(_))
+    )
+}
+
 pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
     let corrupt = |reason: &str| SqlError::CorruptTable {
         table: name.to_string(),
@@ -257,9 +276,16 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
                     Value::Text(reader.text(len).ok_or_else(|| corrupt("invalid text"))?)
                 }
                 3 => Value::Bool(reader.u8().ok_or_else(|| corrupt("missing bool"))? != 0),
+                4 => {
+                    let code = reader.u8().ok_or_else(|| corrupt("missing belnap code"))?;
+                    Value::Logic(
+                        tritdb_exec::ann::B4::from_code(code)
+                            .ok_or_else(|| corrupt("invalid belnap code"))?,
+                    )
+                }
                 _ => return Err(corrupt("invalid value tag")),
             };
-            if !value.is_null() && value.type_name() != column.data_type.name() {
+            if !value_matches(&value, column.data_type) {
                 return Err(corrupt("value type does not match column"));
             }
             if value.is_null() && column.not_null {

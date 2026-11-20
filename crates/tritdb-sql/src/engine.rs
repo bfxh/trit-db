@@ -2904,6 +2904,7 @@ enum GroupKeyPart {
     Int(i64),
     Text(String),
     Bool(bool),
+    Logic(tritdb_exec::ann::B4),
 }
 
 impl From<&Value> for GroupKeyPart {
@@ -2913,6 +2914,7 @@ impl From<&Value> for GroupKeyPart {
             Value::Int(value) => GroupKeyPart::Int(*value),
             Value::Text(value) => GroupKeyPart::Text(value.clone()),
             Value::Bool(value) => GroupKeyPart::Bool(*value),
+            Value::Logic(value) => GroupKeyPart::Logic(*value),
         }
     }
 }
