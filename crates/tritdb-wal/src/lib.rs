@@ -2,7 +2,10 @@
 //! TRWL write-ahead log v0.
 //!
 //! The file starts with a 32-byte segment header, then a sequence of 32-byte
-//! record headers followed by payloads:
+//! record headers followed by payloads. When the active segment reaches its
+//! size limit, the writer appends another segment header to the same file
+//! (see [`DEFAULT_SEGMENT_LIMIT`]); readers accept any number of segment
+//! headers and LSNs stay strictly increasing across them.
 //!
 //! Segment header:
 //!
@@ -284,6 +287,12 @@ pub struct WalScan {
     pub tail: TailState,
     /// Original file length at scan time.
     pub file_len: u64,
+    /// Number of segment headers seen (at least one).
+    pub segments: usize,
+    /// Byte offset of the last segment header.
+    pub last_segment_offset: u64,
+    /// `first_lsn` declared by the last segment header.
+    pub last_segment_first_lsn: u64,
 }
 
 impl WalScan {
@@ -301,12 +310,33 @@ impl WalScan {
 pub struct WalWriter {
     file: File,
     next_lsn: u64,
+    segment_first_lsn: u64,
+    segment_bytes: u64,
+    segment_limit: u64,
 }
+
+/// Default size at which [`WalWriter::append`] starts a new segment.
+///
+/// Rotating writes another 32-byte segment header into the same file, so
+/// archiving and recovery still see one file.
+pub const DEFAULT_SEGMENT_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Smallest accepted segment limit. It must leave room for a header and a
+/// record header, so rotation cannot loop on every append.
+pub const MIN_SEGMENT_LIMIT: u64 = 1024;
 
 impl WalWriter {
     /// Opens or creates a WAL, truncating a torn tail, and returns a scan of
     /// the bytes as they were before truncation.
     pub fn open(path: &Path) -> Result<(Self, WalScan), WalError> {
+        Self::open_with_limit(path, DEFAULT_SEGMENT_LIMIT)
+    }
+
+    /// Opens or creates a WAL with an explicit segment size.
+    ///
+    /// `segment_limit` controls when [`WalWriter::append`] writes a new
+    /// segment header. The WAL stays one file.
+    pub fn open_with_limit(path: &Path, segment_limit: u64) -> Result<(Self, WalScan), WalError> {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -329,8 +359,20 @@ impl WalWriter {
                 valid_end: SEGMENT_HEADER_SIZE as u64,
                 tail: TailState::Clean,
                 file_len: SEGMENT_HEADER_SIZE as u64,
+                segments: 1,
+                last_segment_offset: 0,
+                last_segment_first_lsn: 1,
             };
-            return Ok((Self { file, next_lsn: 1 }, scan));
+            return Ok((
+                Self {
+                    file,
+                    next_lsn: 1,
+                    segment_first_lsn: 1,
+                    segment_bytes: SEGMENT_HEADER_SIZE as u64,
+                    segment_limit: segment_limit.max(MIN_SEGMENT_LIMIT),
+                },
+                scan,
+            ));
         }
 
         file.seek(SeekFrom::Start(0))?;
@@ -349,8 +391,18 @@ impl WalWriter {
             .records
             .last()
             .map_or(scan.first_lsn, |record| record.lsn.saturating_add(1));
+        let segment_bytes = scan.valid_end.saturating_sub(scan.last_segment_offset);
 
-        Ok((Self { file, next_lsn }, scan))
+        Ok((
+            Self {
+                file,
+                next_lsn,
+                segment_first_lsn: scan.last_segment_first_lsn,
+                segment_bytes,
+                segment_limit: segment_limit.max(MIN_SEGMENT_LIMIT),
+            },
+            scan,
+        ))
     }
 
     /// Appends one record and optionally fsyncs it.
@@ -372,6 +424,12 @@ impl WalWriter {
             len: payload.len(),
             max: MAX_RECORD_PAYLOAD,
         })?;
+        let total = RECORD_HEADER_SIZE + payload.len();
+        if self.segment_bytes.saturating_add(total as u64) > self.segment_limit
+            && self.segment_bytes > SEGMENT_HEADER_SIZE as u64
+        {
+            self.rotate()?;
+        }
         let lsn = self.next_lsn;
 
         let mut header = [0u8; RECORD_HEADER_SIZE];
@@ -392,7 +450,22 @@ impl WalWriter {
         }
 
         self.next_lsn = self.next_lsn.saturating_add(1);
+        self.segment_bytes = self.segment_bytes.saturating_add(total as u64);
         Ok(lsn)
+    }
+
+    /// Starts a new segment inside the same file.
+    ///
+    /// The writer is positioned at the end of the last record. A crash before
+    /// the new header is complete leaves a torn tail; recovery truncates it
+    /// and the next append starts from the last valid LSN.
+    fn rotate(&mut self) -> Result<(), WalError> {
+        self.file.sync_all()?;
+        write_segment_header(&mut self.file, self.next_lsn)?;
+        self.file.sync_all()?;
+        self.segment_first_lsn = self.next_lsn;
+        self.segment_bytes = SEGMENT_HEADER_SIZE as u64;
+        Ok(())
     }
 
     /// Flushes the file to stable storage.
@@ -417,6 +490,8 @@ impl WalWriter {
         write_segment_header(&mut self.file, first_lsn)?;
         self.file.sync_all()?;
         self.next_lsn = first_lsn;
+        self.segment_first_lsn = first_lsn;
+        self.segment_bytes = SEGMENT_HEADER_SIZE as u64;
         Ok(())
     }
 
@@ -485,6 +560,9 @@ pub fn parse_wal(bytes: &[u8]) -> Result<WalScan, WalError> {
     let mut offset = SEGMENT_HEADER_SIZE;
     let mut previous_lsn = 0u64;
     let mut tail = TailState::Clean;
+    let mut segments = 1usize;
+    let mut last_segment_offset = 0u64;
+    let mut last_segment_first_lsn = first_lsn;
 
     while offset < bytes.len() {
         let remaining = bytes.len() - offset;
@@ -494,6 +572,49 @@ pub fn parse_wal(bytes: &[u8]) -> Result<WalScan, WalError> {
                 bytes: remaining as u64,
             };
             break;
+        }
+
+        if bytes[offset..offset + 4] == SEGMENT_MAGIC {
+            if bytes[offset + 4] != SEGMENT_VERSION {
+                return Err(WalError::BadSegmentVersion {
+                    found: bytes[offset + 4],
+                });
+            }
+            if bytes[offset + 5..offset + 8].iter().any(|byte| *byte != 0)
+                || bytes[offset + 16..offset + 28]
+                    .iter()
+                    .any(|byte| *byte != 0)
+            {
+                return Err(WalError::BadSegmentHeader {
+                    reason: "reserved bytes must be zero",
+                });
+            }
+            let seg_first = read_u64(bytes, offset + 8)?;
+            if seg_first == 0 {
+                return Err(WalError::BadSegmentHeader {
+                    reason: "first LSN must be non-zero",
+                });
+            }
+            let stored_crc = read_u32(bytes, offset + 28)?;
+            let computed_crc = crc32_parts(&bytes[offset..offset + 28], &[]);
+            if stored_crc != computed_crc {
+                return Err(WalError::ChecksumMismatch {
+                    offset: offset as u64,
+                    expected: stored_crc,
+                    actual: computed_crc,
+                });
+            }
+            if seg_first <= previous_lsn {
+                return Err(WalError::LsnNotMonotonic {
+                    previous: previous_lsn,
+                    found: seg_first,
+                });
+            }
+            segments += 1;
+            last_segment_offset = offset as u64;
+            last_segment_first_lsn = seg_first;
+            offset += SEGMENT_HEADER_SIZE;
+            continue;
         }
 
         let header = &bytes[offset..offset + RECORD_HEADER_SIZE];
@@ -549,9 +670,9 @@ pub fn parse_wal(bytes: &[u8]) -> Result<WalScan, WalError> {
                 actual: computed_crc,
             });
         }
-        if lsn <= previous_lsn {
+        if lsn <= previous_lsn || lsn < last_segment_first_lsn {
             return Err(WalError::LsnNotMonotonic {
-                previous: previous_lsn,
+                previous: previous_lsn.max(last_segment_first_lsn.saturating_sub(1)),
                 found: lsn,
             });
         }
@@ -572,6 +693,9 @@ pub fn parse_wal(bytes: &[u8]) -> Result<WalScan, WalError> {
         valid_end: offset as u64,
         tail,
         file_len: bytes.len() as u64,
+        segments,
+        last_segment_offset,
+        last_segment_first_lsn,
     })
 }
 
