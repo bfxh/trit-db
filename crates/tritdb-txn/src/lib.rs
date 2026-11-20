@@ -572,12 +572,8 @@ impl TxnStore {
         let mut records = Vec::new();
         let mut torn_tail_bytes = 0;
         for wal_path in &wal_paths {
-            let scan = match tritdb_wal::WalReader::open(wal_path) {
-                Ok(scan) => scan,
-                Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                    continue
-                }
-                Err(error) => return Err(error.into()),
+            let Some(scan) = read_wal_scan(wal_path)? else {
+                continue;
             };
             torn_tail_bytes = torn_tail_bytes.max(torn_bytes(&scan));
             records.extend(scan.records);
@@ -1154,6 +1150,27 @@ fn recover(
         u64::MAX,
         torn_tail_bytes,
     )
+}
+
+/// Reads a WAL, retrying briefly when a concurrent checkpoint truncates it
+/// mid-read. A missing file is not an error for archive/live discovery.
+fn read_wal_scan(path: &Path) -> Result<Option<WalScan>, TxnError> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match tritdb_wal::WalReader::open(path) {
+            Ok(scan) => return Ok(Some(scan)),
+            Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("at least one attempt").into())
 }
 
 fn torn_bytes(scan: &WalScan) -> u64 {
