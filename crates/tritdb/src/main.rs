@@ -42,6 +42,8 @@ fn run() -> Result<(), String> {
         Some("sql") => run_sql(&args),
         Some("models") => run_models(&args),
         Some("repair") => run_repair(&args),
+        Some("cas") => run_cas(&args),
+        Some("manifest") => run_manifest(&args),
         Some("crosscheck") => run_crosscheck(),
         Some("help") | Some("--help") | None => {
             print_help();
@@ -76,6 +78,11 @@ fn print_help() {
     println!("  sql --db sql.db --file script.sql");
     println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
     println!("  repair --facts 2 --denial 0,1 --query 0");
+    println!("  cas put --store dir --file blob");
+    println!("  cas get --store dir --hash <hex> --out blob");
+    println!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
+    println!("  manifest verify --store dir --head <hex>");
+    println!("  manifest show --store dir --hash <hex>");
     println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
 
@@ -706,6 +713,125 @@ fn pstore_writer(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn arg_values(args: &[String], flag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index + 1 < args.len() {
+        if args[index] == flag {
+            values.push(args[index + 1].clone());
+            index += 1;
+        }
+        index += 1;
+    }
+    values
+}
+
+fn run_cas(args: &[String]) -> Result<(), String> {
+    match args.get(1).map(String::as_str) {
+        Some("put") => {
+            let root = required_arg(args, "--store")?;
+            let file = required_arg(args, "--file")?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let bytes = std::fs::read(&file).map_err(|error| format!("read {file}: {error}"))?;
+            let hash = store.put(&bytes).map_err(|error| error.to_string())?;
+            println!("hash={hash} bytes={}", bytes.len());
+            Ok(())
+        }
+        Some("get") => {
+            let root = required_arg(args, "--store")?;
+            let hash = required_arg(args, "--hash")?;
+            let out = required_arg(args, "--out")?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let hash = tritdb_cas::Hash::from_hex(&hash).map_err(|error| error.to_string())?;
+            let bytes = store.get(&hash).map_err(|error| error.to_string())?;
+            std::fs::write(&out, &bytes).map_err(|error| format!("write {out}: {error}"))?;
+            println!("hash={hash} bytes={}", bytes.len());
+            Ok(())
+        }
+        Some("has") => {
+            let root = required_arg(args, "--store")?;
+            let hash = required_arg(args, "--hash")?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let hash = tritdb_cas::Hash::from_hex(&hash).map_err(|error| error.to_string())?;
+            println!("hash={hash} present={}", store.has(&hash));
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown cas subcommand: {other}")),
+        None => Err("cas requires `put`, `get`, or `has`".to_string()),
+    }
+}
+
+fn run_manifest(args: &[String]) -> Result<(), String> {
+    match args.get(1).map(String::as_str) {
+        Some("commit") => {
+            let root = required_arg(args, "--store")?;
+            let parent = arg_value(args, "--parent")
+                .map(|text| tritdb_cas::Hash::from_hex(&text))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let mut entries = std::collections::BTreeMap::new();
+            for entry in arg_values(args, "--entry") {
+                let (name, hash) = entry
+                    .split_once('=')
+                    .ok_or_else(|| format!("--entry must be name=hash, got {entry}"))?;
+                let hash = tritdb_cas::Hash::from_hex(hash).map_err(|error| error.to_string())?;
+                entries.insert(name.to_string(), hash);
+            }
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let manifest = tritdb_cas::Manifest::new(parent, entries);
+            let hash = manifest.store(&store).map_err(|error| error.to_string())?;
+            println!(
+                "manifest={hash} parent={} entries={}",
+                parent.map_or("-".to_string(), |hash| hash.to_hex()),
+                manifest.entries.len()
+            );
+            Ok(())
+        }
+        Some("verify") => {
+            let root = required_arg(args, "--store")?;
+            let head = required_arg(args, "--head")?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
+            let info =
+                tritdb_cas::verify_chain(&store, &head).map_err(|error| error.to_string())?;
+            println!(
+                "head={} root={} length={}",
+                info.head, info.root, info.length
+            );
+            Ok(())
+        }
+        Some("show") => {
+            let root = required_arg(args, "--store")?;
+            let hash = required_arg(args, "--hash")?;
+            let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
+                .map_err(|error| error.to_string())?;
+            let hash = tritdb_cas::Hash::from_hex(&hash).map_err(|error| error.to_string())?;
+            let manifest =
+                tritdb_cas::Manifest::load(&store, &hash).map_err(|error| error.to_string())?;
+            println!(
+                "manifest={hash} version={} parent={} created_ms={} entries={}",
+                manifest.version,
+                manifest
+                    .parent
+                    .map_or("-".to_string(), |hash| hash.to_hex()),
+                manifest.created_ms,
+                manifest.entries.len()
+            );
+            for (name, hash) in &manifest.entries {
+                println!("entry={name} hash={hash}");
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown manifest subcommand: {other}")),
+        None => Err("manifest requires `commit`, `verify`, or `show`".to_string()),
+    }
 }
 
 fn run_models(args: &[String]) -> Result<(), String> {
