@@ -9,7 +9,7 @@ pub const TABLE_KEY_PREFIX: &str = "sql/table/";
 pub const STATS_KEY_PREFIX: &str = "sql/stats/";
 
 const TABLE_MAGIC: [u8; 4] = *b"TRSQ";
-const TABLE_VERSION: u8 = 2;
+const TABLE_VERSION: u8 = 3;
 const STATS_MAGIC: [u8; 4] = *b"TRSS";
 const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
@@ -92,6 +92,7 @@ pub fn encode_table(table: &Table) -> Result<Vec<u8>, SqlError> {
         out.push(type_tag(column.data_type));
         out.push(u8::from(column.not_null));
         out.push(u8::from(column.unique));
+        put_text(&mut out, column.check.as_deref().unwrap_or(""))?;
         put_text(&mut out, &column.name)?;
     }
     put_u32(&mut out, table.schema.unique_sets.len())?;
@@ -100,6 +101,10 @@ pub fn encode_table(table: &Table) -> Result<Vec<u8>, SqlError> {
         for &index in set {
             put_u32(&mut out, index)?;
         }
+    }
+    put_u32(&mut out, table.schema.checks.len())?;
+    for check in &table.schema.checks {
+        put_text(&mut out, check)?;
     }
     out.extend_from_slice(&(table.rows.len() as u64).to_le_bytes());
     for row in &table.rows {
@@ -279,6 +284,21 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
         } else {
             false
         };
+        let check = if version >= 3 {
+            let len = reader
+                .u32()
+                .ok_or_else(|| corrupt("missing check length"))? as usize;
+            let text = reader
+                .text(len)
+                .ok_or_else(|| corrupt("invalid check text"))?;
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        } else {
+            None
+        };
         let name_len = reader
             .u32()
             .ok_or_else(|| corrupt("missing column name length"))? as usize;
@@ -290,6 +310,7 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
             data_type,
             not_null,
             unique,
+            check,
         });
     }
     let unique_sets = if version >= 2 {
@@ -316,6 +337,23 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
             sets.push(indices);
         }
         sets
+    } else {
+        Vec::new()
+    };
+    let checks = if version >= 3 {
+        let count = reader.u32().ok_or_else(|| corrupt("missing check count"))? as usize;
+        let mut checks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = reader
+                .u32()
+                .ok_or_else(|| corrupt("missing check length"))? as usize;
+            checks.push(
+                reader
+                    .text(len)
+                    .ok_or_else(|| corrupt("invalid check text"))?,
+            );
+        }
+        checks
     } else {
         Vec::new()
     };
@@ -367,6 +405,7 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
     }
     let mut schema = Schema::new(columns);
     schema.unique_sets = unique_sets;
+    schema.checks = checks;
     Ok(Table {
         name: name.to_string(),
         schema,
@@ -452,6 +491,7 @@ mod tests {
                     data_type: DataType::Text,
                     not_null: true,
                     unique: true,
+                    check: Some("name IS NOT NULL".to_string()),
                 },
                 Column::new("ok", DataType::Bool),
             ]),

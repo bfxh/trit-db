@@ -16,6 +16,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>, SqlError> {
         tokens,
         pos: 0,
         expr_depth: 0,
+        source: sql.to_string(),
     };
     let mut statements = Vec::new();
     loop {
@@ -31,10 +32,33 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>, SqlError> {
     Ok(statements)
 }
 
+/// Parses a single expression, used for stored `CHECK` text.
+pub fn parse_expression(sql: &str) -> Result<Expr, SqlError> {
+    let mut tokens = Lexer::new(sql).tokenize()?;
+    if matches!(
+        tokens.last().map(|token| &token.kind),
+        Some(TokenKind::Symbol(Symbol::Semicolon))
+    ) {
+        tokens.pop();
+    }
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        expr_depth: 0,
+        source: sql.to_string(),
+    };
+    let expr = parser.parse_expr()?;
+    if !parser.at_end() {
+        return Err(parser.error("unexpected input after expression"));
+    }
+    Ok(expr)
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     expr_depth: usize,
+    source: String,
 }
 
 impl Parser {
@@ -61,6 +85,21 @@ impl Parser {
 
     fn peek_at(&self, offset: usize) -> Option<&Token> {
         self.tokens.get(self.pos + offset)
+    }
+
+    fn parse_check(&mut self) -> Result<String, SqlError> {
+        self.expect_word("check")?;
+        self.expect_symbol(Symbol::LParen)?;
+        let start = self.offset();
+        let _expr = self.parse_expr()?;
+        let end = self.offset();
+        self.expect_symbol(Symbol::RParen)?;
+        Ok(self
+            .source
+            .get(start..end)
+            .unwrap_or_default()
+            .trim()
+            .to_string())
     }
 
     fn peek_word(&self, word: &str) -> bool {
@@ -212,7 +251,15 @@ impl Parser {
         self.expect_symbol(Symbol::LParen)?;
         let mut columns = Vec::new();
         let mut unique_sets = Vec::new();
+        let mut checks = Vec::new();
         loop {
+            if self.peek_word("check") {
+                checks.push(self.parse_check()?);
+                if self.eat_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break;
+            }
             if self.peek_word("unique")
                 && matches!(
                     self.peek_at(1).map(|token| &token.kind),
@@ -241,11 +288,17 @@ impl Parser {
                 false
             };
             let unique = self.eat_word("unique");
+            let check = if self.peek_word("check") {
+                Some(self.parse_check()?)
+            } else {
+                None
+            };
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
                 not_null,
                 unique,
+                check,
             });
             if self.eat_symbol(Symbol::Comma) {
                 continue;
@@ -258,6 +311,7 @@ impl Parser {
             if_not_exists,
             columns,
             unique: unique_sets,
+            checks,
         })
     }
 
@@ -301,6 +355,11 @@ impl Parser {
                 data_type,
                 not_null,
                 unique: self.eat_word("unique"),
+                check: if self.peek_word("check") {
+                    Some(self.parse_check()?)
+                } else {
+                    None
+                },
             },
         })
     }

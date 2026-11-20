@@ -122,6 +122,8 @@ pub struct ColumnDef {
     pub not_null: bool,
     /// Reject duplicate non-`NULL` values.
     pub unique: bool,
+    /// Column-level `CHECK (expr)` text.
+    pub check: Option<String>,
 }
 
 /// Select-list item.
@@ -237,6 +239,8 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
         /// Table-level `UNIQUE (a, b, ...)` groups.
         unique: Vec<Vec<String>>,
+        /// Table-level `CHECK (expr)` texts.
+        checks: Vec<String>,
     },
     /// `DROP TABLE`.
     DropTable {

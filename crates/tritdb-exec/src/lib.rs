@@ -158,6 +158,8 @@ pub struct Column {
     pub not_null: bool,
     /// Reject duplicate non-`NULL` values.
     pub unique: bool,
+    /// Column-level `CHECK (expr)` text.
+    pub check: Option<String>,
 }
 
 impl Column {
@@ -168,6 +170,7 @@ impl Column {
             data_type,
             not_null: false,
             unique: false,
+            check: None,
         }
     }
 }
@@ -183,6 +186,8 @@ pub struct Schema {
     aliases: BTreeMap<String, usize>,
     /// Table-level `UNIQUE (a, b, ...)` groups, as column indices.
     pub unique_sets: Vec<Vec<usize>>,
+    /// Table-level `CHECK (expr)` texts.
+    pub checks: Vec<String>,
 }
 
 impl Schema {
@@ -192,6 +197,7 @@ impl Schema {
             columns,
             aliases: BTreeMap::new(),
             unique_sets: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
