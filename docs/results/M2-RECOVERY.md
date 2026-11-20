@@ -61,6 +61,7 @@ pitr_cli: 2 passed
 ## 5. 还没做
 
 - 后台 checkpoint 已提供 `TxnStore::start_background_checkpoint`；它只做普通 checkpoint，不自动归档/prune；
+- 跨进程写锁已提供 `<wal>.lock`（PID 存活检测，stale 自动清理）；
 - 自动 GC 的保留数默认 8（`checkpoint_archive_keep` / `--keep` 可改，0 关闭）；
 - 时间索引只能写入时维护，无法从 WAL 重建；崩溃可能落后最后几条；
 - WAL 段轮转已改为多文件（ADR-036）：`reset` / 归档 GC 能删除旧 `<wal>.<lsn>.seg`；

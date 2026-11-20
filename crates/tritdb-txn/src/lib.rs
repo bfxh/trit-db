@@ -1735,6 +1735,7 @@ mod tests {
         let store = TxnStore::open(&path).expect("recover torn");
         assert_eq!(store.get(b"kept").expect("get"), Some(b"value".to_vec()));
         assert_eq!(store.recovery().torn_tail_bytes, 3);
+        drop(store);
 
         let store = TxnStore::open(&path).expect("recover clean");
         assert_eq!(store.recovery().torn_tail_bytes, 0);
