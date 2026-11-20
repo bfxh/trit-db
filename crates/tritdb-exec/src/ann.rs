@@ -4,7 +4,7 @@
 //! This is the semantic core of M3. It deliberately does not touch the SQL
 //! parser yet: callers build [`BoolExpr`] or fact sets directly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::TruthValue;
@@ -297,6 +297,11 @@ impl BoolExpr {
 /// `vars` must not exceed [`MAX_MODEL_VARS`]; this is an exact counter, not a
 /// sampler.
 pub fn count_models(expr: &BoolExpr, vars: usize) -> Result<u64, AnnError> {
+    count_models_components(expr, vars)
+}
+
+/// DPLL model counter, kept as the independent oracle for the default backend.
+pub fn count_models_dpll(expr: &BoolExpr, vars: usize) -> Result<u64, AnnError> {
     if vars > MAX_MODEL_VARS {
         return Err(AnnError::TooManyVars {
             vars,
@@ -305,7 +310,7 @@ pub fn count_models(expr: &BoolExpr, vars: usize) -> Result<u64, AnnError> {
     }
     check_vars(expr, vars)?;
     let mut assignment = vec![None; vars];
-    Ok(count_models_dpll(expr, &mut assignment))
+    Ok(count_models_dpll_inner(expr, &mut assignment))
 }
 
 fn check_vars(expr: &BoolExpr, vars: usize) -> Result<(), AnnError> {
@@ -326,7 +331,7 @@ fn check_vars(expr: &BoolExpr, vars: usize) -> Result<(), AnnError> {
 }
 
 /// DPLL-style exact model counter with partial evaluation and short-circuiting.
-fn count_models_dpll(expr: &BoolExpr, assignment: &mut [Option<bool>]) -> u64 {
+fn count_models_dpll_inner(expr: &BoolExpr, assignment: &mut [Option<bool>]) -> u64 {
     match eval_partial(expr, assignment) {
         Some(true) => {
             let free = assignment.iter().filter(|value| value.is_none()).count();
@@ -339,9 +344,9 @@ fn count_models_dpll(expr: &BoolExpr, assignment: &mut [Option<bool>]) -> u64 {
         return 0;
     };
     assignment[index] = Some(true);
-    let mut models = count_models_dpll(expr, assignment);
+    let mut models = count_models_dpll_inner(expr, assignment);
     assignment[index] = Some(false);
-    models += count_models_dpll(expr, assignment);
+    models += count_models_dpll_inner(expr, assignment);
     assignment[index] = None;
     models
 }
@@ -558,6 +563,123 @@ pub fn parse_bool_expr(text: &str) -> Result<(BoolExpr, usize), AnnError> {
         });
     }
     Ok((expr, vars))
+}
+
+/// Counts models by splitting a top-level conjunction into independent variable
+/// components, counting each with the BDD backend, and multiplying.
+pub fn count_models_components(expr: &BoolExpr, vars: usize) -> Result<u64, AnnError> {
+    if vars > MAX_MODEL_VARS {
+        return Err(AnnError::TooManyVars {
+            vars,
+            max: MAX_MODEL_VARS,
+        });
+    }
+    check_vars(expr, vars)?;
+
+    let items = match expr {
+        BoolExpr::And(items) if items.len() > 1 => items,
+        _ => return count_models_bdd(expr, vars),
+    };
+
+    let mut parent: Vec<usize> = (0..vars).collect();
+    fn find(parent: &mut [usize], mut value: usize) -> usize {
+        while parent[value] != value {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        value
+    }
+
+    let mut item_vars: Vec<BTreeSet<usize>> = Vec::with_capacity(items.len());
+    for item in items {
+        let mut set = BTreeSet::new();
+        collect_expr_vars(item, &mut set);
+        let mut iter = set.iter();
+        if let Some(&first) = iter.next() {
+            for &other in iter {
+                let left = find(&mut parent, first);
+                let right = find(&mut parent, other);
+                if left != right {
+                    parent[left] = right;
+                }
+            }
+        }
+        item_vars.push(set);
+    }
+
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, set) in item_vars.iter().enumerate() {
+        let root = set
+            .iter()
+            .next()
+            .map_or(usize::MAX, |&value| find(&mut parent, value));
+        groups.entry(root).or_default().push(index);
+    }
+
+    let mut total = 1u64;
+    let mut used = 0usize;
+    for (root, indices) in groups {
+        let mut local_vars = BTreeSet::new();
+        for &index in &indices {
+            collect_expr_vars(&items[index], &mut local_vars);
+        }
+        if root == usize::MAX || local_vars.is_empty() {
+            let group_expr =
+                BoolExpr::And(indices.iter().map(|&index| items[index].clone()).collect());
+            total = total.saturating_mul(count_models_bdd(&group_expr, 0)?);
+            continue;
+        }
+        let map: std::collections::BTreeMap<usize, usize> = local_vars
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+        let local_items: Vec<BoolExpr> = indices
+            .iter()
+            .map(|&index| remap_expr(&items[index], &map))
+            .collect();
+        let group_expr = if local_items.len() == 1 {
+            local_items[0].clone()
+        } else {
+            BoolExpr::And(local_items)
+        };
+        total = total.saturating_mul(count_models_bdd(&group_expr, local_vars.len())?);
+        used += local_vars.len();
+    }
+
+    // Variables that never appear are free in every model.
+    total = total.saturating_mul(1u64 << (vars - used));
+    Ok(total)
+}
+
+fn collect_expr_vars(expr: &BoolExpr, out: &mut BTreeSet<usize>) {
+    match expr {
+        BoolExpr::Const(_) => {}
+        BoolExpr::Var(index) => {
+            out.insert(*index);
+        }
+        BoolExpr::Not(inner) => collect_expr_vars(inner, out),
+        BoolExpr::And(items) | BoolExpr::Or(items) => {
+            for item in items {
+                collect_expr_vars(item, out);
+            }
+        }
+    }
+}
+
+fn remap_expr(expr: &BoolExpr, map: &std::collections::BTreeMap<usize, usize>) -> BoolExpr {
+    match expr {
+        BoolExpr::Const(value) => BoolExpr::Const(*value),
+        BoolExpr::Var(index) => BoolExpr::Var(map.get(index).copied().unwrap_or(*index)),
+        BoolExpr::Not(inner) => BoolExpr::Not(Box::new(remap_expr(inner, map))),
+        BoolExpr::And(items) => {
+            BoolExpr::And(items.iter().map(|item| remap_expr(item, map)).collect())
+        }
+        BoolExpr::Or(items) => {
+            BoolExpr::Or(items.iter().map(|item| remap_expr(item, map)).collect())
+        }
+    }
 }
 
 fn collect_vars(expr: &BoolExpr, max_index: &mut Option<usize>) {
@@ -1020,6 +1142,31 @@ mod tests {
         assert_eq!(
             under_repair(3, &[vec![0, 1], vec![1, 2]], &[0, 1]).unwrap(),
             RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn components_multiply_independent_conjunctions() {
+        // (a OR b) AND (c OR d) over 4 vars: 3 * 3 = 9.
+        let expr = BoolExpr::And(vec![
+            BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(1)]),
+            BoolExpr::Or(vec![BoolExpr::Var(2), BoolExpr::Var(3)]),
+        ]);
+        assert_eq!(count_models(&expr, 4).unwrap(), 9);
+        // Two additional free variables multiply by 2^2.
+        assert_eq!(count_models(&expr, 6).unwrap(), 9 * 4);
+    }
+
+    #[test]
+    fn components_match_dpll_and_bdd_when_variables_are_shared() {
+        let expr = BoolExpr::And(vec![
+            BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(1)]),
+            BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(2)]),
+        ]);
+        assert_eq!(count_models(&expr, 3), count_models_dpll(&expr, 3));
+        assert_eq!(
+            count_models(&expr, 3).unwrap(),
+            count_models_bdd(&expr, 3).unwrap()
         );
     }
 

@@ -3345,6 +3345,36 @@ fn eval_aggregate(
                 _ => unreachable!("mode is one of INT/LUKASIEWICZ/NAT"),
             }
         }
+        AggregateKind::ProbSum => {
+            let Some(expr) = input else {
+                return Err(SqlError::Unsupported(
+                    "PROB_SUM requires an argument".to_string(),
+                ));
+            };
+            let mut product = 1.0f64;
+            let mut count = 0u64;
+            for row in rows {
+                match eval(expr, schema, row)? {
+                    Value::Null => {}
+                    Value::Lukasiewicz(value) => {
+                        let probability = f64::from(value) / 1000.0;
+                        product *= 1.0 - probability;
+                        count += 1;
+                    }
+                    other => {
+                        return Err(SqlError::Exec(ExecError::TypeMismatch {
+                            expected: "LUKASIEWICZ",
+                            actual: other.type_name(),
+                        }));
+                    }
+                }
+            }
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+            let probability = (1.0 - product).clamp(0.0, 1.0);
+            Ok(Value::Lukasiewicz((probability * 1000.0).round() as u16))
+        }
         AggregateKind::Min | AggregateKind::Max => {
             let Some(expr) = input else {
                 return Err(SqlError::Unsupported(format!(

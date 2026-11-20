@@ -9,6 +9,8 @@ pub enum AggregateKind {
     Sum,
     /// `AVG(expr)`.
     Avg,
+    /// `PROB_SUM(expr)`: `1 - product(1 - p)` over Łukasiewicz values.
+    ProbSum,
     /// `MIN(expr)`.
     Min,
     /// `MAX(expr)`.
@@ -22,6 +24,7 @@ impl AggregateKind {
             AggregateKind::Count => "COUNT",
             AggregateKind::Sum => "SUM",
             AggregateKind::Avg => "AVG",
+            AggregateKind::ProbSum => "PROB_SUM",
             AggregateKind::Min => "MIN",
             AggregateKind::Max => "MAX",
         }

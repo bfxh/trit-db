@@ -54,7 +54,7 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 
 - **语义先行**：注解/计数/修复的语义可以用小规模穷举验证，不需要先把 SQL 方言接完。
 - **可判红**：每个结论都有精确期望值（模型数、`Certain/Impossible/Contingent`），不是「看起来对」。
-- **上限显式**：32 个变量 / 64 个事实是硬边界，超限报错；BDD 与增量 CQA 留到后续。
+- **上限显式**：32 个变量 / 64 个事实是硬边界，超限报错；增量 CQA 留到后续。
 
 ## 后果
 
@@ -66,8 +66,8 @@ M3 的目标是「标注关系代数」。完整实现需要 parser/binder/execu
 
 负面 / 未做：
 
-- **SQL 接了 `count_models` 与最小 `UNDER REPAIR`**：`SELECT count_models('<expr>'[, vars])`、`SELECT ... FROM t UNDER REPAIR ON (a, b, ...)`；后者按多列 FD 分组。列级/表级 `UNIQUE` 与 `CHECK` 已接入 INSERT/UPDATE（TRSQ v3）；否定约束可用 `CHECK` 表达；BDD 与 Ł/ℕ 聚合仍未做。
-- `count_models` 用 DPLL，不是 BDD；变量上限 32。
+- **SQL 接了 `count_models` 与最小 `UNDER REPAIR`**：`SELECT count_models('<expr>'[, vars])`、`SELECT ... FROM t UNDER REPAIR ON (a, b, ...)`；后者按多列 FD 分组。列级/表级 `UNIQUE` 与 `CHECK` 已接入 INSERT/UPDATE（TRSQ v3）；否定约束可用 `CHECK` 表达；BDD 默认、组件级计数、Ł/ℕ SUM/AVG/MIN/MAX 与 PROB_SUM 已提供。
+- `count_models` 默认走组件分解 + BDD，DPLL 保留为对拍；变量上限 32。
 - `under_repair` 按 denial 连通分量分解：总事实上限 64，单分量上限 16；没有增量修复或更优的 MCS 枚举。
 - 注解列已接 `LOGIC K3` / `LOGIC BELNAP` / `LOGIC LUKASIEWICZ` / `LOGIC NAT`：K3 复用 `TRUE/FALSE/NULL`，Belnap 用值 tag 存四值，Ł 用千分位整数，ℕ 用 `u64`；`truth(expr)` 只接受 K3/Belnap（投影为 `TRUE/FALSE/UNKNOWN`）。
 

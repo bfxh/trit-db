@@ -881,6 +881,7 @@ fn aggregate_name(kind: AggregateKind) -> &'static str {
         AggregateKind::Count => "count",
         AggregateKind::Sum => "sum",
         AggregateKind::Avg => "avg",
+        AggregateKind::ProbSum => "prob_sum",
         AggregateKind::Min => "min",
         AggregateKind::Max => "max",
     }
