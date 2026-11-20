@@ -6,7 +6,8 @@
 //! `EXPLAIN` text byte-for-byte; `to_sexpr` is a read-only, data-oriented view
 //! intended for debugging and future rule matching.
 
-use crate::ast::JoinKind;
+use crate::ast::{AggregateKind, JoinKind};
+use crate::bind::GroupExpr;
 use crate::error::SqlError;
 use tritdb_exec::{BinaryOp, Expr as ExecExpr, Schema, TruthValue, Value};
 
@@ -33,7 +34,10 @@ pub(crate) enum PlanKind {
         metrics: Metrics,
     },
     Aggregate(Metrics),
-    Having(Metrics),
+    Having {
+        pred: PlanExpr,
+        metrics: Metrics,
+    },
     Project {
         columns: Vec<String>,
         metrics: Metrics,
@@ -51,11 +55,17 @@ pub(crate) enum PlanKind {
 
 /// A bound predicate rendered as data. Column indexes from the executor
 /// expression are resolved back to schema names so the plan remains readable
-/// without the binder context.
+/// without the binder context. `Filter` and join predicates use the scalar
+/// shape; `Having` additionally uses `Aggregate`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlanExpr {
     Literal(Value),
     Column(String),
+    Aggregate {
+        kind: AggregateKind,
+        /// `None` for `COUNT(*)`.
+        input: Option<Box<PlanExpr>>,
+    },
     IsNull {
         expr: Box<PlanExpr>,
         negated: bool,
@@ -269,7 +279,7 @@ impl PlanNode {
                 push_metrics(&mut text, metrics, "groups");
                 text
             }
-            PlanKind::Having(metrics) => {
+            PlanKind::Having { metrics, .. } => {
                 let mut text = "Having".to_string();
                 push_metrics(&mut text, metrics, "groups");
                 text
@@ -374,8 +384,9 @@ impl PlanNode {
                 self.write_sexpr_children(out, indent);
                 out.push(')');
             }
-            PlanKind::Having(metrics) => {
-                out.push_str("(having");
+            PlanKind::Having { pred, metrics } => {
+                out.push_str("(having :pred ");
+                pred.write_sexpr(out);
                 push_sexpr_metrics(out, metrics, "groups");
                 self.write_sexpr_children(out, indent);
                 out.push(')');
@@ -510,12 +521,115 @@ impl PlanExpr {
         }
     }
 
+    /// Convert a bound grouped expression, including aggregate calls, into the
+    /// same data shape used by `Filter` and join predicates.
+    pub(crate) fn from_group_expr(expr: &GroupExpr, schema: &Schema) -> Result<Self, SqlError> {
+        match expr {
+            GroupExpr::Scalar(expr) => Self::from_exec(expr, schema),
+            GroupExpr::Aggregate { kind, input } => Ok(Self::Aggregate {
+                kind: *kind,
+                input: input
+                    .as_ref()
+                    .map(|expr| Self::from_exec(expr, schema))
+                    .transpose()?
+                    .map(Box::new),
+            }),
+            GroupExpr::IsNull { expr, negated } => Ok(Self::IsNull {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                negated: *negated,
+            }),
+            GroupExpr::IsTruth {
+                expr,
+                expected,
+                negated,
+            } => Ok(Self::IsTruth {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                expected: *expected,
+                negated: *negated,
+            }),
+            GroupExpr::Not(expr) => Ok(Self::Not(Box::new(Self::from_group_expr(expr, schema)?))),
+            GroupExpr::InList {
+                expr,
+                values,
+                negated,
+            } => Ok(Self::InList {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                values: values
+                    .iter()
+                    .map(|value| Self::from_group_expr(value, schema))
+                    .collect::<Result<Vec<_>, _>>()?,
+                negated: *negated,
+            }),
+            GroupExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(Self::Between {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                low: Box::new(Self::from_group_expr(low, schema)?),
+                high: Box::new(Self::from_group_expr(high, schema)?),
+                negated: *negated,
+            }),
+            GroupExpr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(Self::Like {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                pattern: Box::new(Self::from_group_expr(pattern, schema)?),
+                negated: *negated,
+            }),
+            GroupExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => Ok(Self::Case {
+                operand: operand
+                    .as_deref()
+                    .map(|expr| Self::from_group_expr(expr, schema))
+                    .transpose()?
+                    .map(Box::new),
+                branches: branches
+                    .iter()
+                    .map(|(when, then)| {
+                        Ok((
+                            Self::from_group_expr(when, schema)?,
+                            Self::from_group_expr(then, schema)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, SqlError>>()?,
+                else_expr: else_expr
+                    .as_deref()
+                    .map(|expr| Self::from_group_expr(expr, schema))
+                    .transpose()?
+                    .map(Box::new),
+            }),
+            GroupExpr::Binary { op, left, right } => Ok(Self::Binary {
+                op: *op,
+                left: Box::new(Self::from_group_expr(left, schema)?),
+                right: Box::new(Self::from_group_expr(right, schema)?),
+            }),
+        }
+    }
+
     fn write_sexpr(&self, out: &mut String) {
         match self {
             Self::Literal(value) => push_plan_value(out, value),
             Self::Column(name) => {
                 out.push_str("(col ");
                 push_string(out, name);
+                out.push(')');
+            }
+            Self::Aggregate { kind, input } => {
+                out.push('(');
+                out.push_str(aggregate_name(*kind));
+                if let Some(input) = input {
+                    out.push(' ');
+                    input.write_sexpr(out);
+                } else {
+                    out.push_str(" :all");
+                }
                 out.push(')');
             }
             Self::IsNull { expr, negated } => {
@@ -683,6 +797,15 @@ fn push_plan_value(out: &mut String, value: &Value) {
         Value::Text(value) => push_string(out, value),
         Value::Bool(true) => out.push_str("#t"),
         Value::Bool(false) => out.push_str("#f"),
+    }
+}
+
+fn aggregate_name(kind: AggregateKind) -> &'static str {
+    match kind {
+        AggregateKind::Count => "count",
+        AggregateKind::Sum => "sum",
+        AggregateKind::Min => "min",
+        AggregateKind::Max => "max",
     }
 }
 

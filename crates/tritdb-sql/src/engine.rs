@@ -1120,7 +1120,7 @@ impl SqlEngine {
                 Metrics::default()
             };
             plan = PlanNode::unary(PlanKind::Aggregate(metrics), plan);
-            if bound.having.is_some() {
+            if let Some(having) = &bound.having {
                 let metrics = if let Some(stats) = stats {
                     Metrics {
                         actual: Some(stats.having_groups as u64),
@@ -1136,7 +1136,8 @@ impl SqlEngine {
                 } else {
                     Metrics::default()
                 };
-                plan = PlanNode::unary(PlanKind::Having(metrics), plan);
+                let pred = PlanExpr::from_group_expr(having, &left_table.schema)?;
+                plan = PlanNode::unary(PlanKind::Having { pred, metrics }, plan);
             }
         }
         let projection_names = bound

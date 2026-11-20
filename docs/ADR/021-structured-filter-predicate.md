@@ -35,7 +35,7 @@ ADR-019 已经把 join 键从字符串拆成 `JoinKeys`，但 `Filter` 节点仍
    - `(like expr pattern)` / `(not-like ...)`
    - `(case [:operand expr] (when cond then) ... [:else expr])`
 4. `EXPLAIN` / `EXPLAIN ANALYZE` 文本继续只显示 `Filter` 和指标，不追加谓词文本；现有整段断言不变。
-5. 本切片只覆盖 `Filter`。`Having`、join 的 `residual` / `on-expr` 仍只有布尔标志；它们的绑定表达式分别是 `GroupExpr` 和 join 两侧 schema，转换规则不同，留到后续切片。ADR-022 已把 join 的完整绑定谓词转成 `:pred`，但 `Having` 仍未结构化。
+5. 本切片只覆盖 `Filter`。`Having`、join 的 `residual` / `on-expr` 仍只有布尔标志；它们的绑定表达式分别是 `GroupExpr` 和 join 两侧 schema，转换规则不同，留到后续切片。ADR-022 已把 join 的完整绑定谓词转成 `:pred`，ADR-023 又把 `Having` 的 `GroupExpr` 转成同一形状的 `:pred`，当前三类谓词节点都已结构化。
 
 ## 后果
 
@@ -45,7 +45,7 @@ ADR-019 已经把 join 键从字符串拆成 `JoinKeys`，但 `Filter` 节点仍
 - 负结果：`PlanExpr` 与 `tritdb_exec::Expr` 是两套形状，后续增加表达式变体时必须同步维护；当前没有自动派生或共享序列化。
 - 负结果：`PlanExpr` 只保存绑定后的结构，不保存原始 SQL 的括号、别名或文本；它用于数据匹配，不是 SQL 反解析器。
 - 负结果：`Filter` 的 `pred` 在 `EXPLAIN ANALYZE SEXPR` 中同样输出，因此实际执行计划会包含完整谓词；大谓词会让单行文本变长，但不会拆成多行节点。
-- 负结果：`Having` 仍未结构化；聚合查询的分组过滤仍只能看到 `Having` 标签和组数。join 谓词已由 ADR-022 补上 `:pred`，但 `residual` 仍不单独拆出。
+- 负结果：`Having` 仍未结构化；聚合查询的分组过滤仍只能看到 `Having` 标签和组数。join 谓词已由 ADR-022 补上 `:pred`，`Having` 随后由 ADR-023 补上 `:pred`，但 join 的 `residual` 仍不单独拆出。
 
 ## 被否掉的替代
 
@@ -62,3 +62,4 @@ ADR-019 已经把 join 键从字符串拆成 `JoinKeys`，但 `Filter` 节点仍
 - [ADR-019：在 EXPLAIN SEXPR 中暴露结构化 join 字段](019-structured-join-sexpr.md)
 - [ADR-020：EXPLAIN ANALYZE SEXPR 输出执行汇总](020-explain-analyze-sexpr.md)
 - [ADR-022：把 join 谓词变成结构化数据](022-structured-join-predicate.md)
+- [ADR-023：把 HAVING 谓词变成结构化数据](023-structured-having-predicate.md)

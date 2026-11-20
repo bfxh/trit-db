@@ -1947,6 +1947,41 @@ fn explain_sexpr_reports_structured_plan() {
          :pred (= (col \"a.id\") (col \"b.id\"))\n        \
          (scan \"a\" :filtered #t)\n        (scan \"b\" :cols (\"id\"))))))"
     );
+
+    let having = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v, COUNT(*) FROM a \
+             GROUP BY a.v HAVING COUNT(*) > 1 AND a.v IS NOT NULL;",
+        )
+        .expect("explain sexpr having");
+    let having_plan = match &as_rows(&having[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        having_plan.contains(
+            "(having :pred (and (> (count :all) 1) \
+             (is-not-null (col \"a.v\")))"
+        ),
+        "unexpected plan: {having_plan}"
+    );
+    assert!(!having_plan.contains(":est-groups"), "{having_plan}");
+    assert!(!having_plan.contains(":actual-groups"), "{having_plan}");
+
+    let summed = engine
+        .execute_script(
+            "EXPLAIN SEXPR SELECT a.v, SUM(a.id) FROM a \
+             GROUP BY a.v HAVING SUM(a.id) > 2;",
+        )
+        .expect("explain sexpr having sum");
+    let summed_plan = match &as_rows(&summed[0]).1[0][0] {
+        Value::Text(plan) => plan,
+        other => panic!("expected plan text, got {other:?}"),
+    };
+    assert!(
+        summed_plan.contains("(having :pred (> (sum (col \"a.id\")) 2)"),
+        "unexpected plan: {summed_plan}"
+    );
 }
 
 #[test]
