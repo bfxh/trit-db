@@ -45,7 +45,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tritdb_page::crc32_parts;
 
@@ -522,7 +522,8 @@ fn now_ms() -> u64 {
 /// intended single writer; there is no cross-process lock in M0. Opening a
 /// second writer on the same path is undefined.
 pub struct WalWriter {
-    file: File,
+    path: PathBuf,
+    file: Option<File>,
     next_lsn: u64,
     segment_first_lsn: u64,
     segment_bytes: u64,
@@ -531,14 +532,180 @@ pub struct WalWriter {
 }
 
 /// Default size at which [`WalWriter::append`] starts a new segment.
-///
-/// Rotating writes another 32-byte segment header into the same file, so
-/// archiving and recovery still see one file.
 pub const DEFAULT_SEGMENT_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// Smallest accepted segment limit. It must leave room for a header and a
 /// record header, so rotation cannot loop on every append.
 pub const MIN_SEGMENT_LIMIT: u64 = 1024;
+
+/// Path of a rotated segment: `<wal>.<first_lsn>.seg`.
+fn segment_path(path: &Path, first_lsn: u64) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{first_lsn}.seg"));
+    PathBuf::from(name)
+}
+
+/// Lists rotated segments as `(first_lsn, path)`, oldest first.
+fn collect_rotated_segments(path: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name =
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(WalError::BadSegmentHeader {
+                reason: "wal path has no file name",
+            })?;
+    let prefix = format!("{file_name}.");
+    let mut segments = Vec::new();
+    if parent.is_dir() {
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(stem) = rest.strip_suffix(".seg") else {
+                continue;
+            };
+            if let Ok(first_lsn) = stem.parse::<u64>() {
+                segments.push((first_lsn, entry.path()));
+            }
+        }
+    }
+    segments.sort_by_key(|(first_lsn, _)| *first_lsn);
+    Ok(segments)
+}
+
+struct MergedScan {
+    scan: WalScan,
+    active_first_lsn: u64,
+    active_bytes: u64,
+    has_active: bool,
+}
+
+/// Reads rotated segments plus the active segment and verifies LSN continuity.
+///
+/// `repair` tolerates a short active segment (left by a crash) and truncates a
+/// torn tail in place. `WalReader` passes `false` and reports both as errors.
+fn scan_segments(path: &Path, repair: bool) -> Result<MergedScan, WalError> {
+    let rotated = collect_rotated_segments(path)?;
+    let mut records = Vec::new();
+    let mut first_lsn = 0u64;
+    let mut previous_lsn = 0u64;
+    let mut segments = 0usize;
+    let mut tail = TailState::Clean;
+    let mut active_valid_end = 0u64;
+    let mut active_file_len = 0u64;
+    let mut active_first_lsn = 0u64;
+    let mut has_active = false;
+
+    for (segment_first, segment) in &rotated {
+        let bytes = std::fs::read(segment)?;
+        let scan = parse_wal(&bytes)?;
+        if scan.first_lsn != *segment_first {
+            return Err(WalError::BadSegmentHeader {
+                reason: "rotated segment name does not match its header",
+            });
+        }
+        if first_lsn == 0 {
+            first_lsn = scan.first_lsn;
+        }
+        if scan.first_lsn <= previous_lsn {
+            return Err(WalError::LsnNotMonotonic {
+                previous: previous_lsn,
+                found: scan.first_lsn,
+            });
+        }
+        for record in &scan.records {
+            if record.lsn <= previous_lsn {
+                return Err(WalError::LsnNotMonotonic {
+                    previous: previous_lsn,
+                    found: record.lsn,
+                });
+            }
+            previous_lsn = record.lsn;
+        }
+        let scan_segments = scan.segments;
+        records.extend(scan.records);
+        segments += scan_segments;
+    }
+
+    if path.is_file() {
+        let len = std::fs::metadata(path)?.len();
+        if repair && len < SEGMENT_HEADER_SIZE as u64 {
+            // A crash can leave a short active segment; rebuild it below.
+            has_active = true;
+            active_valid_end = 0;
+            active_file_len = len;
+            segments += 1;
+        } else {
+            let bytes = std::fs::read(path)?;
+            let scan = parse_wal(&bytes)?;
+            if first_lsn == 0 {
+                first_lsn = scan.first_lsn;
+            }
+            if scan.first_lsn <= previous_lsn && previous_lsn > 0 {
+                return Err(WalError::LsnNotMonotonic {
+                    previous: previous_lsn,
+                    found: scan.first_lsn,
+                });
+            }
+            for record in &scan.records {
+                if record.lsn <= previous_lsn {
+                    return Err(WalError::LsnNotMonotonic {
+                        previous: previous_lsn,
+                        found: record.lsn,
+                    });
+                }
+                previous_lsn = record.lsn;
+            }
+            let scan_segments = scan.segments;
+            records.extend(scan.records);
+            segments += scan_segments;
+            has_active = true;
+            active_first_lsn = scan.first_lsn;
+            active_valid_end = scan.valid_end;
+            active_file_len = scan.file_len;
+            tail = scan.tail;
+            if repair {
+                if let TailState::Torn { offset, .. } = scan.tail {
+                    let file = OpenOptions::new().write(true).open(path)?;
+                    file.set_len(offset)?;
+                    file.sync_all()?;
+                    active_valid_end = offset;
+                    active_file_len = offset;
+                }
+            }
+        }
+    }
+
+    if segments == 0 {
+        return Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "wal does not exist",
+        )));
+    }
+    if first_lsn == 0 {
+        // Only a short active segment was present.
+        first_lsn = previous_lsn.saturating_add(1).max(1);
+    }
+
+    Ok(MergedScan {
+        scan: WalScan {
+            first_lsn,
+            records,
+            valid_end: active_valid_end,
+            tail,
+            file_len: active_file_len,
+            segments,
+            last_segment_offset: 0,
+            last_segment_first_lsn: active_first_lsn,
+        },
+        active_first_lsn,
+        active_bytes: active_valid_end,
+        has_active,
+    })
+}
 
 impl WalWriter {
     /// Opens or creates a WAL, truncating a torn tail, and returns a scan of
@@ -548,74 +715,88 @@ impl WalWriter {
     }
 
     /// Opens or creates a WAL with an explicit segment size.
-    ///
-    /// `segment_limit` controls when [`WalWriter::append`] writes a new
-    /// segment header. The WAL stays one file.
     pub fn open_with_limit(path: &Path, segment_limit: u64) -> Result<(Self, WalScan), WalError> {
+        let segment_limit = segment_limit.max(MIN_SEGMENT_LIMIT);
+        let merged = match scan_segments(path, true) {
+            Ok(merged) => merged,
+            Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(path)?;
+                write_segment_header(&mut file, 1)?;
+                file.sync_all()?;
+                let scan = WalScan {
+                    first_lsn: 1,
+                    records: Vec::new(),
+                    valid_end: SEGMENT_HEADER_SIZE as u64,
+                    tail: TailState::Clean,
+                    file_len: SEGMENT_HEADER_SIZE as u64,
+                    segments: 1,
+                    last_segment_offset: 0,
+                    last_segment_first_lsn: 1,
+                };
+                return Ok((
+                    Self {
+                        path: path.to_path_buf(),
+                        file: Some(file),
+                        next_lsn: 1,
+                        segment_first_lsn: 1,
+                        segment_bytes: SEGMENT_HEADER_SIZE as u64,
+                        segment_limit,
+                        time_index: None,
+                    },
+                    scan,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let next_lsn = merged
+            .scan
+            .records
+            .last()
+            .map_or(merged.scan.first_lsn, |record| record.lsn.saturating_add(1));
+        let active_first_lsn = if merged.has_active && merged.active_first_lsn > 0 {
+            merged.active_first_lsn
+        } else {
+            next_lsn
+        };
+
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
-        let len = file.metadata()?.len();
 
-        if len < SEGMENT_HEADER_SIZE as u64 {
-            // A truncate-to-zero followed by a crash can leave a partial
-            // segment header. There cannot be any valid record in fewer than
-            // 32 bytes, so repair the file as a fresh empty segment.
+        let (active_valid_end, active_bytes) = if merged.has_active && merged.active_bytes > 0 {
+            (merged.active_bytes, merged.active_bytes)
+        } else {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_segment_header(&mut file, 1)?;
+            write_segment_header(&mut file, active_first_lsn)?;
             file.sync_all()?;
-            let scan = WalScan {
-                first_lsn: 1,
-                records: Vec::new(),
-                valid_end: SEGMENT_HEADER_SIZE as u64,
-                tail: TailState::Clean,
-                file_len: SEGMENT_HEADER_SIZE as u64,
-                segments: 1,
-                last_segment_offset: 0,
-                last_segment_first_lsn: 1,
-            };
-            return Ok((
-                Self {
-                    file,
-                    next_lsn: 1,
-                    segment_first_lsn: 1,
-                    segment_bytes: SEGMENT_HEADER_SIZE as u64,
-                    segment_limit: segment_limit.max(MIN_SEGMENT_LIMIT),
-                    time_index: None,
-                },
-                scan,
-            ));
-        }
+            (SEGMENT_HEADER_SIZE as u64, SEGMENT_HEADER_SIZE as u64)
+        };
+        file.seek(SeekFrom::Start(active_valid_end))?;
 
-        file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut bytes)?;
-        let scan = parse_wal(&bytes)?;
-
-        if let TailState::Torn { offset, .. } = scan.tail {
-            file.set_len(offset)?;
-            file.seek(SeekFrom::Start(offset))?;
-        } else {
-            file.seek(SeekFrom::Start(scan.valid_end))?;
-        }
-
-        let next_lsn = scan
-            .records
-            .last()
-            .map_or(scan.first_lsn, |record| record.lsn.saturating_add(1));
-        let segment_bytes = scan.valid_end.saturating_sub(scan.last_segment_offset);
+        let mut scan = merged.scan;
+        scan.segments = scan.segments.max(1);
+        scan.last_segment_first_lsn = active_first_lsn;
+        scan.valid_end = active_valid_end;
+        scan.file_len = scan.file_len.max(active_bytes);
 
         Ok((
             Self {
-                file,
+                path: path.to_path_buf(),
+                file: Some(file),
                 next_lsn,
-                segment_first_lsn: scan.last_segment_first_lsn,
-                segment_bytes,
-                segment_limit: segment_limit.max(MIN_SEGMENT_LIMIT),
+                segment_first_lsn: active_first_lsn,
+                segment_bytes: active_bytes,
+                segment_limit,
                 time_index: None,
             },
             scan,
@@ -623,10 +804,6 @@ impl WalWriter {
     }
 
     /// Opens a WAL and keeps a `<wal>.timeidx` sidecar up to date.
-    ///
-    /// The index is appended after each record without an fsync: a crash can
-    /// leave it behind the WAL, which makes time recovery conservative, not
-    /// wrong.
     pub fn open_with_time_index(
         path: &Path,
         segment_limit: u64,
@@ -634,6 +811,24 @@ impl WalWriter {
         let (mut writer, scan) = Self::open_with_limit(path, segment_limit)?;
         writer.time_index = Some(TimeIndex::open(path)?);
         Ok((writer, scan))
+    }
+
+    /// Paths of every segment (rotated first, active last).
+    pub fn segment_paths(&self) -> Result<Vec<PathBuf>, WalError> {
+        let mut paths: Vec<PathBuf> = collect_rotated_segments(&self.path)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        if self.path.is_file() {
+            paths.push(self.path.clone());
+        }
+        Ok(paths)
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, WalError> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| WalError::Io(std::io::Error::other("wal file is closed")))
     }
 
     /// Appends one record and optionally fsyncs it.
@@ -674,30 +869,45 @@ impl WalWriter {
         let crc = crc32_parts(&header[0..28], payload);
         header[28..32].copy_from_slice(&crc.to_le_bytes());
 
-        self.file.write_all(&header)?;
-        self.file.write_all(payload)?;
+        let file = self.file_mut()?;
+        file.write_all(&header)?;
+        file.write_all(payload)?;
         if sync {
-            self.file.sync_all()?;
+            file.sync_all()?;
         }
 
         self.next_lsn = self.next_lsn.saturating_add(1);
         self.segment_bytes = self.segment_bytes.saturating_add(total as u64);
         if let Some(index) = &mut self.time_index {
-            // The index is advisory; a write failure must not fail the WAL.
             let _ = index.append(lsn, now_ms());
         }
         Ok(lsn)
     }
 
-    /// Starts a new segment inside the same file.
-    ///
-    /// The writer is positioned at the end of the last record. A crash before
-    /// the new header is complete leaves a torn tail; recovery truncates it
-    /// and the next append starts from the last valid LSN.
+    /// Rotates the active segment into `<wal>.<first_lsn>.seg` and starts a
+    /// fresh active segment.
     fn rotate(&mut self) -> Result<(), WalError> {
-        self.file.sync_all()?;
-        write_segment_header(&mut self.file, self.next_lsn)?;
-        self.file.sync_all()?;
+        if let Some(file) = self.file.as_mut() {
+            file.sync_all()?;
+        }
+        // Windows cannot rename an open file.
+        self.file = None;
+
+        let target = segment_path(&self.path, self.segment_first_lsn);
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        std::fs::rename(&self.path, &target)?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        write_segment_header(&mut file, self.next_lsn)?;
+        file.sync_all()?;
+        self.file = Some(file);
         self.segment_first_lsn = self.next_lsn;
         self.segment_bytes = SEGMENT_HEADER_SIZE as u64;
         Ok(())
@@ -705,32 +915,43 @@ impl WalWriter {
 
     /// Flushes the file to stable storage.
     pub fn sync(&mut self) -> Result<(), WalError> {
-        self.file.sync_all()?;
+        if let Some(file) = self.file.as_mut() {
+            file.sync_all()?;
+        }
         Ok(())
     }
 
     /// Replaces the WAL with an empty segment whose first LSN is `first_lsn`.
     ///
-    /// The old records are discarded only after the caller has made the durable
-    /// state they describe durable elsewhere. A crash between truncation and
-    /// header write is repaired by [`WalWriter::open`] as an empty segment.
+    /// Every rotated segment is removed as well.
     pub fn reset(&mut self, first_lsn: u64) -> Result<(), WalError> {
         if first_lsn == 0 {
             return Err(WalError::BadSegmentHeader {
                 reason: "first LSN must be non-zero",
             });
         }
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        write_segment_header(&mut self.file, first_lsn)?;
-        self.file.sync_all()?;
+        if let Some(file) = self.file.as_mut() {
+            file.sync_all()?;
+        }
+        self.file = None;
+
+        for (_, segment) in collect_rotated_segments(&self.path)? {
+            let _ = std::fs::remove_file(segment);
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        write_segment_header(&mut file, first_lsn)?;
+        file.sync_all()?;
+        self.file = Some(file);
         self.next_lsn = first_lsn;
         self.segment_first_lsn = first_lsn;
         self.segment_bytes = SEGMENT_HEADER_SIZE as u64;
         if let Some(index) = &mut self.time_index {
-            // A normal checkpoint resets to `checkpoint_lsn + 1`, so the
-            // existing time entries stay valid. Only an LSN rollback (mostly
-            // tests) needs a fresh index.
             if first_lsn <= index.last_lsn() {
                 index.reset()?;
             }
@@ -750,16 +971,7 @@ pub struct WalReader;
 impl WalReader {
     /// Opens a WAL for reading and scans its current prefix.
     pub fn open(path: &Path) -> Result<WalScan, WalError> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
-        let len = file.metadata()?.len();
-        if len < SEGMENT_HEADER_SIZE as u64 {
-            return Err(WalError::BadSegmentHeader {
-                reason: "file is shorter than the segment header",
-            });
-        }
-        let mut bytes = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut bytes)?;
-        parse_wal(&bytes)
+        scan_segments(path, false).map(|merged| merged.scan)
     }
 }
 
