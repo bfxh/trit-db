@@ -2397,11 +2397,77 @@ fn copy_rejects_unsupported_encoding() {
 
     query(
         &mut stream,
-        "COPY t FROM STDIN (FORMAT csv, ENCODING 'LATIN1');",
+        "COPY t FROM STDIN (FORMAT csv, ENCODING 'KOI8R');",
     );
     let messages = read_until_ready(&mut stream);
     assert!(
         has_error(&messages),
         "unsupported COPY encoding must be rejected: {messages:?}"
     );
+}
+
+#[test]
+fn copy_csv_force_null_wildcard() {
+    let (_dir, mut stream) = start_server("pgproto-copy-force-all");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT csv, NULL 'NULL', FORCE_NULL (*));",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    write_message(&mut stream, b'd', b"1,\"NULL\"\n");
+    write_message(&mut stream, b'd', b"2,alpha\n");
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), None],
+            vec![Some("2".into()), Some("alpha".into())],
+        ]
+    );
+}
+
+#[test]
+fn copy_latin1_encoding_is_transcoded() {
+    let (_dir, mut stream) = start_server("pgproto-copy-latin1");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT text, ENCODING 'LATIN1');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    // 0xE9 is "é" in ISO-8859-1.
+    write_message(&mut stream, b'd', b"1\t\xe9\n");
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(row, vec![Some("1".into()), Some("é".into())]);
 }
