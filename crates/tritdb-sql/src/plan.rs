@@ -1067,5 +1067,6 @@ fn join_kind_name(kind: JoinKind) -> &'static str {
         JoinKind::Left => "left",
         JoinKind::Right => "right",
         JoinKind::Full => "full",
+        JoinKind::Asof => "asof",
     }
 }

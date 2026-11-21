@@ -272,6 +272,9 @@ pub struct OrderBy {
 pub enum JoinKind {
     /// Inner join: only matching row pairs survive.
     Inner,
+    /// As-of join: each left row pairs with the last right row whose time is
+    /// `<=` the left row's time (`ON left.ts >= right.ts`).
+    Asof,
     /// Cross join: every left row pairs with every right row.
     Cross,
     /// Left outer join: unmatched left rows survive with `NULL` right columns.

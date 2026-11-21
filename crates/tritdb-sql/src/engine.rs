@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tritdb_exec::{
     ann::B4,
-    batch::{eval_predicate, filter_indices, TriPredicate, TritVec, K3},
+    batch::{asof_join, eval_predicate, filter_indices, TriPredicate, TritVec, K3},
     certainty_of_value, compare_values, eval, truth_of, truth_projection, truth_text, BinaryOp,
     Column, DataType, ExecError, Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
 };
@@ -4169,7 +4169,7 @@ fn build_join_layout(
         let right_column = &right.schema.columns[right_index];
         let name = unqualified_name(&left_column.name).to_string();
         let not_null = match kind {
-            JoinKind::Inner => left_column.not_null || right_column.not_null,
+            JoinKind::Inner | JoinKind::Asof => left_column.not_null || right_column.not_null,
             JoinKind::Left => left_column.not_null,
             JoinKind::Right => right_column.not_null,
             JoinKind::Full | JoinKind::Cross => false,
@@ -4230,7 +4230,7 @@ fn build_join_layout(
             continue;
         }
         let not_null = match kind {
-            JoinKind::Left | JoinKind::Full => false,
+            JoinKind::Left | JoinKind::Full | JoinKind::Asof => false,
             _ => column.not_null,
         };
         let output_index = columns.len();
@@ -4535,6 +4535,7 @@ fn estimate_join_rows(
         JoinKind::Right => rows.max(right_rows),
         JoinKind::Full => rows.max(left_rows).max(right_rows),
         JoinKind::Cross => product,
+        JoinKind::Asof => left_rows,
     }
 }
 
@@ -4817,6 +4818,9 @@ fn join_tables(
     strategy: JoinStrategy,
     stats: JoinStats<'_>,
 ) -> Result<(Table, Vec<JoinSource>, bool), SqlError> {
+    if matches!(kind, JoinKind::Asof) {
+        return asof_join_tables(left, right, condition, kind);
+    }
     let pairs = match condition {
         JoinCondition::Using(names) => using_pairs(left, right, names)?,
         JoinCondition::Natural => natural_pairs(left, right)?,
@@ -4884,6 +4888,145 @@ fn join_tables(
         sources,
         uses_hash,
     ))
+}
+
+/// As-of join: each left row pairs with the last right row whose time is
+/// `<=` the left row's time.
+///
+/// The right side is sorted by time at execution (stable), rows with a `NULL`
+/// time never match, and every left row survives (right columns `NULL` when
+/// there is no match).
+fn asof_join_tables(
+    left: &Table,
+    right: &Table,
+    condition: &JoinCondition,
+    kind: JoinKind,
+) -> Result<(Table, Vec<JoinSource>, bool), SqlError> {
+    let (left_time, right_time) = asof_time_columns(left, right, condition)?;
+    let (schema, sources) = build_join_layout(left, right, &[], kind);
+
+    // Right rows with a time, sorted by time (stable: equal times keep their
+    // original order, so the last one wins).
+    let mut order: Vec<usize> = (0..right.rows.len())
+        .filter(|&index| !right.rows[index][right_time].is_null())
+        .collect();
+    order.sort_by_key(|&index| asof_time(&right.rows[index][right_time]).unwrap_or(i64::MIN));
+    let right_times: Vec<i64> = order
+        .iter()
+        .map(|&index| asof_time(&right.rows[index][right_time]).expect("non-null filtered"))
+        .collect();
+
+    // Left rows with a time participate in the search; `NULL` times never
+    // match.
+    let left_indices: Vec<usize> = (0..left.rows.len())
+        .filter(|&index| !left.rows[index][left_time].is_null())
+        .collect();
+    let left_times: Vec<i64> = left_indices
+        .iter()
+        .map(|&index| asof_time(&left.rows[index][left_time]).expect("non-null filtered"))
+        .collect();
+    let matches = asof_join(&left_times, &right_times).map_err(|error| {
+        SqlError::Exec(ExecError::TypeMismatch {
+            expected: "INT",
+            actual: error.to_string().leak(),
+        })
+    })?;
+
+    let mut matched: Vec<Option<usize>> = vec![None; left.rows.len()];
+    for (position, &left_index) in left_indices.iter().enumerate() {
+        matched[left_index] = matches[position].map(|position| order[position]);
+    }
+
+    let null_right = vec![Value::Null; right.schema.len()];
+    let mut rows = Vec::with_capacity(left.rows.len());
+    for (index, left_row) in left.rows.iter().enumerate() {
+        let right_row = matched[index]
+            .map(|right_index| right.rows[right_index].as_slice())
+            .unwrap_or(null_right.as_slice());
+        let mut row = left_row.clone();
+        row.extend(right_row.iter().cloned());
+        rows.push(row);
+    }
+
+    Ok((
+        Table {
+            name: format!("{}+{}", left.name, right.name),
+            schema,
+            rows,
+        },
+        sources,
+        false,
+    ))
+}
+
+/// Extracts the `left.ts >= right.ts` time columns from an as-of `ON` clause.
+fn asof_time_columns(
+    left: &Table,
+    right: &Table,
+    condition: &JoinCondition,
+) -> Result<(usize, usize), SqlError> {
+    let unsupported = || {
+        SqlError::Unsupported(
+            "ASOF JOIN needs `ON <left>.ts >= <right>.ts` (single INT time column)".to_string(),
+        )
+    };
+    let JoinCondition::On(expr) = condition else {
+        return Err(unsupported());
+    };
+    let Expr::Binary {
+        op: BinaryOp::Ge,
+        left: left_expr,
+        right: right_expr,
+    } = expr
+    else {
+        return Err(unsupported());
+    };
+    let (
+        Expr::Column {
+            table: left_table,
+            name: left_name,
+        },
+        Expr::Column {
+            table: right_table,
+            name: right_name,
+        },
+    ) = (&**left_expr, &**right_expr)
+    else {
+        return Err(unsupported());
+    };
+    let left_index = asof_column(left, left_table.as_deref(), left_name)?;
+    let right_index = asof_column(right, right_table.as_deref(), right_name)?;
+    for (table, index) in [(left, left_index), (right, right_index)] {
+        let column = &table.schema.columns[index];
+        if column.data_type != DataType::Int {
+            return Err(SqlError::Exec(ExecError::TypeMismatch {
+                expected: "INT",
+                actual: column.data_type.name(),
+            }));
+        }
+    }
+    Ok((left_index, right_index))
+}
+
+fn asof_column(schema_table: &Table, table: Option<&str>, name: &str) -> Result<usize, SqlError> {
+    if let Some(table) = table {
+        let qualified = format!("{table}.{name}");
+        return schema_table
+            .schema
+            .index_of(&qualified)
+            .ok_or(SqlError::UnknownColumn(qualified));
+    }
+    schema_table
+        .schema
+        .index_of(name)
+        .ok_or_else(|| SqlError::UnknownColumn(name.to_string()))
+}
+
+fn asof_time(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(value) => Some(*value),
+        _ => None,
+    }
 }
 
 fn passes_filter(filter: Option<&ExecExpr>, schema: &Schema, row: &Row) -> Result<bool, SqlError> {

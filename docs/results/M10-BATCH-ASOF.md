@@ -60,11 +60,12 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
 - 集成测试 `batch_where_matches_row_path_on_annotation_columns` 覆盖 K3/Belnap 的 AND/OR/NOT
   组合与混合谓词回退；
 - `DELETE` 与 `UPDATE` 的 `WHERE` 复用同一 `batch_filter_indices`（同一 debug 对拍），
-  集成测试 `batch_where_drives_update_and_delete` 覆盖更新/删除与混合谓词回退。
+  集成测试 `batch_where_drives_update_and_delete` 覆盖更新/删除与混合谓词回退；
+- `ASOF JOIN` 语法已接入（`ON <left>.ts >= <right>.ts`）：单 `INT` 时间键、右表执行时稳定排序、
+  `NULL` 时间不匹配、左外语义；语义与 SQLSTATE 见 `docs/ADR/046-asof-join.md`。
 
 ### 5.1 还没做
 
-- **ASOF JOIN 语法**：还没有 `ASOF JOIN` 关键字与 binder（`asof_join` 目前是库 API）；
 - **三值列存块**：`TritVec` 还没作为表的物理列格式（目前是内存向量）；
 
 ## 6. 验收

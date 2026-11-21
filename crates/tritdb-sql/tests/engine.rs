@@ -3389,6 +3389,92 @@ fn batch_where_drives_update_and_delete() {
 }
 
 #[test]
+fn asof_join_picks_the_last_matching_row() {
+    let dir = TempDir::new("sql-asof");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE trades (id INT NOT NULL, ts INT NOT NULL, price INT);              CREATE TABLE quotes (ts INT NOT NULL, bid INT);              INSERT INTO trades VALUES (1, 10, 100), (2, 25, 200), (3, 40, 300);              INSERT INTO quotes VALUES (5, 50), (20, 60), (30, 70), (20, 61);",
+        )
+        .expect("seed");
+
+    // The right side is unsorted on purpose: the executor sorts it (stable),
+    // so the last of the equal 20s (bid 61) wins for ts = 25.
+    let results = engine
+        .execute_script(
+            "SELECT trades.id, quotes.bid FROM trades              ASOF JOIN quotes ON trades.ts >= quotes.ts ORDER BY trades.id;",
+        )
+        .expect("asof");
+    assert_eq!(
+        as_rows(&results[0]).1,
+        [
+            vec![Value::Int(1), Value::Int(50)],
+            vec![Value::Int(2), Value::Int(61)],
+            vec![Value::Int(3), Value::Int(70)],
+        ]
+    );
+}
+
+#[test]
+fn asof_join_handles_null_and_missing_matches() {
+    let dir = TempDir::new("sql-asof-null");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE trades (id INT NOT NULL, ts INT);              CREATE TABLE quotes (ts INT, bid INT);              INSERT INTO trades VALUES (1, 3), (2, NULL), (3, 10);              INSERT INTO quotes VALUES (5, 50), (NULL, 99), (10, 100);",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT trades.id, quotes.bid FROM trades              ASOF JOIN quotes ON trades.ts >= quotes.ts ORDER BY trades.id;",
+        )
+        .expect("asof");
+    // ts=3 has no quote <= 3 (NULL time excluded); ts=NULL never matches;
+    // ts=10 takes the equal quote (100).
+    assert_eq!(
+        as_rows(&results[0]).1,
+        [
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Int(100)],
+        ]
+    );
+}
+
+#[test]
+fn asof_join_rejects_unsupported_conditions() {
+    let dir = TempDir::new("sql-asof-errors");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE a (ts INT NOT NULL, label TEXT);              CREATE TABLE b (ts INT NOT NULL, label TEXT);",
+        )
+        .expect("seed");
+
+    let error = engine
+        .execute_script("SELECT * FROM a ASOF JOIN b ON a.ts = b.ts;")
+        .expect_err("equality is not an as-of condition");
+    assert!(
+        matches!(error, SqlError::Unsupported(_)),
+        "unexpected {error:?}"
+    );
+
+    let error = engine
+        .execute_script("SELECT * FROM a ASOF JOIN b ON a.label >= b.label;")
+        .expect_err("time columns must be INT");
+    assert!(
+        matches!(
+            error,
+            SqlError::Exec(tritdb_exec::ExecError::TypeMismatch { .. })
+        ),
+        "unexpected {error:?}"
+    );
+}
+
+#[test]
 fn join_projection_prunes_unused_source_columns() {
     let dir = TempDir::new("sql-projection");
     let db = dir.join("sql.db");

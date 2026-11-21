@@ -653,6 +653,9 @@ impl Parser {
                 self.eat_keyword(Keyword::Outer);
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Full
+            } else if self.eat_keyword(Keyword::Asof) {
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Asof
             } else if self.eat_keyword(Keyword::Join) {
                 JoinKind::Inner
             } else if natural {
@@ -664,6 +667,11 @@ impl Parser {
             if natural && kind == JoinKind::Cross {
                 return Err(SqlError::Unsupported(
                     "NATURAL CROSS JOIN is not supported".to_string(),
+                ));
+            }
+            if natural && kind == JoinKind::Asof {
+                return Err(SqlError::Unsupported(
+                    "NATURAL ASOF JOIN is not supported".to_string(),
                 ));
             }
 
@@ -680,6 +688,9 @@ impl Parser {
                     ));
                 }
                 JoinCondition::None
+            } else if kind == JoinKind::Asof {
+                self.expect_keyword(Keyword::On)?;
+                JoinCondition::On(self.parse_expr()?)
             } else if self.eat_keyword(Keyword::Using) {
                 self.expect_symbol(Symbol::LParen)?;
                 let mut columns = Vec::new();
