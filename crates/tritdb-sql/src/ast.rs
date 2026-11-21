@@ -70,6 +70,20 @@ pub enum Expr {
         /// `true` for `NOT IN`.
         negated: bool,
     },
+    /// `expr [NOT] IN (SELECT ...)`.
+    InSubquery {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Subquery; must return exactly one column.
+        query: Box<Query>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+    },
+    /// `(SELECT ...)` used as a scalar value.
+    ScalarSubquery {
+        /// Subquery; must return zero or one row and one column.
+        query: Box<Query>,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// Probe expression.
