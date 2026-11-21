@@ -1884,6 +1884,35 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_archived_checkpoints_keep_recovery_intact() {
+        let dir = TempDir::new();
+        let path = dir.wal();
+        let store = Arc::new(TxnStore::open(&path).expect("open"));
+        let mut txn = store.begin().expect("begin");
+        txn.put(b"k", b"v").expect("put");
+        txn.commit().expect("commit");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for _ in 0..5 {
+                    // Serialized by the WAL lock; archives must stay complete.
+                    let _ = store.checkpoint_archive_keep(4);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        // `TxnStore::open` takes `<wal>.lock`; release it before reopening.
+        drop(store);
+
+        let reopened = TxnStore::open(&path).expect("reopen");
+        assert_eq!(reopened.get(b"k").expect("get"), Some(b"v".to_vec()));
+    }
+
+    #[test]
     fn checkpoint_races_begin_without_losing_commits() {
         let dir = TempDir::new();
         let path = dir.wal();

@@ -25,7 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use md5::{Digest as _, Md5};
 
-use tritdb_exec::{DataType, Value};
+use tritdb_exec::{DataType, Table, Value};
 use tritdb_sql::{parse_script, QueryResult, SqlEngine, SqlError, Statement};
 use x509_cert::ext::pkix::CrlReason;
 
@@ -2094,15 +2094,38 @@ fn handle_copy(
             copy_in_binary(stream, engine, &plan.table, &columns, &types)
         }
         (CopyDirection::Out, CopyFormat::Text) => {
-            copy_out(stream, engine, &plan.table, &columns, &plan.options)
+            let Some((table, indices)) = copy_out_source(engine, &plan.table, &columns) else {
+                return copy_failed(stream, &format!("unknown table {}", plan.table));
+            };
+            copy_out(stream, table, &indices, &columns, &plan.options)
         }
         (CopyDirection::Out, CopyFormat::Csv) => {
-            copy_out_csv(stream, engine, &plan.table, &columns, &plan.options)
+            let Some((table, indices)) = copy_out_source(engine, &plan.table, &columns) else {
+                return copy_failed(stream, &format!("unknown table {}", plan.table));
+            };
+            copy_out_csv(stream, table, &indices, &columns, &plan.options)
         }
         (CopyDirection::Out, CopyFormat::Binary) => {
-            copy_out_binary(stream, engine, &plan.table, &columns, &types)
+            let Some((table, indices)) = copy_out_source(engine, &plan.table, &columns) else {
+                return copy_failed(stream, &format!("unknown table {}", plan.table));
+            };
+            copy_out_binary(stream, table, &indices, &types)
         }
     }
+}
+
+/// Resolves the table and column indexes for a streaming COPY OUT.
+fn copy_out_source<'a>(
+    engine: &'a SqlEngine,
+    name: &str,
+    columns: &[String],
+) -> Option<(&'a Table, Vec<usize>)> {
+    let table = engine.copy_source(name)?;
+    let mut indices = Vec::with_capacity(columns.len());
+    for column in columns {
+        indices.push(table.schema.index_of(column)?);
+    }
+    Some((table, indices))
 }
 
 /// Parses one CSV line into fields. An unquoted empty field is `NULL`.
@@ -2315,16 +2338,11 @@ fn copy_in_csv(
 
 fn copy_out_csv(
     stream: &mut dyn ReadWrite,
-    engine: &mut SqlEngine,
-    table: &str,
+    table: &Table,
+    indices: &[usize],
     columns: &[String],
     options: &CopyOptions,
 ) -> Result<bool, PgError> {
-    let sql = format!("SELECT {} FROM {table};", columns.join(", "));
-    let results = match engine.execute_script(&sql) {
-        Ok(results) => results,
-        Err(error) => return copy_failed_sql(stream, &error),
-    };
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(0);
     payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
@@ -2348,30 +2366,27 @@ fn copy_out_csv(
         write_message(stream, b'd', &header)?;
     }
     let mut sent = 0usize;
-    for result in results {
-        if let QueryResult::Rows { rows, .. } = result {
-            for row in rows {
-                let mut line = String::new();
-                for (index, value) in row.iter().enumerate() {
-                    if index > 0 {
-                        line.push(options.delimiter as char);
-                    }
-                    let text = if value.is_null() {
-                        None
-                    } else {
-                        Some(value_text(value))
-                    };
-                    line.push_str(&csv_field(text.as_deref(), options));
-                }
-                line.push('\n');
-                let bytes = match encode_copy_line(&line, &options.encoding) {
-                    Ok(bytes) => bytes,
-                    Err(message) => return copy_failed(stream, &message),
-                };
-                write_message(stream, b'd', &bytes)?;
-                sent += 1;
+    for row in &table.rows {
+        let mut line = String::new();
+        for (position, &index) in indices.iter().enumerate() {
+            if position > 0 {
+                line.push(options.delimiter as char);
             }
+            let value = &row[index];
+            let text = if value.is_null() {
+                None
+            } else {
+                Some(value_text(value))
+            };
+            line.push_str(&csv_field(text.as_deref(), options));
         }
+        line.push('\n');
+        let bytes = match encode_copy_line(&line, &options.encoding) {
+            Ok(bytes) => bytes,
+            Err(message) => return copy_failed(stream, &message),
+        };
+        write_message(stream, b'd', &bytes)?;
+        sent += 1;
     }
     write_message(stream, b'c', &[])?;
     let tag = format!("COPY {sent}\0");
@@ -2605,20 +2620,14 @@ fn copy_in_binary(
 
 fn copy_out_binary(
     stream: &mut dyn ReadWrite,
-    engine: &mut SqlEngine,
-    table: &str,
-    columns: &[String],
+    table: &Table,
+    indices: &[usize],
     types: &[DataType],
 ) -> Result<bool, PgError> {
-    let sql = format!("SELECT {} FROM {table};", columns.join(", "));
-    let results = match engine.execute_script(&sql) {
-        Ok(results) => results,
-        Err(error) => return copy_failed_sql(stream, &error),
-    };
-    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    let mut payload = Vec::with_capacity(3 + types.len() * 2);
     payload.push(1);
-    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
-    for _ in columns {
+    payload.extend_from_slice(&(types.len() as i16).to_be_bytes());
+    for _ in types {
         payload.extend_from_slice(&1i16.to_be_bytes());
     }
     write_message(stream, b'H', &payload)?;
@@ -2630,24 +2639,21 @@ fn copy_out_binary(
     write_message(stream, b'd', &header)?;
 
     let mut sent = 0usize;
-    for result in results {
-        if let QueryResult::Rows { rows, .. } = result {
-            for row in rows {
-                let mut message = Vec::new();
-                message.extend_from_slice(&(row.len() as i16).to_be_bytes());
-                for (index, value) in row.iter().enumerate() {
-                    if value.is_null() {
-                        message.extend_from_slice(&(-1i32).to_be_bytes());
-                        continue;
-                    }
-                    let bytes = encode_copy_binary_value(value, types[index]);
-                    message.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-                    message.extend_from_slice(&bytes);
-                }
-                write_message(stream, b'd', &message)?;
-                sent += 1;
+    for row in &table.rows {
+        let mut message = Vec::new();
+        message.extend_from_slice(&(indices.len() as i16).to_be_bytes());
+        for (position, &index) in indices.iter().enumerate() {
+            let value = &row[index];
+            if value.is_null() {
+                message.extend_from_slice(&(-1i32).to_be_bytes());
+                continue;
             }
+            let bytes = encode_copy_binary_value(value, types[position]);
+            message.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            message.extend_from_slice(&bytes);
         }
+        write_message(stream, b'd', &message)?;
+        sent += 1;
     }
     write_message(stream, b'd', &(-1i16).to_be_bytes())?;
     write_message(stream, b'c', &[])?;
@@ -2767,16 +2773,11 @@ fn copy_in(
 
 fn copy_out(
     stream: &mut dyn ReadWrite,
-    engine: &mut SqlEngine,
-    table: &str,
+    table: &Table,
+    indices: &[usize],
     columns: &[String],
     options: &CopyOptions,
 ) -> Result<bool, PgError> {
-    let sql = format!("SELECT {} FROM {table};", columns.join(", "));
-    let results = match engine.execute_script(&sql) {
-        Ok(results) => results,
-        Err(error) => return copy_failed_sql(stream, &error),
-    };
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(0);
     payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
@@ -2800,29 +2801,26 @@ fn copy_out(
         write_message(stream, b'd', &header)?;
     }
     let mut sent = 0usize;
-    for result in results {
-        if let QueryResult::Rows { rows, .. } = result {
-            for row in rows {
-                let mut line = String::new();
-                for (index, value) in row.iter().enumerate() {
-                    if index > 0 {
-                        line.push(options.delimiter as char);
-                    }
-                    if value.is_null() {
-                        line.push_str(&options.null);
-                    } else {
-                        line.push_str(&copy_escape(&value_text(value)));
-                    }
-                }
-                line.push('\n');
-                let bytes = match encode_copy_line(&line, &options.encoding) {
-                    Ok(bytes) => bytes,
-                    Err(message) => return copy_failed(stream, &message),
-                };
-                write_message(stream, b'd', &bytes)?;
-                sent += 1;
+    for row in &table.rows {
+        let mut line = String::new();
+        for (position, &index) in indices.iter().enumerate() {
+            if position > 0 {
+                line.push(options.delimiter as char);
+            }
+            let value = &row[index];
+            if value.is_null() {
+                line.push_str(&options.null);
+            } else {
+                line.push_str(&copy_escape(&value_text(value)));
             }
         }
+        line.push('\n');
+        let bytes = match encode_copy_line(&line, &options.encoding) {
+            Ok(bytes) => bytes,
+            Err(message) => return copy_failed(stream, &message),
+        };
+        write_message(stream, b'd', &bytes)?;
+        sent += 1;
     }
     write_message(stream, b'c', &[])?;
     let tag = format!("COPY {sent}\0");
@@ -3138,6 +3136,23 @@ fn describe_columns(
 ) -> Result<Option<ResultMeta>, PgError> {
     let placeholders = vec![None; param_types.len()];
     let sql = substitute_params(sql, param_types, &placeholders)?;
+    // Fast path: bind only. `Describe` of a grouped query used to run
+    // `SELECT ... LIMIT 1`, which aggregates the whole table.
+    if let Some(columns) = engine.describe_select(&sql) {
+        let names = columns.iter().map(|(name, _)| name.clone()).collect();
+        let oids = columns
+            .iter()
+            .map(|(_, data_type)| match data_type {
+                DataType::Int => 20,
+                DataType::Bool => 16,
+                _ => 25,
+            })
+            .collect();
+        return Ok(Some(ResultMeta {
+            columns: names,
+            oids,
+        }));
+    }
     let statements = parse_script(&sql).map_err(|error| PgError::Sql(error.to_string()))?;
     let Some(Statement::Select(select)) = statements.first() else {
         return Ok(None);

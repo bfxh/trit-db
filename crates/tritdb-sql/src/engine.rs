@@ -444,6 +444,29 @@ fn infer_schema(names: &[String], rows: &[Row]) -> Schema {
     Schema::new(columns)
 }
 
+/// Exact result type for the shapes [`SqlEngine::describe_select`]
+/// fast-paths; `None` means "probe by execution instead".
+fn group_expr_type(expr: &GroupExpr, schema: &Schema) -> Option<DataType> {
+    match expr {
+        GroupExpr::Scalar(ExecExpr::Column(index)) => {
+            schema.columns.get(*index).map(|column| column.data_type)
+        }
+        GroupExpr::Scalar(ExecExpr::Literal(value)) => Some(value_data_type(value)),
+        GroupExpr::Aggregate { kind, input } => match kind {
+            AggregateKind::Count | AggregateKind::Sum | AggregateKind::Avg => Some(DataType::Int),
+            AggregateKind::ProbSum => Some(DataType::Lukasiewicz),
+            AggregateKind::Min | AggregateKind::Max => match input.as_ref() {
+                Some(ExecExpr::Column(index)) => {
+                    schema.columns.get(*index).map(|column| column.data_type)
+                }
+                Some(ExecExpr::Literal(value)) => Some(value_data_type(value)),
+                _ => None,
+            },
+        },
+        _ => None,
+    }
+}
+
 fn value_data_type(value: &Value) -> DataType {
     match value {
         Value::Null => DataType::Text,
@@ -566,6 +589,12 @@ impl SqlEngine {
         }
     }
 
+    /// Borrows one table so `COPY ... TO STDOUT` can stream rows instead of
+    /// materializing a full query result.
+    pub fn copy_source(&self, name: &str) -> Option<&Table> {
+        self.tables.get(name)
+    }
+
     /// Returns the column names and types of `name`, if the table exists.
     pub fn table_schema(&self, name: &str) -> Option<Vec<(String, DataType)>> {
         self.tables.get(name).map(|table| {
@@ -576,6 +605,30 @@ impl SqlEngine {
                 .map(|column| (column.name.clone(), column.data_type))
                 .collect()
         })
+    }
+
+    /// Result column names and types for a single-table `SELECT`, computed by
+    /// binding only. Returns `None` for shapes this fast path does not cover
+    /// (joins, non-SELECT, or expressions whose type is not exact), so callers
+    /// can fall back to probing with `LIMIT 1`.
+    pub fn describe_select(&self, sql: &str) -> Option<Vec<(String, DataType)>> {
+        let statements = parse_script(sql).ok()?;
+        let Some(Statement::Select(select)) = statements.first() else {
+            return None;
+        };
+        if !select.joins.is_empty() {
+            return None;
+        }
+        let table = self.tables.get(&select.table)?;
+        let bound = bind_select(select, table).ok()?;
+        bound
+            .items
+            .iter()
+            .map(|item| {
+                group_expr_type(&item.expr, &table.schema)
+                    .map(|data_type| (item.name.clone(), data_type))
+            })
+            .collect()
     }
 
     /// Opens an engine and loads all persisted tables.
@@ -5973,6 +6026,29 @@ mod tests {
             rows.is_empty(),
             "NOT IN with a NULL candidate must not return rows: {rows:?}"
         );
+    }
+
+    #[test]
+    fn describe_select_binds_without_executing() {
+        let dir = tritdb_testkit::TempDir::new("engine-describe");
+        let db = dir.join("describe.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        engine
+            .execute_script("CREATE TABLE t (x INT NOT NULL, name TEXT);")
+            .expect("create");
+
+        // Binding alone produces the metadata; execution would aggregate the
+        // (empty) table, which this fast path must skip.
+        let columns = engine
+            .describe_select("SELECT x, COUNT(*) FROM t GROUP BY x;")
+            .expect("describe");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0], ("x".to_string(), DataType::Int));
+        assert_eq!(columns[1].1, DataType::Int);
+
+        // Shapes the fast path does not cover return None (probe fallback).
+        assert!(engine.describe_select("SELECT x FROM missing;").is_none());
+        assert!(engine.describe_select("SELECT * FROM t, t AS u;").is_none());
     }
 
     #[test]
