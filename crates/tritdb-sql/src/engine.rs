@@ -519,6 +519,18 @@ pub struct SqlEngine {
 }
 
 impl SqlEngine {
+    /// Returns the column names and types of `name`, if the table exists.
+    pub fn table_schema(&self, name: &str) -> Option<Vec<(String, DataType)>> {
+        self.tables.get(name).map(|table| {
+            table
+                .schema
+                .columns
+                .iter()
+                .map(|column| (column.name.clone(), column.data_type))
+                .collect()
+        })
+    }
+
     /// Opens an engine and loads all persisted tables.
     pub fn open(path: &Path) -> Result<Self, SqlError> {
         let store = TxnStore::open(path)?;

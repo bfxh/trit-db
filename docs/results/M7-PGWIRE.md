@@ -1,6 +1,6 @@
 # M7 第一刀：最小 PostgreSQL wire protocol
 
-状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` / TLS（rustls，含 mTLS、热轮换、指纹吊销）/ trust、cleartext、MD5、SCRAM-SHA-256（含持久化 verifier）认证已实现；COPY、二进制结果格式未做
+状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` / TLS（rustls，含 mTLS、热轮换、指纹吊销）/ trust、cleartext、MD5、SCRAM-SHA-256（含持久化 verifier）认证、COPY（文本格式）与二进制结果格式已实现；COPY CSV/二进制格式、二进制参数未做
 
 日期：2026-11-21
 
@@ -12,7 +12,7 @@ crates/tritdb-pgwire/src/lib.rs   serve / 协议编解码 / 类型文本化
                                   Parse/Bind/Describe/Execute/Close / $n 参数替换
 crates/tritdb/src/main.rs         serve --db ... [--listen ...]
 crates/tritdb/tests/pgwire.rs            5 个端到端测试
-crates/tritdb/tests/pgwire_protocol.rs  29 个协议/认证/TLS 测试
+crates/tritdb/tests/pgwire_protocol.rs  33 个协议/认证/TLS 测试
 docs/ADR/045-pgwire.md
 ```
 
@@ -37,6 +37,9 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - `Terminate`（`X`）断开。
 - 空查询 → `EmptyQueryResponse`；SQL 错误 → `ErrorResponse` + `ReadyForQuery`。
 - 事务状态：`BEGIN`/`START TRANSACTION` → `ReadyForQuery('T')`；语句失败 → `'E'`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝；`COMMIT`/`ROLLBACK` → `'I'`。
+- `COPY <table> [(cols)] FROM STDIN` → `CopyInResponse`（`G`）+ `CopyData`（`d`）行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；文本格式，`\N` 为 NULL，按列类型构造 `INSERT`（每 1024 行一批）。
+- `COPY <table> [(cols)] TO STDOUT` → `CopyOutResponse`（`H`）+ `CopyData` 行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`。
+- 二进制结果：扩展查询 `Bind` 的 result format code（0/1，或每列一个）；`RowDescription` 的每列 format code 与 `DataRow` 编码一致（`int8` 8 字节 BE、`bool` 1 字节、`text` UTF-8）。
 
 ## 4. 类型与命令标签
 
@@ -53,9 +56,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')；`Describe('S')` 返回 `ParameterDescription` + `RowDescription(id, name)`，非 SELECT 返回 `NoData`；4 个并发连接同时查询；密码认证接受/拒绝、trust 不发密码请求、`SSLRequest` 在无 TLS 时回 `N`；自签证书下 TLS 握手 + 查询、`--require-tls` 拒绝明文；MD5 与 SCRAM 各自接受正确密码、拒绝错误密码；mTLS 接受 CA 签发的客户端证书、拒绝无证书客户端；证书文件替换后新连接使用新证书；cleartext 密码在明文连接下默认拒绝（需 `--allow-plaintext-password`）；SCRAM verifier 文件往返 + 登录、错误密码拒绝；吊销列表命中时客户端证书被拒。
+端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')；`Describe('S')` 返回 `ParameterDescription` + `RowDescription(id, name)`，非 SELECT 返回 `NoData`；4 个并发连接同时查询；密码认证接受/拒绝、trust 不发密码请求、`SSLRequest` 在无 TLS 时回 `N`；自签证书下 TLS 握手 + 查询、`--require-tls` 拒绝明文；MD5 与 SCRAM 各自接受正确密码、拒绝错误密码；mTLS 接受 CA 签发的客户端证书、拒绝无证书客户端；证书文件替换后新连接使用新证书；cleartext 密码在明文连接下默认拒绝（需 `--allow-plaintext-password`）；SCRAM verifier 文件往返 + 登录、错误密码拒绝；吊销列表命中时客户端证书被拒；COPY FROM STDIN 插入两行（含 `\N`）后可查询、COPY TO STDOUT 输出文本行与 `\N`；扩展查询二进制结果（int8/bool/text 的字节编码与 RowDescription format code）、简单查询仍为文本。
 
 ## 6. 还没做
 
-- **COPY / binary format**：只有文本结果与 simple/extended query；
+- **COPY CSV / 二进制格式**：COPY 只支持文本格式；参数只支持文本；
 - **完整 CRL/OCSP**：吊销只支持 SHA-256 指纹列表，不做 CRL 签名验证或 OCSP 在线查询；

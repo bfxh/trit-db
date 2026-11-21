@@ -21,7 +21,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use md5::{Digest as _, Md5};
 
-use tritdb_exec::Value;
+use tritdb_exec::{DataType, Value};
 use tritdb_sql::{parse_script, QueryResult, SqlEngine, Statement};
 
 const PROTOCOL_V3: i32 = 196_608;
@@ -923,6 +923,292 @@ fn transaction_command(sql: &str) -> Option<TxCommand> {
     }
 }
 
+enum CopyDirection {
+    In,
+    Out,
+}
+
+struct CopyPlan {
+    table: String,
+    columns: Option<Vec<String>>,
+    direction: CopyDirection,
+}
+
+/// Recognises `COPY <table> [(<cols>)] FROM STDIN` / `TO STDOUT`.
+fn parse_copy(sql: &str) -> Option<CopyPlan> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.len() < 5 || !trimmed[..4].eq_ignore_ascii_case("copy") {
+        return None;
+    }
+    let rest = trimmed[4..].trim_start();
+    let upper = rest.to_ascii_uppercase();
+    let (head, direction) = if let Some(at) = upper.rfind(" FROM STDIN") {
+        (&rest[..at], CopyDirection::In)
+    } else {
+        let at = upper.rfind(" TO STDOUT")?;
+        (&rest[..at], CopyDirection::Out)
+    };
+    let head = head.trim();
+    let (table, columns) = match head.find('(') {
+        Some(open) => {
+            let close = head.rfind(')')?;
+            let table = head[..open].trim().trim_matches('"').to_ascii_lowercase();
+            let columns: Vec<String> = head[open + 1..close]
+                .split(',')
+                .map(|column| column.trim().trim_matches('"').to_ascii_lowercase())
+                .filter(|column| !column.is_empty())
+                .collect();
+            (table, Some(columns))
+        }
+        None => (head.trim().trim_matches('"').to_ascii_lowercase(), None),
+    };
+    if table.is_empty() {
+        return None;
+    }
+    Some(CopyPlan {
+        table,
+        columns,
+        direction,
+    })
+}
+
+fn copy_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Unescapes one COPY text-format value (`\\`, `\t`, `\n`, `\r`).
+fn copy_unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn copy_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Builds a SQL literal for one COPY value, using the target column's type.
+fn copy_literal(value: &str, data_type: DataType) -> String {
+    if value == "\\N" {
+        return "NULL".to_string();
+    }
+    let value = copy_unescape(value);
+    match data_type {
+        DataType::Int | DataType::Lukasiewicz | DataType::Nat => {
+            if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+                value
+            } else {
+                copy_quote(&value)
+            }
+        }
+        DataType::Bool | DataType::Logic | DataType::Belnap => {
+            let lowered = value.to_ascii_lowercase();
+            match lowered.as_str() {
+                "t" | "true" => "TRUE".to_string(),
+                "f" | "false" => "FALSE".to_string(),
+                "both" | "neither" => value.to_ascii_uppercase(),
+                _ => copy_quote(&value),
+            }
+        }
+        DataType::Text => copy_quote(&value),
+    }
+}
+
+fn copy_failed(stream: &mut dyn ReadWrite, message: &str) -> Result<bool, PgError> {
+    write_error(stream, message)?;
+    Ok(false)
+}
+
+fn handle_copy(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    plan: &CopyPlan,
+) -> Result<bool, PgError> {
+    let Some(schema) = engine.table_schema(&plan.table) else {
+        return copy_failed(stream, &format!("unknown table {}", plan.table));
+    };
+    let columns = match &plan.columns {
+        Some(columns) => columns.clone(),
+        None => schema.iter().map(|(name, _)| name.clone()).collect(),
+    };
+    let mut types = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let Some((_, data_type)) = schema.iter().find(|(name, _)| name == column) else {
+            return copy_failed(stream, &format!("unknown column {column}"));
+        };
+        types.push(*data_type);
+    }
+    match plan.direction {
+        CopyDirection::In => copy_in(stream, engine, &plan.table, &columns, &types),
+        CopyDirection::Out => copy_out(stream, engine, &plan.table, &columns),
+    }
+}
+
+fn copy_in(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    table: &str,
+    columns: &[String],
+    types: &[DataType],
+) -> Result<bool, PgError> {
+    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    payload.push(0); // text format
+    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for _ in columns {
+        payload.extend_from_slice(&0i16.to_be_bytes());
+    }
+    write_message(stream, b'G', &payload)?;
+
+    let mut inserted = 0usize;
+    let mut batch = String::new();
+    let mut batched = 0usize;
+    loop {
+        let Some((kind, payload)) = read_message(stream)? else {
+            return Err(PgError::Protocol(
+                "client disconnected during COPY".to_string(),
+            ));
+        };
+        match kind {
+            b'd' => {
+                let line = String::from_utf8_lossy(&payload);
+                let line = line.trim_end_matches(['\r', '\n']);
+                let values: Vec<&str> = line.split('\t').collect();
+                if values.len() != columns.len() {
+                    return copy_failed(
+                        stream,
+                        &format!(
+                            "COPY expected {} columns, got {}",
+                            columns.len(),
+                            values.len()
+                        ),
+                    );
+                }
+                if batched == 0 {
+                    batch.push_str(&format!(
+                        "INSERT INTO {table} ({}) VALUES ",
+                        columns.join(", ")
+                    ));
+                } else {
+                    batch.push(',');
+                }
+                batch.push('(');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        batch.push(',');
+                    }
+                    batch.push_str(&copy_literal(value, types[index]));
+                }
+                batch.push(')');
+                batched += 1;
+                if batched >= 1024 {
+                    batch.push(';');
+                    if let Err(error) = engine.execute_script(&batch) {
+                        return copy_failed(stream, &error.to_string());
+                    }
+                    inserted += batched;
+                    batch.clear();
+                    batched = 0;
+                }
+            }
+            b'c' => break,
+            b'f' => {
+                let message = String::from_utf8_lossy(&payload)
+                    .trim_end_matches('\0')
+                    .to_string();
+                return copy_failed(stream, &message);
+            }
+            other => {
+                return Err(PgError::Protocol(format!(
+                    "unexpected message {} during COPY",
+                    other as char
+                )));
+            }
+        }
+    }
+    if batched > 0 {
+        batch.push(';');
+        if let Err(error) = engine.execute_script(&batch) {
+            return copy_failed(stream, &error.to_string());
+        }
+        inserted += batched;
+    }
+    let tag = format!("COPY {inserted}\0");
+    write_message(stream, b'C', tag.as_bytes())?;
+    Ok(true)
+}
+
+fn copy_out(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    table: &str,
+    columns: &[String],
+) -> Result<bool, PgError> {
+    let sql = format!("SELECT {} FROM {table};", columns.join(", "));
+    let results = match engine.execute_script(&sql) {
+        Ok(results) => results,
+        Err(error) => return copy_failed(stream, &error.to_string()),
+    };
+    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    payload.push(0);
+    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for _ in columns {
+        payload.extend_from_slice(&0i16.to_be_bytes());
+    }
+    write_message(stream, b'H', &payload)?;
+    let mut sent = 0usize;
+    for result in results {
+        if let QueryResult::Rows { rows, .. } = result {
+            for row in rows {
+                let mut line = String::new();
+                for (index, value) in row.iter().enumerate() {
+                    if index > 0 {
+                        line.push('\t');
+                    }
+                    if value.is_null() {
+                        line.push_str("\\N");
+                    } else {
+                        line.push_str(&copy_escape(&value_text(value)));
+                    }
+                }
+                line.push('\n');
+                write_message(stream, b'd', line.as_bytes())?;
+                sent += 1;
+            }
+        }
+    }
+    write_message(stream, b'c', &[])?;
+    let tag = format!("COPY {sent}\0");
+    write_message(stream, b'C', tag.as_bytes())?;
+    Ok(true)
+}
+
 fn handle_query(
     stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
@@ -972,7 +1258,10 @@ fn handle_query(
         write_message(stream, b'Z', &[tx_status.byte()])?;
         return Ok(());
     }
-    let success = execute_and_write(stream, engine, sql)?;
+    let success = match parse_copy(sql) {
+        Some(plan) => handle_copy(stream, engine, &plan)?,
+        None => execute_and_write(stream, engine, sql, &[])?,
+    };
     if !success && *tx_status == TxStatus::InTransaction {
         *tx_status = TxStatus::Failed;
     }
@@ -984,6 +1273,7 @@ fn execute_and_write(
     stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
     sql: &str,
+    result_formats: &[i16],
 ) -> Result<bool, PgError> {
     match engine.execute_script(sql) {
         Ok(results) => {
@@ -991,9 +1281,9 @@ fn execute_and_write(
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let oids = column_oids(&rows, columns.len());
-                        write_row_description(stream, &columns, &oids)?;
+                        write_row_description(stream, &columns, &oids, result_formats)?;
                         for row in &rows {
-                            write_data_row(stream, row)?;
+                            write_data_row(stream, row, &oids, result_formats)?;
                         }
                         let tag = format!("SELECT {}\0", rows.len());
                         write_message(stream, b'C', tag.as_bytes())?;
@@ -1020,6 +1310,7 @@ struct Prepared {
 
 struct Bound {
     sql: String,
+    result_formats: Vec<i16>,
 }
 
 fn read_cstring(payload: &[u8], offset: usize) -> Result<(String, usize), PgError> {
@@ -1101,7 +1392,20 @@ fn bind_portal(
         }
     }
     let sql = substitute_params(&prepared.sql, &prepared.param_types, &params)?;
-    portals.insert(portal, Bound { sql });
+    let result_format_count = read_i16(payload, cursor)?;
+    cursor += 2;
+    let mut result_formats = Vec::with_capacity(result_format_count.max(0) as usize);
+    for _ in 0..result_format_count.max(0) {
+        result_formats.push(read_i16(payload, cursor)?);
+        cursor += 2;
+    }
+    portals.insert(
+        portal,
+        Bound {
+            sql,
+            result_formats,
+        },
+    );
     write_message(stream, b'2', &[])
 }
 
@@ -1128,13 +1432,13 @@ fn describe(
                 p.extend_from_slice(&oid.to_be_bytes());
             }
             write_message(stream, b't', &p)?;
-            describe_result(stream, engine, &prepared.sql, &prepared.param_types)?;
+            describe_result(stream, engine, &prepared.sql, &prepared.param_types, &[])?;
         }
         b'P' => {
             let bound = portals
                 .get(&name)
                 .ok_or_else(|| PgError::Protocol(format!("unknown portal {name:?}")))?;
-            describe_result(stream, engine, &bound.sql, &[])?;
+            describe_result(stream, engine, &bound.sql, &[], &bound.result_formats)?;
         }
         other => {
             return Err(PgError::Protocol(format!(
@@ -1153,9 +1457,10 @@ fn describe_result(
     engine: &mut SqlEngine,
     sql: &str,
     param_types: &[i32],
+    result_formats: &[i16],
 ) -> Result<(), PgError> {
     match describe_columns(engine, sql, param_types) {
-        Ok(Some(meta)) => write_row_description(stream, &meta.columns, &meta.oids),
+        Ok(Some(meta)) => write_row_description(stream, &meta.columns, &meta.oids, result_formats),
         Ok(None) => write_message(stream, b'n', &[]),
         Err(error) => write_error(stream, &error.to_string()),
     }
@@ -1236,7 +1541,7 @@ fn execute_portal(
         )?;
         return Ok(());
     }
-    let success = execute_and_write(stream, engine, &bound.sql)?;
+    let success = execute_and_write(stream, engine, &bound.sql, &bound.result_formats)?;
     if !success && *tx_status == TxStatus::InTransaction {
         *tx_status = TxStatus::Failed;
     }
@@ -1349,6 +1654,7 @@ fn write_row_description(
     stream: &mut dyn ReadWrite,
     columns: &[String],
     oids: &[i32],
+    formats: &[i16],
 ) -> Result<(), PgError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
@@ -1366,22 +1672,51 @@ fn write_row_description(
         payload.extend_from_slice(&oid.to_be_bytes());
         payload.extend_from_slice(&size.to_be_bytes());
         payload.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-        payload.extend_from_slice(&0i16.to_be_bytes()); // text format
+        payload.extend_from_slice(&format_for_column(formats, index).to_be_bytes());
     }
     write_message(stream, b'T', &payload)
 }
 
-fn write_data_row(stream: &mut dyn ReadWrite, row: &[Value]) -> Result<(), PgError> {
+/// PostgreSQL result format rule: zero codes means text, one code applies to
+/// every column, otherwise each column has its own code.
+fn format_for_column(formats: &[i16], index: usize) -> i16 {
+    match formats.len() {
+        0 => 0,
+        1 => formats[0],
+        _ => formats.get(index).copied().unwrap_or(0),
+    }
+}
+
+fn value_binary(value: &Value, oid: i32) -> Vec<u8> {
+    match (oid, value) {
+        (20, Value::Int(number)) => number.to_be_bytes().to_vec(),
+        (16, Value::Bool(flag)) => vec![u8::from(*flag)],
+        _ => value_text(value).into_bytes(),
+    }
+}
+
+fn write_data_row(
+    stream: &mut dyn ReadWrite,
+    row: &[Value],
+    oids: &[i32],
+    formats: &[i16],
+) -> Result<(), PgError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(row.len() as i16).to_be_bytes());
-    for value in row {
+    for (index, value) in row.iter().enumerate() {
         if value.is_null() {
             payload.extend_from_slice(&(-1i32).to_be_bytes());
             continue;
         }
-        let text = value_text(value);
-        payload.extend_from_slice(&(text.len() as i32).to_be_bytes());
-        payload.extend_from_slice(text.as_bytes());
+        if format_for_column(formats, index) == 1 {
+            let bytes = value_binary(value, oids.get(index).copied().unwrap_or(25));
+            payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            payload.extend_from_slice(&bytes);
+        } else {
+            let text = value_text(value);
+            payload.extend_from_slice(&(text.len() as i32).to_be_bytes());
+            payload.extend_from_slice(text.as_bytes());
+        }
     }
     write_message(stream, b'D', &payload)
 }

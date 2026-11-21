@@ -357,6 +357,7 @@ fn extended_query_substitutes_typed_parameters() {
         payload.extend_from_slice(&(value.len() as i32).to_be_bytes());
         payload.extend_from_slice(value.as_bytes());
     }
+    payload.extend_from_slice(&0i16.to_be_bytes()); // result format count
     write_message(&mut stream, b'B', &payload);
     let mut execute = b"portal\0".to_vec();
     execute.extend_from_slice(&0i32.to_be_bytes()); // max rows (ignored)
@@ -1179,5 +1180,220 @@ fn revoked_client_certificate_is_rejected() {
     assert!(
         tls_select_one(addr, client).is_err(),
         "a revoked client certificate must be rejected"
+    );
+}
+
+fn parse_format_codes(payload: &[u8]) -> Vec<i16> {
+    let count = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let mut cursor = 2;
+    let mut codes = Vec::new();
+    for _ in 0..count {
+        let end = payload[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("field name terminator")
+            + cursor;
+        // name, table oid (4), attribute number (2), type oid (4), size (2),
+        // type modifier (4), format code (2).
+        let at = end + 1 + 4 + 2 + 4 + 2 + 4;
+        codes.push(i16::from_be_bytes([payload[at], payload[at + 1]]));
+        cursor = at + 2;
+    }
+    codes
+}
+
+fn parse_binary_row(payload: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let count = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let mut cursor = 2;
+    let mut values = Vec::new();
+    for _ in 0..count {
+        let length = i32::from_be_bytes([
+            payload[cursor],
+            payload[cursor + 1],
+            payload[cursor + 2],
+            payload[cursor + 3],
+        ]);
+        cursor += 4;
+        if length < 0 {
+            values.push(None);
+        } else {
+            let length = length as usize;
+            values.push(Some(payload[cursor..cursor + length].to_vec()));
+            cursor += length;
+        }
+    }
+    values
+}
+
+#[test]
+fn copy_from_stdin_inserts_rows() {
+    let (_dir, mut stream) = start_server("pgproto-copy-in");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT, flag BOOL);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "COPY t FROM STDIN;");
+    let (kind, payload) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    assert_eq!(payload[0], 0, "COPY text format");
+    assert_eq!(i16::from_be_bytes([payload[1], payload[2]]), 3);
+
+    write_message(&mut stream, b'd', b"1\talpha\tt\n");
+    write_message(&mut stream, b'd', b"2\t\\N\tf\n");
+    write_message(&mut stream, b'c', b"");
+
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        messages
+            .iter()
+            .any(|(kind, payload)| *kind == b'C' && payload.starts_with(b"COPY 2")),
+        "missing COPY 2 tag: {messages:?}"
+    );
+    assert_eq!(ready_status(&messages), Some(b'I'));
+
+    query(&mut stream, "SELECT id, name, flag FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alpha".into()), Some("t".into())],
+            vec![Some("2".into()), None, Some("f".into())],
+        ]
+    );
+}
+
+#[test]
+fn copy_to_stdout_emits_text_rows() {
+    let (_dir, mut stream) = start_server("pgproto-copy-out");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT); \
+         INSERT INTO t VALUES (1, 'a'), (2, NULL);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "COPY t TO STDOUT;");
+    let (kind, payload) = read_message(&mut stream).expect("CopyOutResponse");
+    assert_eq!(kind, b'H');
+    assert_eq!(i16::from_be_bytes([payload[1], payload[2]]), 2);
+
+    let mut lines = Vec::new();
+    loop {
+        let (kind, payload) = read_message(&mut stream).expect("copy message");
+        match kind {
+            b'd' => lines.push(String::from_utf8_lossy(&payload).to_string()),
+            b'c' => break,
+            other => panic!("unexpected message {} during COPY OUT", other as char),
+        }
+    }
+    assert_eq!(lines, vec!["1\ta\n".to_string(), "2\t\\N\n".to_string()]);
+
+    let messages = read_until_ready(&mut stream);
+    assert!(messages
+        .iter()
+        .any(|(kind, payload)| *kind == b'C' && payload.starts_with(b"COPY 2")));
+    assert_eq!(ready_status(&messages), Some(b'I'));
+}
+
+#[test]
+fn extended_query_returns_binary_columns() {
+    let (_dir, mut stream) = start_server("pgproto-binary");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, flag BOOL, name TEXT); \
+         INSERT INTO t VALUES (7, TRUE, 'x');",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    // Parse: SELECT id, flag, name FROM t
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"stmt\0");
+    payload.extend_from_slice(b"SELECT id, flag, name FROM t;\0");
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    write_message(&mut stream, b'P', &payload);
+
+    // Bind with one result format code: 1 = binary.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"portal\0stmt\0");
+    payload.extend_from_slice(&0i16.to_be_bytes()); // parameter format count
+    payload.extend_from_slice(&0i16.to_be_bytes()); // parameter count
+    payload.extend_from_slice(&1i16.to_be_bytes()); // result format count
+    payload.extend_from_slice(&1i16.to_be_bytes()); // binary
+    write_message(&mut stream, b'B', &payload);
+    write_message(&mut stream, b'S', b"");
+    let _ = read_until_ready(&mut stream);
+
+    // Describe portal: the RowDescription must advertise binary columns.
+    let mut payload = b"P".to_vec();
+    payload.extend_from_slice(b"portal\0");
+    write_message(&mut stream, b'D', &payload);
+    write_message(&mut stream, b'S', b"");
+    let messages = read_until_ready(&mut stream);
+    let description = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'T')
+        .map(|(_, payload)| payload.clone())
+        .expect("RowDescription");
+    assert_eq!(parse_format_codes(&description), vec![1, 1, 1]);
+
+    // Execute: int8 is 8 big-endian bytes, bool is one byte, text is UTF-8.
+    let mut payload = b"portal\0".to_vec();
+    payload.extend_from_slice(&0i32.to_be_bytes());
+    write_message(&mut stream, b'E', &payload);
+    write_message(&mut stream, b'S', b"");
+    let messages = read_until_ready(&mut stream);
+    let data = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| payload.clone())
+        .expect("DataRow");
+    assert_eq!(
+        parse_binary_row(&data),
+        vec![
+            Some(7i64.to_be_bytes().to_vec()),
+            Some(vec![1u8]),
+            Some(b"x".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn simple_query_stays_text_format() {
+    let (_dir, mut stream) = start_server("pgproto-text");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT 1, TRUE, 'x';");
+    let messages = read_until_ready(&mut stream);
+    let description = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'T')
+        .map(|(_, payload)| payload.clone())
+        .expect("RowDescription");
+    assert_eq!(parse_format_codes(&description), vec![0, 0, 0]);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(
+        row,
+        vec![Some("1".into()), Some("t".into()), Some("x".into())]
     );
 }
