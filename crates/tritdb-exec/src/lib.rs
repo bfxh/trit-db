@@ -341,6 +341,15 @@ pub enum Expr {
         /// `true` for `IS NOT NULL`.
         negated: bool,
     },
+    /// `truth(expr [, threshold])`: projection to `TRUE`/`FALSE`/`UNKNOWN`
+    /// text. Łukasiewicz values compare their thousandths against the
+    /// threshold (default `500`), ℕ counts against the default `1`.
+    Truth {
+        /// Input annotation.
+        expr: Box<Expr>,
+        /// Optional `Int` threshold.
+        threshold: Option<Box<Expr>>,
+    },
     /// `expr IS [NOT] TRUE|FALSE|UNKNOWN`.
     IsTruth {
         /// Input expression.
@@ -533,6 +542,60 @@ pub fn truth_of(value: &Value) -> Result<TruthValue, ExecError> {
     }
 }
 
+/// Projects any annotation to three-valued truth for `truth(...)`.
+///
+/// `threshold` is only meaningful for Łukasiewicz (thousandths) and ℕ
+/// (count); K3/Belnap ignore it.
+pub fn truth_projection(value: &Value, threshold: Option<&Value>) -> Result<TruthValue, ExecError> {
+    match value {
+        Value::Lukasiewicz(milli) => {
+            let limit = match threshold {
+                Some(Value::Int(raw)) => (*raw).clamp(0, 1000) as u16,
+                Some(Value::Lukasiewicz(items)) => *items,
+                Some(other) => {
+                    return Err(ExecError::TypeMismatch {
+                        expected: "INT",
+                        actual: other.type_name(),
+                    })
+                }
+                None => 500,
+            };
+            Ok(if *milli >= limit {
+                TruthValue::True
+            } else {
+                TruthValue::False
+            })
+        }
+        Value::Nat(count) => {
+            let limit = match threshold {
+                Some(Value::Int(raw)) => (*raw).max(0) as u64,
+                Some(Value::Nat(raw)) => *raw,
+                Some(other) => {
+                    return Err(ExecError::TypeMismatch {
+                        expected: "INT",
+                        actual: other.type_name(),
+                    })
+                }
+                None => 1,
+            };
+            Ok(if *count >= limit {
+                TruthValue::True
+            } else {
+                TruthValue::False
+            })
+        }
+        _ => truth_of(value),
+    }
+}
+
+pub fn truth_text(truth: TruthValue) -> &'static str {
+    match truth {
+        TruthValue::True => "TRUE",
+        TruthValue::False => "FALSE",
+        TruthValue::Unknown => "UNKNOWN",
+    }
+}
+
 /// Compares two values. `NULL` yields `None`; mixed non-null types are an
 /// error rather than an implicit cast.
 pub fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, ExecError> {
@@ -639,6 +702,15 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
             let value = eval(expr, schema, row)?;
             let is_null = value.is_null();
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
+        Expr::Truth { expr, threshold } => {
+            let value = eval(expr, schema, row)?;
+            let threshold = match threshold {
+                Some(threshold) => Some(eval(threshold, schema, row)?),
+                None => None,
+            };
+            let truth = truth_projection(&value, threshold.as_ref())?;
+            Ok(Value::Text(truth_text(truth).to_string()))
         }
         Expr::IsTruth {
             expr,

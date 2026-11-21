@@ -1112,8 +1112,9 @@ impl Parser {
                 if name.eq_ignore_ascii_case("neither") {
                     return Ok(Expr::Literal(Value::Logic(tritdb_exec::ann::B4::Neither)));
                 }
-                // `truth(x)` is sugar for a three-valued projection:
-                // NULL -> UNKNOWN, TRUE -> TRUE, FALSE -> FALSE.
+                // `truth(x [, threshold])` projects an annotation to
+                // TRUE / FALSE / UNKNOWN. K3/Belnap use the truth tables;
+                // Łukasiewicz and ℕ compare against a threshold.
                 if name.eq_ignore_ascii_case("truth")
                     && self
                         .peek()
@@ -1121,21 +1122,15 @@ impl Parser {
                 {
                     self.bump(); // (
                     let inner = self.parse_expr()?;
-                    self.expect_symbol(Symbol::RParen)?;
-                    let null_check = Expr::IsNull {
-                        expr: Box::new(inner.clone()),
-                        negated: false,
+                    let threshold = if self.eat_symbol(Symbol::Comma) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
                     };
-                    return Ok(Expr::Case {
-                        operand: None,
-                        branches: vec![
-                            (
-                                null_check,
-                                Expr::Literal(Value::Text("UNKNOWN".to_string())),
-                            ),
-                            (inner, Expr::Literal(Value::Text("TRUE".to_string()))),
-                        ],
-                        else_expr: Some(Box::new(Expr::Literal(Value::Text("FALSE".to_string())))),
+                    self.expect_symbol(Symbol::RParen)?;
+                    return Ok(Expr::Truth {
+                        expr: Box::new(inner),
+                        threshold,
                     });
                 }
                 if let Some(function) = window_function(&name) {

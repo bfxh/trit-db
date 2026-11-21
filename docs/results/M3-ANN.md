@@ -1,6 +1,6 @@
 # M3 第一刀：四域注解、COUNT MODELS、UNDER REPAIR
 
-状态：语义核心与 CLI 已实现；SQL 语法接线、注解列存储、CQA 优化未做
+状态：语义核心、CLI、SQL 接线（`count_models` / `UNDER REPAIR ON` / `LOGIC` 列 / `truth()`）已实现；第二刀补上 t-norm 家族、truth 阈值投影与单元传播；增量 MCS 枚举未做
 
 日期：2026-11-21
 
@@ -57,20 +57,23 @@ SELECT id FROM reading WHERE status IS UNKNOWN;
 | Łukasiewicz | `[0,1]`，neg `1-x`，meet `min`，join `max` |
 | ℕ | 计数半环：meet 乘法、join 加法、无 neg |
 
-- `count_models`：变量 ≤ 32，DPLL 精确计数（部分求值 + 短路 + 自由变量一次乘回），超限 `TooManyVars`；
-- `under_repair`：总事实 ≤ 64；按 denial 连通分量分解，每个分量 ≤ 16；修复 = 最大一致子集，返回 `Certain / Impossible / Contingent`。
+- `count_models`：变量 ≤ 32，组件分解 + BDD 默认，DPLL 保留为对拍；超限 `TooManyVars`；
+- `under_repair`：总事实 ≤ 64；按 denial 连通分量分解，**单元传播**把单元素 denial 的事实先钉掉，枚举只在存活事实上展开（单分量上限 16 指存活事实），返回 `Certain / Impossible / Contingent`；
+- `TNorm`：Gödel / Łukasiewicz / Product 的 t-norm、t-conorm 与残差蕴涵，`Annotation::meet_with` / `join_with` / `implication_with` 可选家族（默认 Gödel）；
+- `truth(x [, threshold])`：K3/Belnap 走三值投影，Ł 按千分位与阈值（默认 0.5）比较，ℕ 与阈值（默认 1）比较。
 
 ## 5. 验收
 
 ```bash
-cargo test -p tritdb-exec ann          # 5 passed
-cargo test -p tritdb --test ann_cli    # 2 passed
+cargo test -p tritdb-exec ann          # 20 passed（含 t-norm 与单元传播）
+cargo test -p tritdb --test ann_cli    # 6 passed
+cargo test -p tritdb --test sql_cli truth_  # 2 passed
 ```
 
 ## 6. 还没做
 
 - SQL 支持 `UNDER REPAIR ON (a, b, ...)` 多列函数依赖；列级/表级 `UNIQUE` 与 `CHECK` 在 `INSERT` / `UPDATE` 时生效（CHECK 的 `UNKNOWN` 通过）；Ł/ℕ 的 `SUM/AVG/MIN/MAX` 已支持；
-- Ł / ℕ 的 `truth()` 投影（这两类不是布尔，`truth()` 会拒绝）；`PROB_SUM` 已提供；
+- `truth()` 已支持 Ł/ℕ 的阈值投影（第二参数为 `Int`：Ł 用千分位、ℕ 用计数）；`PROB_SUM` 已提供；
 - `count_models` 默认走组件分解 + BDD（独立合取项相乘、自由变量乘 `2^k`）；DPLL 保留为对拍 oracle；
-- `under_repair` 的增量修复与更优的 MCS 枚举仍未做；
-- 概率/模糊聚合与 `Łukasiewicz` 的更多 t-norm。
+- `under_repair` 的增量修复与更优的 MCS 枚举仍未做（单元传播只是剪枝，不是增量）；
+- 概率/模糊聚合的标量函数（`PROB_AND` / `PROB_OR`）与 `PROB_SUM` 之外的聚合；t-norm 家族目前只在库层。

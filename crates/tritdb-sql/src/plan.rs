@@ -71,6 +71,10 @@ pub(crate) enum PlanExpr {
         expected: TruthValue,
         negated: bool,
     },
+    Truth {
+        expr: Box<PlanExpr>,
+        threshold: Option<Box<PlanExpr>>,
+    },
     Not(Box<PlanExpr>),
     InList {
         expr: Box<PlanExpr>,
@@ -528,6 +532,13 @@ impl PlanExpr {
                 expected: *expected,
                 negated: *negated,
             }),
+            ExecExpr::Truth { expr, threshold } => Ok(Self::Truth {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                threshold: match threshold {
+                    Some(threshold) => Some(Box::new(Self::from_exec(threshold, schema)?)),
+                    None => None,
+                },
+            }),
             ExecExpr::Not(expr) => Ok(Self::Not(Box::new(Self::from_exec(expr, schema)?))),
             ExecExpr::InList {
                 expr,
@@ -610,6 +621,13 @@ impl PlanExpr {
             GroupExpr::IsNull { expr, negated } => Ok(Self::IsNull {
                 expr: Box::new(Self::from_group_expr(expr, schema)?),
                 negated: *negated,
+            }),
+            GroupExpr::Truth { expr, threshold } => Ok(Self::Truth {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                threshold: match threshold {
+                    Some(threshold) => Some(Box::new(Self::from_group_expr(threshold, schema)?)),
+                    None => None,
+                },
             }),
             GroupExpr::IsTruth {
                 expr,
@@ -723,6 +741,15 @@ impl PlanExpr {
                 expr.write_sexpr(out);
                 out.push(' ');
                 out.push_str(truth_name(*expected));
+                out.push(')');
+            }
+            Self::Truth { expr, threshold } => {
+                out.push_str("(truth ");
+                expr.write_sexpr(out);
+                if let Some(threshold) = threshold {
+                    out.push(' ');
+                    threshold.write_sexpr(out);
+                }
                 out.push(')');
             }
             Self::Not(expr) => {

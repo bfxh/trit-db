@@ -185,6 +185,111 @@ impl Annotation {
             _ => Err(AnnError::DomainMismatch),
         }
     }
+
+    /// Conjunction under an explicit t-norm family.
+    ///
+    /// Only Łukasiewicz annotations use the family; K3 and Belnap keep their
+    /// truth tables and ℕ its multiplication.
+    pub fn meet_with(self, other: Self, family: TNorm) -> Result<Self, AnnError> {
+        match (self, other) {
+            (Annotation::Lukasiewicz(left), Annotation::Lukasiewicz(right)) => {
+                Ok(Annotation::Lukasiewicz(family.meet(left, right)))
+            }
+            _ => self.meet(other),
+        }
+    }
+
+    /// Disjunction under an explicit t-conorm family.
+    pub fn join_with(self, other: Self, family: TNorm) -> Result<Self, AnnError> {
+        match (self, other) {
+            (Annotation::Lukasiewicz(left), Annotation::Lukasiewicz(right)) => {
+                Ok(Annotation::Lukasiewicz(family.join(left, right)))
+            }
+            _ => self.join(other),
+        }
+    }
+
+    /// Material implication.
+    ///
+    /// K3 / Belnap use `¬a ∨ b`; Łukasiewicz uses the residuum of `family`;
+    /// ℕ has no implication in the counting semiring.
+    pub fn implication_with(self, other: Self, family: TNorm) -> Result<Self, AnnError> {
+        match (self, other) {
+            (Annotation::Lukasiewicz(left), Annotation::Lukasiewicz(right)) => {
+                Ok(Annotation::Lukasiewicz(family.residuum(left, right)))
+            }
+            (Annotation::Nat(_), _) | (_, Annotation::Nat(_)) => {
+                Err(AnnError::NegationUndefined("Nat"))
+            }
+            _ => self.neg()?.join(other),
+        }
+    }
+}
+
+/// A triangular norm family over `[0, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TNorm {
+    /// Gödel: meet `min`, conorm `max` (the default used by [`Annotation`]).
+    Godel,
+    /// Łukasiewicz: meet `max(0, a + b - 1)`, conorm `min(1, a + b)`.
+    Lukasiewicz,
+    /// Product (Goguen): meet `a * b`, conorm `a + b - a * b`.
+    Product,
+}
+
+impl TNorm {
+    /// Every family, in a stable order.
+    pub const ALL: [TNorm; 3] = [TNorm::Godel, TNorm::Lukasiewicz, TNorm::Product];
+
+    /// Name used by CLI output and errors.
+    pub const fn name(self) -> &'static str {
+        match self {
+            TNorm::Godel => "godel",
+            TNorm::Lukasiewicz => "lukasiewicz",
+            TNorm::Product => "product",
+        }
+    }
+
+    /// Resolves a family from its name (`godel` / `lukasiewicz` / `product`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "godel" | "gödel" | "min" => Some(TNorm::Godel),
+            "lukasiewicz" | "luk" => Some(TNorm::Lukasiewicz),
+            "product" | "prob" => Some(TNorm::Product),
+            _ => None,
+        }
+    }
+
+    /// Conjunction over `[0, 1]`.
+    pub fn meet(self, left: f64, right: f64) -> f64 {
+        match self {
+            TNorm::Godel => left.min(right),
+            TNorm::Lukasiewicz => (left + right - 1.0).max(0.0),
+            TNorm::Product => left * right,
+        }
+    }
+
+    /// Disjunction over `[0, 1]`.
+    pub fn join(self, left: f64, right: f64) -> f64 {
+        match self {
+            TNorm::Godel => left.max(right),
+            TNorm::Lukasiewicz => (left + right).min(1.0),
+            TNorm::Product => left + right - left * right,
+        }
+    }
+
+    /// Residuum `a → b = sup { z : meet(a, z) ≤ b }`.
+    pub fn residuum(self, left: f64, right: f64) -> f64 {
+        if left <= right {
+            1.0
+        } else {
+            match self {
+                TNorm::Godel => right,
+                TNorm::Lukasiewicz => 1.0 - left + right,
+                TNorm::Product => right / left,
+            }
+        }
+    }
 }
 
 /// Errors from annotation evaluation and counting.
@@ -434,6 +539,12 @@ pub fn under_repair(
             });
         }
     }
+    // An empty denial cannot be satisfied, so no repair exists. Checked before
+    // decomposition: such a denial has no anchor fact and would be dropped
+    // when denials are assigned to components.
+    if denials.iter().any(|denial| denial.is_empty()) {
+        return Ok(RepairAnswer::Impossible);
+    }
 
     // Denials only connect facts inside one component. Answers compose
     // independently, so each component is enumerated on its own.
@@ -485,9 +596,40 @@ fn component_answer(
             max: MAX_COMPONENT_FACTS,
         });
     }
+    // Unit propagation: a one-fact denial pins that fact out of every repair,
+    // so it must fail the query no matter what. An empty denial can never be
+    // satisfied, which leaves no repair at all.
+    let mut forced: u64 = 0;
+    for denial in denials {
+        match denial.len() {
+            0 => return Ok(RepairAnswer::Impossible),
+            1 => forced |= 1 << denial[0],
+            _ => {}
+        }
+    }
+    if query.iter().any(|index| forced & (1 << index) != 0) {
+        return Ok(RepairAnswer::Impossible);
+    }
+    // Only the surviving facts are enumerated; forced removals drop out of
+    // the search space entirely.
+    let free: Vec<usize> = (0..facts)
+        .filter(|index| forced & (1 << index) == 0)
+        .collect();
+    if free.len() > MAX_COMPONENT_FACTS {
+        return Err(AnnError::TooManyFacts {
+            facts: free.len(),
+            max: MAX_COMPONENT_FACTS,
+        });
+    }
     let mut certain = true;
     let mut possible = false;
-    for mask in 0..(1u64 << facts) {
+    for combination in 0..(1u64 << free.len()) {
+        let mut mask = 0u64;
+        for (bit, &index) in free.iter().enumerate() {
+            if combination & (1 << bit) != 0 {
+                mask |= 1 << index;
+            }
+        }
         if !consistent(mask, denials) || !maximal(mask, facts, denials) {
             continue;
         }
@@ -1041,6 +1183,91 @@ mod tests {
     }
 
     #[test]
+    fn tnorm_families_agree_on_corners_and_differ_inside() {
+        for family in TNorm::ALL {
+            // Crisp corners are shared by every family.
+            assert_eq!(family.meet(1.0, 1.0), 1.0, "{}", family.name());
+            assert_eq!(family.meet(1.0, 0.0), 0.0, "{}", family.name());
+            assert_eq!(family.meet(0.0, 0.0), 0.0, "{}", family.name());
+            assert_eq!(family.join(0.0, 0.0), 0.0, "{}", family.name());
+            assert_eq!(family.join(1.0, 0.0), 1.0, "{}", family.name());
+            assert_eq!(family.join(1.0, 1.0), 1.0, "{}", family.name());
+        }
+
+        // 0.5 ∧ 0.5 separates the three families.
+        assert_eq!(TNorm::Godel.meet(0.5, 0.5), 0.5);
+        assert_eq!(TNorm::Lukasiewicz.meet(0.5, 0.5), 0.0);
+        assert_eq!(TNorm::Product.meet(0.5, 0.5), 0.25);
+        // 0.5 ∨ 0.5 likewise.
+        assert_eq!(TNorm::Godel.join(0.5, 0.5), 0.5);
+        assert_eq!(TNorm::Lukasiewicz.join(0.5, 0.5), 1.0);
+        assert_eq!(TNorm::Product.join(0.5, 0.5), 0.75);
+    }
+
+    #[test]
+    fn tnorm_residuum_satisfies_adjunction() {
+        for family in TNorm::ALL {
+            for left in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                for right in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let implication = family.residuum(left, right);
+                    // a → b is the largest z with a ∧ z ≤ b.
+                    assert!(
+                        family.meet(left, implication) <= right + 1e-12,
+                        "{}: {} ∧ {} > {}",
+                        family.name(),
+                        left,
+                        implication,
+                        right
+                    );
+                    // And it is maximal: anything above it breaks the bound.
+                    if implication < 1.0 {
+                        assert!(
+                            family.meet(left, (implication + 0.1).min(1.0)) > right + 1e-12,
+                            "{}: residuum not maximal for {} → {}",
+                            family.name(),
+                            left,
+                            right
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tnorm_with_dispatches_only_for_lukasiewicz() {
+        let product =
+            Annotation::Lukasiewicz(0.5).meet_with(Annotation::Lukasiewicz(0.5), TNorm::Product);
+        assert_eq!(product, Ok(Annotation::Lukasiewicz(0.25)));
+        // Default meet stays Gödel.
+        assert_eq!(
+            Annotation::Lukasiewicz(0.5)
+                .meet(Annotation::Lukasiewicz(0.5))
+                .unwrap(),
+            Annotation::Lukasiewicz(0.5)
+        );
+        // K3 keeps its truth table whatever the family.
+        assert_eq!(
+            Annotation::K3(TruthValue::Unknown)
+                .meet_with(Annotation::K3(TruthValue::False), TNorm::Product)
+                .unwrap(),
+            Annotation::K3(TruthValue::False)
+        );
+        // Nat has no implication.
+        assert_eq!(
+            Annotation::Nat(2).implication_with(Annotation::Nat(3), TNorm::Godel),
+            Err(AnnError::NegationUndefined("Nat"))
+        );
+        // K3 implication is material.
+        assert_eq!(
+            Annotation::K3(TruthValue::False)
+                .implication_with(Annotation::K3(TruthValue::Unknown), TNorm::Godel)
+                .unwrap(),
+            Annotation::K3(TruthValue::True)
+        );
+    }
+
+    #[test]
     fn annotation_operations_respect_domains() {
         let k3 = Annotation::K3(TruthValue::Unknown);
         assert_eq!(
@@ -1224,6 +1451,92 @@ mod tests {
         );
         assert_eq!(
             under_repair(20, &denials, &[0, 1]).unwrap(),
+            RepairAnswer::Impossible
+        );
+    }
+
+    /// Straight enumeration of every subset, kept as the oracle.
+    #[cfg(test)]
+    fn repair_answer_bruteforce(
+        facts: usize,
+        denials: &[Vec<usize>],
+        query: &[usize],
+    ) -> RepairAnswer {
+        let mut certain = true;
+        let mut possible = false;
+        for mask in 0..(1u64 << facts) {
+            if !consistent(mask, denials) || !maximal(mask, facts, denials) {
+                continue;
+            }
+            let holds = query.iter().all(|index| mask & (1 << index) != 0);
+            if holds {
+                possible = true;
+            } else {
+                certain = false;
+            }
+        }
+        if certain {
+            RepairAnswer::Certain
+        } else if possible {
+            RepairAnswer::Contingent
+        } else {
+            RepairAnswer::Impossible
+        }
+    }
+
+    #[test]
+    fn unit_propagation_matches_bruteforce() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..300 {
+            let facts = (next() % 6) as usize + 1;
+            let denial_count = (next() % 4) as usize;
+            let mut denials = Vec::new();
+            for _ in 0..denial_count {
+                let size = (next() % 3) as usize + 1;
+                let mut denial: Vec<usize> = (0..size).map(|_| (next() as usize) % facts).collect();
+                denial.sort_unstable();
+                denial.dedup();
+                denials.push(denial);
+            }
+            let query: Vec<usize> = (0..facts).filter(|_| next() % 2 == 0).collect();
+            let expected = repair_answer_bruteforce(facts, &denials, &query);
+            assert_eq!(
+                component_answer(facts, &denials, &query).unwrap(),
+                expected,
+                "facts={facts} denials={denials:?} query={query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_propagation_handles_oversized_components() {
+        // Eight facts are pinned out by one-fact denials; the remaining
+        // sixteen still fit the enumeration budget.
+        let mut denials: Vec<Vec<usize>> = (0..8).map(|index| vec![index]).collect();
+        let base = 8;
+        for offset in 0..15 {
+            denials.push(vec![base + offset, base + offset + 1]);
+        }
+        let answer = under_repair(24, &denials, &[9]).unwrap();
+        assert_eq!(answer, RepairAnswer::Contingent);
+        // The brute-force oracle cannot run at this size; the pinned facts
+        // must make the query impossible instead.
+        assert_eq!(
+            under_repair(24, &denials, &[0]).unwrap(),
+            RepairAnswer::Impossible
+        );
+    }
+
+    #[test]
+    fn empty_denial_leaves_no_repair() {
+        assert_eq!(
+            under_repair(2, &[vec![]], &[0]).unwrap(),
             RepairAnswer::Impossible
         );
     }

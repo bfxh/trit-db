@@ -212,6 +212,39 @@ fn logic_column_and_truth_projection() {
 }
 
 #[test]
+fn truth_projects_lukasiewicz_and_nat_with_thresholds() {
+    let dir = TempDir::new("sql-truth-threshold");
+    let db = dir.join("truth.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, p LOGIC LUKASIEWICZ, n LOGIC NAT); \
+         INSERT INTO t VALUES (1, 200, 0), (2, 600, 3), (3, NULL, NULL); \
+         SELECT id, truth(p) AS tp, truth(n) AS tn FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\tFALSE\tFALSE"), "out: {text}");
+    assert!(text.contains("2\tTRUE\tTRUE"), "out: {text}");
+    assert!(text.contains("3\tUNKNOWN\tUNKNOWN"), "out: {text}");
+
+    // An explicit threshold overrides the defaults (0.5 for Ł, 1 for ℕ).
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, truth(p, 700) AS tp, truth(n, 4) AS tn FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("2\tFALSE\tFALSE"), "out: {text}");
+}
+
+#[test]
 fn logic_column_is_unknown_filterable() {
     let dir = TempDir::new("sql-logic-unknown");
     let db = dir.join("logic.db");

@@ -5,8 +5,8 @@ use std::str;
 use std::time::Instant;
 
 use tritdb_exec::{
-    ann::B4, compare_values, eval, truth_of, BinaryOp, Column, DataType, ExecError,
-    Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
+    ann::B4, compare_values, eval, truth_of, truth_projection, truth_text, BinaryOp, Column,
+    DataType, ExecError, Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
 };
 use tritdb_txn::TxnStore;
 
@@ -161,6 +161,9 @@ fn expr_contains_window(expr: &Expr) -> bool {
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_contains_window(expr)
         }
+        Expr::Truth { expr, threshold } => {
+            expr_contains_window(expr) || threshold.as_deref().is_some_and(expr_contains_window)
+        }
         Expr::InList { expr, values, .. } => {
             expr_contains_window(expr) || values.iter().any(expr_contains_window)
         }
@@ -226,6 +229,12 @@ fn expr_has_outer_subquery(expr: &Expr, outer: &str) -> bool {
         Expr::Literal(_) | Expr::Column { .. } => false,
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_has_outer_subquery(expr, outer)
+        }
+        Expr::Truth { expr, threshold } => {
+            expr_has_outer_subquery(expr, outer)
+                || threshold
+                    .as_deref()
+                    .is_some_and(|threshold| expr_has_outer_subquery(threshold, outer))
         }
         Expr::InList { expr, values, .. } => {
             expr_has_outer_subquery(expr, outer)
@@ -340,6 +349,12 @@ fn expr_mentions_outer(expr: &Expr, outer: &str) -> bool {
         }
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_mentions_outer(expr, outer)
+        }
+        Expr::Truth { expr, threshold } => {
+            expr_mentions_outer(expr, outer)
+                || threshold
+                    .as_deref()
+                    .is_some_and(|threshold| expr_mentions_outer(threshold, outer))
         }
         Expr::InList { expr, values, .. } => {
             expr_mentions_outer(expr, outer)
@@ -1236,6 +1251,13 @@ impl SqlEngine {
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
                 self.materialize_expr(expr, outer)
             }
+            Expr::Truth { expr, threshold } => {
+                self.materialize_expr(expr, outer)?;
+                if let Some(threshold) = threshold {
+                    self.materialize_expr(threshold, outer)?;
+                }
+                Ok(())
+            }
             Expr::InList { expr, values, .. } => {
                 self.materialize_expr(expr, outer)?;
                 for value in values {
@@ -2004,6 +2026,13 @@ impl SqlEngine {
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
                 self.replace_having_subqueries(expr, table, group_by, groups, outer)
             }
+            Expr::Truth { expr, threshold } => {
+                self.replace_having_subqueries(expr, table, group_by, groups, outer)?;
+                if let Some(threshold) = threshold {
+                    self.replace_having_subqueries(threshold, table, group_by, groups, outer)?;
+                }
+                Ok(())
+            }
             Expr::InList { expr, values, .. } => {
                 self.replace_having_subqueries(expr, table, group_by, groups, outer)?;
                 for value in values {
@@ -2108,6 +2137,13 @@ impl SqlEngine {
             Expr::Literal(_) | Expr::Column { .. } => Ok(()),
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
                 self.bind_correlated_expr(expr, outer_schema, outer_row, outer)
+            }
+            Expr::Truth { expr, threshold } => {
+                self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
+                if let Some(threshold) = threshold {
+                    self.bind_correlated_expr(threshold, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
             }
             Expr::InList { expr, values, .. } => {
                 self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
@@ -2308,6 +2344,13 @@ impl SqlEngine {
             Expr::Literal(_) | Expr::Column { table: None, .. } => Ok(()),
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
                 self.substitute_outer_expr(expr, outer_schema, outer_row, outer)
+            }
+            Expr::Truth { expr, threshold } => {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+                if let Some(threshold) = threshold {
+                    self.substitute_outer_expr(threshold, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
             }
             Expr::InList { expr, values, .. } => {
                 self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
@@ -3127,6 +3170,12 @@ fn collect_plan_aggregates(
         GroupExpr::IsNull { expr, .. } | GroupExpr::IsTruth { expr, .. } => {
             collect_plan_aggregates(expr, schema, out)?;
         }
+        GroupExpr::Truth { expr, threshold } => {
+            collect_plan_aggregates(expr, schema, out)?;
+            if let Some(threshold) = threshold {
+                collect_plan_aggregates(threshold, schema, out)?;
+            }
+        }
         GroupExpr::Not(expr) => collect_plan_aggregates(expr, schema, out)?,
         GroupExpr::InList { expr, values, .. } => {
             collect_plan_aggregates(expr, schema, out)?;
@@ -3351,6 +3400,13 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_sources(expr, sources)
         }
+        Expr::Truth { expr, threshold } => {
+            let mut ok = expr_sources(expr, sources);
+            if let Some(threshold) = threshold {
+                ok &= expr_sources(threshold, sources);
+            }
+            ok
+        }
         Expr::InList { expr, values, .. } => {
             expr_sources(expr, sources) && values.iter().all(|value| expr_sources(value, sources))
         }
@@ -3430,6 +3486,13 @@ fn collect_expr_columns(
         }
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             collect_expr_columns(expr, qualifiers, source_columns, keep)
+        }
+        Expr::Truth { expr, threshold } => {
+            let mut ok = collect_expr_columns(expr, qualifiers, source_columns, keep);
+            if let Some(threshold) = threshold {
+                ok &= collect_expr_columns(threshold, qualifiers, source_columns, keep);
+            }
+            ok
         }
         Expr::InList { expr, values, .. } => {
             collect_expr_columns(expr, qualifiers, source_columns, keep)
@@ -3698,6 +3761,12 @@ fn fold_expr(expr: &Expr) -> Expr {
             expected: *expected,
             negated: *negated,
         }),
+        Expr::Truth { expr, threshold } => fold_constant(Expr::Truth {
+            expr: Box::new(fold_expr(expr)),
+            threshold: threshold
+                .as_ref()
+                .map(|threshold| Box::new(fold_expr(threshold))),
+        }),
         Expr::Not(expr) => fold_constant(Expr::Not(Box::new(fold_expr(expr)))),
         Expr::InList {
             expr,
@@ -3782,6 +3851,9 @@ fn expr_is_constant(expr: &Expr) -> bool {
         Expr::Column { .. } | Expr::Aggregate { .. } => false,
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_is_constant(expr)
+        }
+        Expr::Truth { expr, threshold } => {
+            expr_is_constant(expr) && threshold.as_deref().is_none_or(expr_is_constant)
         }
         Expr::InList { expr, values, .. } => {
             expr_is_constant(expr) && values.iter().all(expr_is_constant)
@@ -4939,6 +5011,15 @@ fn eval_group_expr(
             let truth = truth_of(&value)?;
             let matched = truth == *expected;
             Ok(Value::Bool(if *negated { !matched } else { matched }))
+        }
+        GroupExpr::Truth { expr, threshold } => {
+            let value = eval_group_expr(expr, schema, group)?;
+            let threshold = match threshold {
+                Some(threshold) => Some(eval_group_expr(threshold, schema, group)?),
+                None => None,
+            };
+            let truth = truth_projection(&value, threshold.as_ref())?;
+            Ok(Value::Text(truth_text(truth).to_string()))
         }
         GroupExpr::Not(expr) => {
             let value = eval_group_expr(expr, schema, group)?;

@@ -162,6 +162,18 @@ pub enum Expr {
         /// `true` for `NOT LIKE`.
         negated: bool,
     },
+    /// `truth(expr [, threshold])`: projects an annotation to
+    /// `TRUE` / `FALSE` / `UNKNOWN`.
+    ///
+    /// K3/Belnap map `Both`/`Neither` to `UNKNOWN`; Łukasiewicz compares the
+    /// thousandths value against a threshold (default `0.5`); ℕ compares the
+    /// count against a threshold (default `1`).
+    Truth {
+        /// Input annotation.
+        expr: Box<Expr>,
+        /// Optional `Int` threshold (thousandths for Ł, a count for ℕ).
+        threshold: Option<Box<Expr>>,
+    },
     /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`.
     Case {
         /// Simple-case operand; `None` for a searched case.
