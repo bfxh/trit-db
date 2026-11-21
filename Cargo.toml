@@ -14,6 +14,7 @@ members = [
     "crates/tritdb-testkit",
     "crates/tritdb-cas",
     "crates/tritdb-pgwire",
+    "crates/tritdb-tritvec",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ tritdb-sql = { path = "crates/tritdb-sql" }
 tritdb-testkit = { path = "crates/tritdb-testkit" }
 tritdb-cas = { path = "crates/tritdb-cas" }
 tritdb-pgwire = { path = "crates/tritdb-pgwire" }
+tritdb-tritvec = { path = "crates/tritdb-tritvec" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
