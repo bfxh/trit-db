@@ -9,6 +9,7 @@
 //! Connections are handled one at a time; each connection opens its own
 //! [`SqlEngine`] over the same database path.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -89,6 +90,8 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
     write_message(&mut stream, b'Z', b"I")?;
 
     let mut engine = SqlEngine::open(db).map_err(|error| PgError::Sql(error.to_string()))?;
+    let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
+    let mut portals: BTreeMap<String, Bound> = BTreeMap::new();
 
     loop {
         let Some((kind, payload)) = read_message(&mut stream)? else {
@@ -103,13 +106,12 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
             }
             b'S' => write_message(&mut stream, b'Z', b"I")?,
             b'X' => return Ok(()),
-            b'P' | b'B' | b'D' | b'E' | b'C' => {
-                write_error(
-                    &mut stream,
-                    "extended query protocol is not supported; use simple queries",
-                )?;
-                write_message(&mut stream, b'Z', b"I")?;
-            }
+            b'P' => parse_prepared(&mut stream, &mut prepared, &payload)?,
+            b'B' => bind_portal(&mut stream, &prepared, &mut portals, &payload)?,
+            b'D' => describe(&mut stream, &prepared, &portals, &payload)?,
+            b'E' => execute_portal(&mut stream, &mut engine, &portals, &payload)?,
+            b'C' => close_portal(&mut stream, &mut prepared, &mut portals, &payload)?,
+            b'H' => {}
             other => {
                 write_error(
                     &mut stream,
@@ -188,9 +190,18 @@ fn write_parameter(stream: &mut TcpStream, key: &str, value: &str) -> Result<(),
 fn handle_query(stream: &mut TcpStream, engine: &mut SqlEngine, sql: &str) -> Result<(), PgError> {
     if sql.trim().is_empty() {
         write_message(stream, b'I', &[])?;
-        write_message(stream, b'Z', b"I")?;
-        return Ok(());
+    } else {
+        execute_and_write(stream, engine, sql)?;
     }
+    write_message(stream, b'Z', b"I")?;
+    Ok(())
+}
+
+fn execute_and_write(
+    stream: &mut TcpStream,
+    engine: &mut SqlEngine,
+    sql: &str,
+) -> Result<(), PgError> {
     match engine.execute_script(sql) {
         Ok(results) => {
             for result in results {
@@ -209,13 +220,259 @@ fn handle_query(stream: &mut TcpStream, engine: &mut SqlEngine, sql: &str) -> Re
                     }
                 }
             }
-            write_message(stream, b'Z', b"I")?;
             Ok(())
         }
         Err(error) => {
             write_error(stream, &error.to_string())?;
-            write_message(stream, b'Z', b"I")?;
             Ok(())
+        }
+    }
+}
+
+struct Prepared {
+    sql: String,
+    param_types: Vec<i32>,
+}
+
+struct Bound {
+    sql: String,
+}
+
+fn read_cstring(payload: &[u8], offset: usize) -> Result<(String, usize), PgError> {
+    let end = payload[offset..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| PgError::Protocol("unterminated string".to_string()))?
+        + offset;
+    Ok((
+        String::from_utf8_lossy(&payload[offset..end]).to_string(),
+        end + 1,
+    ))
+}
+
+fn read_i16(payload: &[u8], offset: usize) -> Result<i16, PgError> {
+    let bytes: [u8; 2] = payload
+        .get(offset..offset + 2)
+        .ok_or_else(|| PgError::Protocol("truncated int16".to_string()))?
+        .try_into()
+        .map_err(|_| PgError::Protocol("truncated int16".to_string()))?;
+    Ok(i16::from_be_bytes(bytes))
+}
+
+fn read_i32(payload: &[u8], offset: usize) -> Result<i32, PgError> {
+    let bytes: [u8; 4] = payload
+        .get(offset..offset + 4)
+        .ok_or_else(|| PgError::Protocol("truncated int32".to_string()))?
+        .try_into()
+        .map_err(|_| PgError::Protocol("truncated int32".to_string()))?;
+    Ok(i32::from_be_bytes(bytes))
+}
+
+fn parse_prepared(
+    stream: &mut TcpStream,
+    prepared: &mut BTreeMap<String, Prepared>,
+    payload: &[u8],
+) -> Result<(), PgError> {
+    let (name, cursor) = read_cstring(payload, 0)?;
+    let (sql, cursor) = read_cstring(payload, cursor)?;
+    let count = read_i16(payload, cursor)?;
+    let mut cursor = cursor + 2;
+    let mut param_types = Vec::with_capacity(count.max(0) as usize);
+    for _ in 0..count.max(0) {
+        param_types.push(read_i32(payload, cursor)?);
+        cursor += 4;
+    }
+    prepared.insert(name, Prepared { sql, param_types });
+    write_message(stream, b'1', &[])
+}
+
+fn bind_portal(
+    stream: &mut TcpStream,
+    prepared: &BTreeMap<String, Prepared>,
+    portals: &mut BTreeMap<String, Bound>,
+    payload: &[u8],
+) -> Result<(), PgError> {
+    let (portal, cursor) = read_cstring(payload, 0)?;
+    let (statement, mut cursor) = read_cstring(payload, cursor)?;
+    let format_count = read_i16(payload, cursor)?;
+    cursor += 2 + format_count.max(0) as usize * 2;
+    let param_count = read_i16(payload, cursor)?;
+    cursor += 2;
+    let prepared = prepared
+        .get(&statement)
+        .ok_or_else(|| PgError::Protocol(format!("unknown prepared statement {statement:?}")))?;
+    let mut params = Vec::with_capacity(param_count.max(0) as usize);
+    for _ in 0..param_count.max(0) {
+        let length = read_i32(payload, cursor)?;
+        cursor += 4;
+        if length < 0 {
+            params.push(None);
+        } else {
+            let length = length as usize;
+            let value = payload
+                .get(cursor..cursor + length)
+                .ok_or_else(|| PgError::Protocol("truncated parameter".to_string()))?;
+            params.push(Some(String::from_utf8_lossy(value).to_string()));
+            cursor += length;
+        }
+    }
+    let sql = substitute_params(&prepared.sql, &prepared.param_types, &params)?;
+    portals.insert(portal, Bound { sql });
+    write_message(stream, b'2', &[])
+}
+
+fn describe(
+    stream: &mut TcpStream,
+    prepared: &BTreeMap<String, Prepared>,
+    portals: &BTreeMap<String, Bound>,
+    payload: &[u8],
+) -> Result<(), PgError> {
+    let kind = payload
+        .first()
+        .copied()
+        .ok_or_else(|| PgError::Protocol("empty Describe".to_string()))?;
+    let (name, _) = read_cstring(payload, 1)?;
+    match kind {
+        b'S' => {
+            let prepared = prepared
+                .get(&name)
+                .ok_or_else(|| PgError::Protocol(format!("unknown prepared statement {name:?}")))?;
+            let mut p = Vec::new();
+            p.extend_from_slice(&(prepared.param_types.len() as i16).to_be_bytes());
+            for oid in &prepared.param_types {
+                p.extend_from_slice(&oid.to_be_bytes());
+            }
+            write_message(stream, b't', &p)?;
+            write_message(stream, b'n', &[])?;
+        }
+        b'P' => {
+            portals
+                .get(&name)
+                .ok_or_else(|| PgError::Protocol(format!("unknown portal {name:?}")))?;
+            write_message(stream, b'n', &[])?;
+        }
+        other => {
+            return Err(PgError::Protocol(format!(
+                "bad Describe kind {}",
+                other as char
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn execute_portal(
+    stream: &mut TcpStream,
+    engine: &mut SqlEngine,
+    portals: &BTreeMap<String, Bound>,
+    payload: &[u8],
+) -> Result<(), PgError> {
+    let (portal, cursor) = read_cstring(payload, 0)?;
+    let _max_rows = read_i32(payload, cursor)?;
+    let bound = portals
+        .get(&portal)
+        .ok_or_else(|| PgError::Protocol(format!("unknown portal {portal:?}")))?;
+    execute_and_write(stream, engine, &bound.sql)
+}
+
+fn close_portal(
+    stream: &mut TcpStream,
+    prepared: &mut BTreeMap<String, Prepared>,
+    portals: &mut BTreeMap<String, Bound>,
+    payload: &[u8],
+) -> Result<(), PgError> {
+    let kind = payload
+        .first()
+        .copied()
+        .ok_or_else(|| PgError::Protocol("empty Close".to_string()))?;
+    let (name, _) = read_cstring(payload, 1)?;
+    match kind {
+        b'S' => {
+            prepared.remove(&name);
+        }
+        b'P' => {
+            portals.remove(&name);
+        }
+        other => {
+            return Err(PgError::Protocol(format!(
+                "bad Close kind {}",
+                other as char
+            )));
+        }
+    }
+    write_message(stream, b'3', &[])
+}
+
+fn substitute_params(
+    sql: &str,
+    param_types: &[i32],
+    params: &[Option<String>],
+) -> Result<String, PgError> {
+    let mut output = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut in_string = false;
+    while let Some(character) = chars.next() {
+        if character == '\'' {
+            in_string = !in_string;
+            output.push(character);
+            continue;
+        }
+        if character == '$' && !in_string {
+            let mut digits = String::new();
+            while let Some(next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    digits.push(*next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if digits.is_empty() {
+                output.push('$');
+                continue;
+            }
+            let index: usize = digits
+                .parse()
+                .map_err(|_| PgError::Protocol("bad parameter index".to_string()))?;
+            if index == 0 || index > params.len() {
+                return Err(PgError::Protocol(format!(
+                    "parameter ${index} out of range ({} supplied)",
+                    params.len()
+                )));
+            }
+            let oid = param_types.get(index - 1).copied().unwrap_or(0);
+            output.push_str(&param_literal(&params[index - 1], oid));
+            continue;
+        }
+        output.push(character);
+    }
+    Ok(output)
+}
+
+fn param_literal(value: &Option<String>, oid: i32) -> String {
+    let Some(text) = value else {
+        return "NULL".to_string();
+    };
+    match oid {
+        20 | 21 | 23 => text.clone(),
+        16 => {
+            if text == "t" || text.eq_ignore_ascii_case("true") {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        25 | 1043 => format!("'{}'", text.replace('\'', "''")),
+        _ => {
+            if text.parse::<i64>().is_ok() {
+                text.clone()
+            } else if text.eq_ignore_ascii_case("true") || text == "t" {
+                "TRUE".to_string()
+            } else if text.eq_ignore_ascii_case("false") || text == "f" {
+                "FALSE".to_string()
+            } else {
+                format!("'{}'", text.replace('\'', "''"))
+            }
         }
     }
 }
