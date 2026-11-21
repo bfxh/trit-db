@@ -409,6 +409,28 @@ impl Parser {
         self.expect_keyword(Keyword::Alter)?;
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_ident()?;
+        if self.eat_keyword(Keyword::Drop) {
+            self.eat_word("column");
+            let if_exists = if self.eat_keyword(Keyword::If) {
+                self.expect_keyword(Keyword::Exists)?;
+                true
+            } else {
+                false
+            };
+            let column = self.parse_ident()?;
+            return Ok(Statement::AlterTableDropColumn {
+                name,
+                if_exists,
+                column,
+            });
+        }
+        if self.eat_word("rename") {
+            self.eat_word("column");
+            let from = self.parse_ident()?;
+            self.expect_word("to")?;
+            let to = self.parse_ident()?;
+            return Ok(Statement::AlterTableRenameColumn { name, from, to });
+        }
         self.expect_keyword(Keyword::Add)?;
         self.eat_word("column");
         let mut if_not_exists = false;
@@ -1107,8 +1129,14 @@ impl Parser {
                         .is_some_and(|token| token.kind == TokenKind::Symbol(Symbol::LParen))
                     {
                         self.expect_symbol(Symbol::LParen)?;
+                        let input =
+                            if matches!(function, WindowFunction::Lag | WindowFunction::Lead) {
+                                Some(Box::new(self.parse_expr()?))
+                            } else {
+                                None
+                            };
                         self.expect_symbol(Symbol::RParen)?;
-                        return self.parse_window(function, None);
+                        return self.parse_window(function, input);
                     }
                 }
                 if self.eat_symbol(Symbol::Dot) {
@@ -1275,6 +1303,10 @@ fn window_function(name: &str) -> Option<WindowFunction> {
         Some(WindowFunction::Rank)
     } else if name.eq_ignore_ascii_case("dense_rank") {
         Some(WindowFunction::DenseRank)
+    } else if name.eq_ignore_ascii_case("lag") {
+        Some(WindowFunction::Lag)
+    } else if name.eq_ignore_ascii_case("lead") {
+        Some(WindowFunction::Lead)
     } else {
         None
     }

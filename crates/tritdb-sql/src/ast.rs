@@ -42,6 +42,10 @@ pub enum WindowFunction {
     DenseRank,
     /// `SUM/AVG/COUNT/MIN/MAX(...)` aggregate window.
     Aggregate(AggregateKind),
+    /// `LAG(expr)`.
+    Lag,
+    /// `LEAD(expr)`.
+    Lead,
 }
 
 impl WindowFunction {
@@ -52,6 +56,8 @@ impl WindowFunction {
             WindowFunction::Rank => "RANK",
             WindowFunction::DenseRank => "DENSE_RANK",
             WindowFunction::Aggregate(kind) => kind.name(),
+            WindowFunction::Lag => "LAG",
+            WindowFunction::Lead => "LEAD",
         }
     }
 }
@@ -378,6 +384,24 @@ pub enum Statement {
         name: String,
         /// Skip when the table is absent.
         if_exists: bool,
+    },
+    /// `ALTER TABLE ... DROP [COLUMN] ...`.
+    AlterTableDropColumn {
+        /// Table name.
+        name: String,
+        /// Skip when the column is absent.
+        if_exists: bool,
+        /// Column to remove.
+        column: String,
+    },
+    /// `ALTER TABLE ... RENAME [COLUMN] a TO b`.
+    AlterTableRenameColumn {
+        /// Table name.
+        name: String,
+        /// Old column name.
+        from: String,
+        /// New column name.
+        to: String,
     },
     /// `ALTER TABLE ... ADD [COLUMN] ...`.
     AlterTableAddColumn {
