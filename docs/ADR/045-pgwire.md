@@ -30,12 +30,12 @@
 ## 理由
 
 - **零依赖**：wire protocol 的 simple query 子集足够小，用 `std::net` 直接实现。
-- **默认文本、扩展查询可选二进制**：`Bind` 的 result format code 决定 `RowDescription`/`DataRow` 编码（`int8`(20) → 8 字节 BE、`bool`(16) → 1 字节、`text`(25) → UTF-8）；简单查询始终文本；参数仍只支持文本格式。
+- **默认文本、扩展查询可选二进制**：`Bind` 的 result format code 决定 `RowDescription`/`DataRow` 编码（`int8`(20) → 8 字节 BE、`bool`(16) → 1 字节、`text`(25) → UTF-8）；简单查询始终文本；`Bind` 的 param format code 也支持二进制参数（`int2/4/8`、`bool`、`float4/8`、`text`）。
 - **共享引擎锁**：多连接可以同时握手/等待，但执行语句时串行；避免多连接同时写 `TxnStore` 的锁冲突。
 
 ## 后果 / 限制
 
-- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端；`--tls-client-ca` 用 `WebPkiClientVerifier` 要求客户端证书（mTLS）；`--tls-client-revoked` 给 verifier 套一层指纹检查，`verify_client_cert` 里拒绝命中吊销列表的证书。证书/私钥/CA 文件按内容哈希检测，变化后新连接自动重载（重载失败保留旧证书）。
+- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端；`--tls-client-ca` 用 `WebPkiClientVerifier` 要求客户端证书（mTLS）；`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，用 CA 公钥验签后按序列号吊销）或 SHA-256 指纹列表；`--tls-client-ocsp` 读取预取的 DER OCSP 响应，验签后按 `CertStatus::Revoked` 吊销。证书/私钥/CA 文件按内容哈希检测，变化后新连接自动重载（重载失败保留旧证书）。
 - **扩展查询只覆盖最小子集**：`Describe` 对 SELECT 返回列名与取样推断的类型，非 SELECT 返回 `NoData`；`Execute` 忽略 row limit，参数只按文本格式处理。
 - **认证有 trust / cleartext / MD5 / SCRAM-SHA-256**：`--auth password|md5|scram-sha-256`；SCRAM 用 4096 轮 PBKDF2-HMAC-SHA256（复用 `tritdb-cas` 的 SHA-256/HMAC），salt 每个进程随机；`--scram-verifier-file` 可加载持久化的 `SCRAM-SHA-256$...` verifier（PG 格式），`tritdb scram-verifier` 生成；明文连接下 cleartext 密码默认拒绝启动，需要 `--allow-plaintext-password`。
 - **执行串行化**：连接并发，但语句在共享引擎锁上排队；不是多写者并发。

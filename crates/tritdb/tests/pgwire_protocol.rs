@@ -1397,3 +1397,325 @@ fn simple_query_stays_text_format() {
         vec![Some("1".into()), Some("t".into()), Some("x".into())]
     );
 }
+
+#[test]
+fn extended_query_accepts_binary_parameters() {
+    let (_dir, mut stream) = start_server("pgproto-binary-params");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, flag BOOL, name TEXT);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    // Parse with explicit parameter OIDs: int8, bool, text.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"stmt\0");
+    payload.extend_from_slice(b"INSERT INTO t VALUES ($1, $2, $3);\0");
+    payload.extend_from_slice(&3i16.to_be_bytes());
+    for oid in [20i32, 16, 25] {
+        payload.extend_from_slice(&oid.to_be_bytes());
+    }
+    write_message(&mut stream, b'P', &payload);
+
+    // Bind with one parameter format code (1 = binary).
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"portal\0stmt\0");
+    payload.extend_from_slice(&1i16.to_be_bytes()); // parameter format count
+    payload.extend_from_slice(&1i16.to_be_bytes()); // binary
+    payload.extend_from_slice(&3i16.to_be_bytes()); // parameter count
+    payload.extend_from_slice(&8i32.to_be_bytes());
+    payload.extend_from_slice(&42i64.to_be_bytes());
+    payload.extend_from_slice(&1i32.to_be_bytes());
+    payload.push(1);
+    payload.extend_from_slice(&3i32.to_be_bytes());
+    payload.extend_from_slice(b"bin");
+    payload.extend_from_slice(&0i16.to_be_bytes()); // result format count
+    write_message(&mut stream, b'B', &payload);
+
+    let mut execute = b"portal\0".to_vec();
+    execute.extend_from_slice(&0i32.to_be_bytes());
+    write_message(&mut stream, b'E', &execute);
+    write_message(&mut stream, b'S', b"");
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        !has_error(&messages),
+        "binary parameter bind failed: {messages:?}"
+    );
+
+    query(&mut stream, "SELECT id, flag, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(
+        row,
+        vec![Some("42".into()), Some("t".into()), Some("bin".into())]
+    );
+}
+
+#[test]
+fn copy_csv_roundtrip() {
+    let (_dir, mut stream) = start_server("pgproto-copy-csv");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT, flag BOOL);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "COPY t FROM STDIN (FORMAT csv);");
+    let (kind, payload) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    assert_eq!(payload[0], 0, "CSV uses the text wire format");
+
+    write_message(&mut stream, b'd', b"1,alpha,t\n");
+    write_message(&mut stream, b'd', b"2,,f\n");
+    write_message(&mut stream, b'c', b"");
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        messages
+            .iter()
+            .any(|(kind, payload)| *kind == b'C' && payload.starts_with(b"COPY 2")),
+        "missing COPY 2: {messages:?}"
+    );
+
+    query(&mut stream, "SELECT id, name, flag FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alpha".into()), Some("t".into())],
+            vec![Some("2".into()), None, Some("f".into())],
+        ]
+    );
+
+    query(&mut stream, "COPY t TO STDOUT (FORMAT csv);");
+    let (kind, _) = read_message(&mut stream).expect("CopyOutResponse");
+    assert_eq!(kind, b'H');
+    let mut lines = Vec::new();
+    loop {
+        let (kind, payload) = read_message(&mut stream).expect("copy message");
+        match kind {
+            b'd' => lines.push(String::from_utf8_lossy(&payload).to_string()),
+            b'c' => break,
+            other => panic!("unexpected message {} during COPY OUT", other as char),
+        }
+    }
+    assert_eq!(lines, vec!["1,alpha,t\n".to_string(), "2,,f\n".to_string()]);
+    let _ = read_until_ready(&mut stream);
+}
+
+#[test]
+fn copy_binary_roundtrip() {
+    let (_dir, mut stream) = start_server("pgproto-copy-binary");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, flag BOOL, name TEXT);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "COPY t FROM STDIN (FORMAT binary);");
+    let (kind, payload) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    assert_eq!(payload[0], 1, "binary wire format");
+
+    let mut data = Vec::new();
+    data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    data.extend_from_slice(&0i32.to_be_bytes());
+    data.extend_from_slice(&0i32.to_be_bytes());
+    data.extend_from_slice(&3i16.to_be_bytes());
+    data.extend_from_slice(&8i32.to_be_bytes());
+    data.extend_from_slice(&42i64.to_be_bytes());
+    data.extend_from_slice(&1i32.to_be_bytes());
+    data.push(1);
+    data.extend_from_slice(&3i32.to_be_bytes());
+    data.extend_from_slice(b"bin");
+    data.extend_from_slice(&(-1i16).to_be_bytes());
+    write_message(&mut stream, b'd', &data);
+    write_message(&mut stream, b'c', b"");
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        messages
+            .iter()
+            .any(|(kind, payload)| *kind == b'C' && payload.starts_with(b"COPY 1")),
+        "missing COPY 1: {messages:?}"
+    );
+
+    query(&mut stream, "SELECT id, flag, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("42".into()),
+            Some("t".into()),
+            Some("bin".into())
+        ]]
+    );
+
+    query(&mut stream, "COPY t TO STDOUT (FORMAT binary);");
+    let (kind, payload) = read_message(&mut stream).expect("CopyOutResponse");
+    assert_eq!(kind, b'H');
+    assert_eq!(payload[0], 1);
+    let mut data = Vec::new();
+    loop {
+        let (kind, payload) = read_message(&mut stream).expect("copy message");
+        match kind {
+            b'd' => data.extend_from_slice(&payload),
+            b'c' => break,
+            other => panic!("unexpected message {} during COPY OUT", other as char),
+        }
+    }
+    assert!(data.starts_with(b"PGCOPY\n\xff\r\n\0"));
+    assert_eq!(&data[19..21], &3i16.to_be_bytes());
+    assert_eq!(&data[21..25], &8i32.to_be_bytes());
+    assert_eq!(&data[25..33], &42i64.to_be_bytes());
+    assert_eq!(&data[33..37], &1i32.to_be_bytes());
+    assert_eq!(data[37], 1);
+    assert_eq!(&data[38..42], &3i32.to_be_bytes());
+    assert_eq!(&data[42..45], b"bin");
+    assert_eq!(&data[45..47], &(-1i16).to_be_bytes());
+    let _ = read_until_ready(&mut stream);
+}
+
+fn make_client_cert_with_serial(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+    serial: u64,
+) -> (rcgen::Certificate, rcgen::KeyPair) {
+    let mut params =
+        rcgen::CertificateParams::new(vec!["client".to_string()]).expect("client params");
+    params.serial_number = Some(rcgen::SerialNumber::from(serial));
+    let key = rcgen::KeyPair::generate().expect("client key");
+    let cert = params
+        .signed_by(&key, ca_cert, ca_key)
+        .expect("client certificate");
+    (cert, key)
+}
+
+#[test]
+fn crl_signed_by_ca_revokes_client_certificate() {
+    let server =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 42);
+
+    let dir = TempDir::new("pgproto-crl");
+    let db = dir.join("crl.db");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server-key.pem");
+    let ca_path = dir.join("ca.pem");
+    let crl_path = dir.join("crl.pem");
+    std::fs::write(&cert_path, server.cert.pem()).expect("server cert");
+    std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("CA cert");
+
+    let crl = rcgen::CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2024, 1, 1),
+        next_update: rcgen::date_time_ymd(2030, 1, 1),
+        crl_number: rcgen::SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![rcgen::RevokedCertParams {
+            serial_number: rcgen::SerialNumber::from(42u64),
+            revocation_time: rcgen::date_time_ymd(2024, 1, 1),
+            reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    }
+    .signed_by(&ca_cert, &ca_key)
+    .expect("CRL");
+    std::fs::write(&crl_path, crl.pem().expect("CRL PEM")).expect("CRL file");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        tls_client_ca: Some(ca_path),
+        tls_client_revoked: Some(crl_path),
+        require_tls: true,
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db, listener, options);
+    });
+
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    assert!(
+        tls_select_one(addr, client).is_err(),
+        "a CRL-revoked client certificate must be rejected"
+    );
+}
+
+#[test]
+fn crl_without_revoked_serial_still_accepts_client() {
+    let server =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 7);
+
+    let dir = TempDir::new("pgproto-crl-ok");
+    let db = dir.join("crl-ok.db");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server-key.pem");
+    let ca_path = dir.join("ca.pem");
+    let crl_path = dir.join("crl.pem");
+    std::fs::write(&cert_path, server.cert.pem()).expect("server cert");
+    std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("CA cert");
+
+    // Revokes a different serial number.
+    let crl = rcgen::CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2024, 1, 1),
+        next_update: rcgen::date_time_ymd(2030, 1, 1),
+        crl_number: rcgen::SerialNumber::from(2u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![rcgen::RevokedCertParams {
+            serial_number: rcgen::SerialNumber::from(99u64),
+            revocation_time: rcgen::date_time_ymd(2024, 1, 1),
+            reason_code: Some(rcgen::RevocationReason::Superseded),
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    }
+    .signed_by(&ca_cert, &ca_key)
+    .expect("CRL");
+    std::fs::write(&crl_path, crl.pem().expect("CRL PEM")).expect("CRL file");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        tls_client_ca: Some(ca_path),
+        tls_client_revoked: Some(crl_path),
+        require_tls: true,
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db, listener, options);
+    });
+
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    tls_select_one(addr, client).expect("a client with an unrevoked serial must be accepted");
+}
