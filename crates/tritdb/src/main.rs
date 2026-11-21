@@ -56,6 +56,7 @@ fn run() -> Result<(), String> {
         Some("pstore") => run_pstore(&args),
         Some("sql") => run_sql(&args),
         Some("serve") => run_serve(&args),
+        Some("scram-verifier") => run_scram_verifier(&args),
         Some("models") => run_models(&args),
         Some("repair") => run_repair(&args),
         Some("graph") => run_graph(&args),
@@ -98,7 +99,10 @@ fn print_help() {
         "        [--auth trust|password|md5|scram-sha-256 --password <pwd>|--password-file <file>]"
     );
     println!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
-    println!("        [--tls-client-ca <ca.pem>] [--allow-plaintext-password]");
+    println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>]]");
+    println!("        [--allow-plaintext-password]");
+    println!("        [--scram-verifier-file <file>]");
+    println!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
     println!("  sql --db sql.db --file script.sql");
     println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
     println!("  repair --facts 2 --denial 0,1 --query 0");
@@ -1728,31 +1732,50 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     if arg_value(args, "--password").is_some() && arg_value(args, "--password-file").is_some() {
         return Err("use either --password or --password-file, not both".to_string());
     }
+    let scram_verifier_file = arg_value(args, "--scram-verifier-file");
+    if scram_verifier_file.is_some()
+        && (arg_value(args, "--password").is_some() || arg_value(args, "--password-file").is_some())
+    {
+        return Err(
+            "use either --password/--password-file or --scram-verifier-file, not both".to_string(),
+        );
+    }
     let auth = match arg_value(args, "--auth")
         .unwrap_or_else(|| "trust".to_string())
         .as_str()
     {
         "trust" => tritdb_pgwire::AuthMode::Trust,
         mode @ ("password" | "md5" | "scram-sha-256" | "scram") => {
-            let password = if let Some(password) = arg_value(args, "--password") {
-                password
-            } else if let Some(path) = arg_value(args, "--password-file") {
-                std::fs::read_to_string(&path)
-                    .map_err(|error| format!("read {path}: {error}"))?
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string()
+            if let Some(path) = &scram_verifier_file {
+                if mode != "scram-sha-256" && mode != "scram" {
+                    return Err("--scram-verifier-file requires --auth scram-sha-256".to_string());
+                }
+                let text = std::fs::read_to_string(path)
+                    .map_err(|error| format!("read {path}: {error}"))?;
+                let verifier = tritdb_pgwire::ScramVerifier::parse(&text)
+                    .map_err(|error| error.to_string())?;
+                tritdb_pgwire::AuthMode::ScramSha256Verifier(verifier)
             } else {
-                return Err(format!(
-                    "--auth {mode} requires --password or --password-file"
-                ));
-            };
-            if password.is_empty() {
-                return Err("password must not be empty".to_string());
-            }
-            match mode {
-                "password" => tritdb_pgwire::AuthMode::Password(password),
-                "md5" => tritdb_pgwire::AuthMode::Md5(password),
-                _ => tritdb_pgwire::AuthMode::ScramSha256(password),
+                let password = if let Some(password) = arg_value(args, "--password") {
+                    password
+                } else if let Some(path) = arg_value(args, "--password-file") {
+                    std::fs::read_to_string(&path)
+                        .map_err(|error| format!("read {path}: {error}"))?
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string()
+                } else {
+                    return Err(format!(
+                        "--auth {mode} requires --password, --password-file, or --scram-verifier-file"
+                    ));
+                };
+                if password.is_empty() {
+                    return Err("password must not be empty".to_string());
+                }
+                match mode {
+                    "password" => tritdb_pgwire::AuthMode::Password(password),
+                    "md5" => tritdb_pgwire::AuthMode::Md5(password),
+                    _ => tritdb_pgwire::AuthMode::ScramSha256(password),
+                }
             }
         }
         other => {
@@ -1765,6 +1788,10 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let tls_cert = arg_value(args, "--tls-cert").map(std::path::PathBuf::from);
     let tls_key = arg_value(args, "--tls-key").map(std::path::PathBuf::from);
     let tls_client_ca = arg_value(args, "--tls-client-ca").map(std::path::PathBuf::from);
+    let tls_client_revoked = arg_value(args, "--tls-client-revoked").map(std::path::PathBuf::from);
+    if tls_client_revoked.is_some() && tls_client_ca.is_none() {
+        return Err("--tls-client-revoked needs --tls-client-ca".to_string());
+    }
     if tls_cert.is_some() != tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be given together".to_string());
     }
@@ -1791,6 +1818,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_cert,
         tls_key,
         tls_client_ca,
+        tls_client_revoked,
         require_tls,
         allow_plaintext_password,
     };
@@ -1804,6 +1832,26 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         std::sync::Arc::new(options),
     )
     .map_err(|error| error.to_string())
+}
+
+fn run_scram_verifier(args: &[String]) -> Result<(), String> {
+    let password = required_arg(args, "--password")?;
+    if password.is_empty() {
+        return Err("password must not be empty".to_string());
+    }
+    let iterations = match arg_value(args, "--iterations") {
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|_| format!("bad --iterations: {value}"))?,
+        None => 4_096,
+    };
+    let out = required_arg(args, "--out")?;
+    let verifier = tritdb_pgwire::ScramVerifier::from_password(&password, iterations)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(&out, format!("{}\n", verifier.encode()))
+        .map_err(|error| format!("write {out}: {error}"))?;
+    println!("wrote={out} iterations={iterations}");
+    Ok(())
 }
 
 fn run_sql(args: &[String]) -> Result<(), String> {

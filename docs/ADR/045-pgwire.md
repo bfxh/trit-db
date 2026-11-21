@@ -35,9 +35,9 @@
 
 ## 后果 / 限制
 
-- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端；`--tls-client-ca` 用 `WebPkiClientVerifier` 要求客户端证书（mTLS）。证书/私钥/CA 文件按内容哈希检测，变化后新连接自动重载（重载失败保留旧证书）。
+- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端；`--tls-client-ca` 用 `WebPkiClientVerifier` 要求客户端证书（mTLS）；`--tls-client-revoked` 给 verifier 套一层指纹检查，`verify_client_cert` 里拒绝命中吊销列表的证书。证书/私钥/CA 文件按内容哈希检测，变化后新连接自动重载（重载失败保留旧证书）。
 - **扩展查询只覆盖最小子集**：`Describe` 对 SELECT 返回列名与取样推断的类型，非 SELECT 返回 `NoData`；`Execute` 忽略 row limit，参数只按文本格式处理。
-- **认证有 trust / cleartext / MD5 / SCRAM-SHA-256**：`--auth password|md5|scram-sha-256`；SCRAM 用 4096 轮 PBKDF2-HMAC-SHA256（复用 `tritdb-cas` 的 SHA-256/HMAC），salt 每个进程随机；明文连接下 cleartext 密码默认拒绝启动，需要 `--allow-plaintext-password`。
+- **认证有 trust / cleartext / MD5 / SCRAM-SHA-256**：`--auth password|md5|scram-sha-256`；SCRAM 用 4096 轮 PBKDF2-HMAC-SHA256（复用 `tritdb-cas` 的 SHA-256/HMAC），salt 每个进程随机；`--scram-verifier-file` 可加载持久化的 `SCRAM-SHA-256$...` verifier（PG 格式），`tritdb scram-verifier` 生成；明文连接下 cleartext 密码默认拒绝启动，需要 `--allow-plaintext-password`。
 - **执行串行化**：连接并发，但语句在共享引擎锁上排队；不是多写者并发。
 - 类型只按取样值推断：全 `NULL` 列、空结果回落成 `text`；`Logic`/`Ł`/`ℕ` 等非 `INT`/`BOOL` 值也报 `text`。
 - **事务状态只是协议层**：`BEGIN`/`COMMIT`/`ROLLBACK` 不改变引擎的单语句提交模型，不会把多条语句合成一个原子事务；`E` 状态只是拒绝后续语句。

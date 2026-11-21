@@ -271,6 +271,39 @@ fn serve_rejects_incomplete_auth_and_tls_flags() {
         stderr(&output)
     );
 
+    // `scram-verifier` writes a verifier file; `--scram-verifier-file`
+    // cannot be combined with a cleartext password source.
+    let verifier_path = dir.join("scram.verifier");
+    let verifier_arg = verifier_path.to_str().expect("verifier path");
+    let output = run([
+        "scram-verifier",
+        "--password",
+        "s3cret",
+        "--out",
+        verifier_arg,
+    ]);
+    assert_success(&output);
+    let text = fs::read_to_string(&verifier_path).expect("read verifier");
+    assert!(text.starts_with("SCRAM-SHA-256$"), "verifier: {text}");
+
+    let output = run([
+        "serve",
+        "--db",
+        db,
+        "--auth",
+        "scram-sha-256",
+        "--scram-verifier-file",
+        verifier_arg,
+        "--password",
+        "s3cret",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not both"),
+        "stderr: {}",
+        stderr(&output)
+    );
+
     // Cleartext password without TLS needs an explicit opt-in.
     let output = run([
         "serve",
