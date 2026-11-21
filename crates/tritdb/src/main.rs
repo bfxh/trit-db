@@ -99,7 +99,7 @@ fn print_help() {
         "        [--auth trust|password|md5|scram-sha-256 --password <pwd>|--password-file <file>]"
     );
     println!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
-    println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>]]");
+    println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http://...>]]");
     println!("        [--allow-plaintext-password]");
     println!("        [--scram-verifier-file <file>]");
     println!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
@@ -1796,6 +1796,10 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     if tls_client_ocsp.is_some() && tls_client_ca.is_none() {
         return Err("--tls-client-ocsp needs --tls-client-ca".to_string());
     }
+    let tls_client_ocsp_url = arg_value(args, "--tls-client-ocsp-url");
+    if tls_client_ocsp_url.is_some() && tls_client_ca.is_none() {
+        return Err("--tls-client-ocsp-url needs --tls-client-ca".to_string());
+    }
     if tls_cert.is_some() != tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be given together".to_string());
     }
@@ -1824,6 +1828,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_client_ca,
         tls_client_revoked,
         tls_client_ocsp,
+        tls_client_ocsp_url,
         require_tls,
         allow_plaintext_password,
     };

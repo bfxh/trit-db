@@ -1719,3 +1719,421 @@ fn crl_without_revoked_serial_still_accepts_client() {
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
     tls_select_one(addr, client).expect("a client with an unrevoked serial must be accepted");
 }
+
+#[test]
+fn extended_query_accepts_binary_date_uuid_and_numeric() {
+    let (_dir, mut stream) = start_server("pgproto-binary-oids");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, d TEXT, u TEXT, n TEXT);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    // Parse with OIDs: int8, date, uuid, numeric.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"stmt\0");
+    payload.extend_from_slice(b"INSERT INTO t VALUES ($1, $2, $3, $4);\0");
+    payload.extend_from_slice(&4i16.to_be_bytes());
+    for oid in [20i32, 1082, 2950, 1700] {
+        payload.extend_from_slice(&oid.to_be_bytes());
+    }
+    write_message(&mut stream, b'P', &payload);
+
+    // Bind every parameter in binary format.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"portal\0stmt\0");
+    payload.extend_from_slice(&1i16.to_be_bytes()); // parameter format count
+    payload.extend_from_slice(&1i16.to_be_bytes()); // binary
+    payload.extend_from_slice(&4i16.to_be_bytes()); // parameter count
+                                                    // id int8 = 1
+    payload.extend_from_slice(&8i32.to_be_bytes());
+    payload.extend_from_slice(&1i64.to_be_bytes());
+    // date = 2000-01-01 (0 days after the PostgreSQL epoch)
+    payload.extend_from_slice(&4i32.to_be_bytes());
+    payload.extend_from_slice(&0i32.to_be_bytes());
+    // uuid = 12121212-1212-1212-1212-121212121212
+    payload.extend_from_slice(&16i32.to_be_bytes());
+    payload.extend_from_slice(&[0x12u8; 16]);
+    // numeric = 1.23: 2 digits (1, 2300), weight 0, sign 0, dscale 2
+    payload.extend_from_slice(&12i32.to_be_bytes());
+    payload.extend_from_slice(&2i16.to_be_bytes());
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    payload.extend_from_slice(&2i16.to_be_bytes());
+    payload.extend_from_slice(&1i16.to_be_bytes());
+    payload.extend_from_slice(&2300i16.to_be_bytes());
+    payload.extend_from_slice(&0i16.to_be_bytes()); // result format count
+    write_message(&mut stream, b'B', &payload);
+
+    let mut execute = b"portal\0".to_vec();
+    execute.extend_from_slice(&0i32.to_be_bytes());
+    write_message(&mut stream, b'E', &execute);
+    write_message(&mut stream, b'S', b"");
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        !has_error(&messages),
+        "binary OID bind failed: {messages:?}"
+    );
+
+    query(&mut stream, "SELECT id, d, u, n FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(
+        row,
+        vec![
+            Some("1".into()),
+            Some("2000-01-01".into()),
+            Some("12121212-1212-1212-1212-121212121212".into()),
+            Some("1.23".into()),
+        ]
+    );
+}
+
+#[test]
+fn copy_text_options_header_delimiter_null() {
+    let (_dir, mut stream) = start_server("pgproto-copy-options");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT text, HEADER, DELIMITER ';', NULL 'NULL');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    write_message(&mut stream, b'd', b"id;name\n");
+    write_message(&mut stream, b'd', b"1;alpha\n");
+    write_message(&mut stream, b'd', b"2;NULL\n");
+    write_message(&mut stream, b'c', b"");
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        messages
+            .iter()
+            .any(|(kind, payload)| *kind == b'C' && payload.starts_with(b"COPY 2")),
+        "missing COPY 2: {messages:?}"
+    );
+
+    query(&mut stream, "SELECT id, name FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alpha".into())],
+            vec![Some("2".into()), None],
+        ]
+    );
+
+    query(
+        &mut stream,
+        "COPY t TO STDOUT (FORMAT text, HEADER, DELIMITER ';', NULL 'NULL');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyOutResponse");
+    assert_eq!(kind, b'H');
+    let mut lines = Vec::new();
+    loop {
+        let (kind, payload) = read_message(&mut stream).expect("copy message");
+        match kind {
+            b'd' => lines.push(String::from_utf8_lossy(&payload).to_string()),
+            b'c' => break,
+            other => panic!("unexpected message {} during COPY OUT", other as char),
+        }
+    }
+    assert_eq!(
+        lines,
+        vec![
+            "id;name\n".to_string(),
+            "1;alpha\n".to_string(),
+            "2;NULL\n".to_string(),
+        ]
+    );
+    let _ = read_until_ready(&mut stream);
+}
+
+#[test]
+fn copy_csv_options_delimiter_header() {
+    let (_dir, mut stream) = start_server("pgproto-copy-csv-options");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT csv, DELIMITER ';', HEADER);",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    write_message(&mut stream, b'd', b"id;name\n");
+    write_message(&mut stream, b'd', b"1;alpha\n");
+    write_message(&mut stream, b'd', b"2;\n");
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alpha".into())],
+            vec![Some("2".into()), None],
+        ]
+    );
+
+    query(
+        &mut stream,
+        "COPY t TO STDOUT (FORMAT csv, DELIMITER ';', HEADER);",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyOutResponse");
+    assert_eq!(kind, b'H');
+    let mut lines = Vec::new();
+    loop {
+        let (kind, payload) = read_message(&mut stream).expect("copy message");
+        match kind {
+            b'd' => lines.push(String::from_utf8_lossy(&payload).to_string()),
+            b'c' => break,
+            other => panic!("unexpected message {} during COPY OUT", other as char),
+        }
+    }
+    assert_eq!(
+        lines,
+        vec![
+            "id;name\n".to_string(),
+            "1;alpha\n".to_string(),
+            "2;\n".to_string(),
+        ]
+    );
+    let _ = read_until_ready(&mut stream);
+}
+
+fn ocsp_responder_response(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+    client_cert: &rcgen::Certificate,
+    revoked: bool,
+) -> Vec<u8> {
+    use der::asn1::{BitString, GeneralizedTime, ObjectIdentifier, OctetString};
+    use der::{Any, Decode, Encode};
+    use sha1::{Digest, Sha1};
+
+    let ca_der = ca_cert.der();
+    let ca = x509_cert::Certificate::from_der(ca_der.as_ref()).expect("CA certificate");
+    let name_hash = Sha1::digest(ca.tbs_certificate.subject.to_der().expect("subject"));
+    let key_hash = Sha1::digest(
+        ca.tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .expect("spki"),
+    );
+    let client_der = client_cert.der();
+    let client = x509_cert::Certificate::from_der(client_der.as_ref()).expect("client certificate");
+    let serial = client.tbs_certificate.serial_number.as_bytes().to_vec();
+    let cert_id = x509_ocsp::CertId {
+        hash_algorithm: spki::AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.3.14.3.2.26"),
+            parameters: Some(Any::null()),
+        },
+        issuer_name_hash: OctetString::new(name_hash.to_vec()).expect("name hash"),
+        issuer_key_hash: OctetString::new(key_hash.to_vec()).expect("key hash"),
+        serial_number: x509_cert::serial_number::SerialNumber::new(&serial).expect("serial"),
+    };
+    let this_update = x509_ocsp::OcspGeneralizedTime(
+        GeneralizedTime::from_unix_duration(std::time::Duration::from_secs(0))
+            .expect("generalized time"),
+    );
+    let status = if revoked {
+        x509_ocsp::CertStatus::revoked(x509_ocsp::RevokedInfo {
+            revocation_time: this_update,
+            revocation_reason: None,
+        })
+    } else {
+        x509_ocsp::CertStatus::good()
+    };
+    let single = x509_ocsp::SingleResponse {
+        cert_id,
+        cert_status: status,
+        this_update,
+        next_update: None,
+        single_extensions: None,
+    };
+    let response_data = x509_ocsp::ResponseData {
+        version: Default::default(),
+        responder_id: x509_ocsp::ResponderId::ByName(x509_cert::name::Name::default()),
+        produced_at: this_update,
+        responses: vec![single],
+        response_extensions: None,
+    };
+    let tbs = response_data.to_der().expect("tbs response data");
+    let rng = ring::rand::SystemRandom::new();
+    let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &ca_key.serialize_der(),
+        &rng,
+    )
+    .expect("signing key");
+    let signature = key_pair.sign(&rng, &tbs).expect("signature");
+    let basic = x509_ocsp::BasicOcspResponse {
+        tbs_response_data: response_data,
+        signature_algorithm: spki::AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+            parameters: None,
+        },
+        signature: BitString::from_bytes(signature.as_ref()).expect("bit string"),
+        certs: None,
+    };
+    x509_ocsp::OcspResponse::successful(basic)
+        .expect("OCSP response")
+        .to_der()
+        .expect("DER")
+}
+
+fn start_ocsp_responder(response: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind responder");
+    let addr = listener.local_addr().expect("responder address");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&response);
+        }
+    });
+    format!("http://{addr}/ocsp")
+}
+
+fn start_failing_ocsp_responder() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind responder");
+    let addr = listener.local_addr().expect("responder address");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let body = b"error";
+            let header = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{addr}/ocsp")
+}
+
+fn serve_mtls_with_ocsp_url(
+    name: &str,
+    url: String,
+    ca_cert: &rcgen::Certificate,
+    client_cert: &rcgen::Certificate,
+    client_key: &rcgen::KeyPair,
+) -> (TempDir, std::net::SocketAddr, rcgen::CertifiedKey) {
+    let server =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
+    let dir = TempDir::new(name);
+    let db = dir.join("ocsp.db");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server-key.pem");
+    let ca_path = dir.join("ca.pem");
+    std::fs::write(&cert_path, server.cert.pem()).expect("server cert");
+    std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("CA cert");
+    let _ = (client_cert, client_key);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        tls_client_ca: Some(ca_path),
+        tls_client_ocsp_url: Some(url),
+        require_tls: true,
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db, listener, options);
+    });
+    (dir, addr, server)
+}
+
+#[test]
+fn ocsp_online_rejects_revoked_client_certificate() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 42);
+    let response = ocsp_responder_response(&ca_cert, &ca_key, &client_cert, true);
+    let url = start_ocsp_responder(response);
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-online",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    assert!(
+        tls_select_one(addr, client).is_err(),
+        "an OCSP-revoked client certificate must be rejected"
+    );
+}
+
+#[test]
+fn ocsp_online_accepts_good_client_certificate() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 7);
+    let response = ocsp_responder_response(&ca_cert, &ca_key, &client_cert, false);
+    let url = start_ocsp_responder(response);
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-good",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    tls_select_one(addr, client).expect("an OCSP-good client certificate must be accepted");
+}
+
+#[test]
+fn ocsp_online_rejects_when_responder_fails() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 9);
+    let url = start_failing_ocsp_responder();
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-fail",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    assert!(
+        tls_select_one(addr, client).is_err(),
+        "a failing OCSP responder must reject the connection"
+    );
+}

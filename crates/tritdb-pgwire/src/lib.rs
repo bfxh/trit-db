@@ -10,12 +10,13 @@
 //! behind a mutex, so statements from different clients serialize on the
 //! engine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -185,6 +186,9 @@ pub struct ServerOptions {
     /// DER-encoded OCSP response (pre-fetched) used to revoke client
     /// certificates.
     pub tls_client_ocsp: Option<PathBuf>,
+    /// OCSP responder URL (`http://...`) used to check client certificates
+    /// online. Requires `tls_client_ca`.
+    pub tls_client_ocsp_url: Option<String>,
     /// Reject clients that do not request TLS.
     pub require_tls: bool,
     /// Permit cleartext password authentication over a plaintext connection.
@@ -445,6 +449,7 @@ struct RevocationVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     fingerprints: Vec<[u8; 32]>,
     serials: Vec<Vec<u8>>,
+    online: Option<Arc<OcspOnline>>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
@@ -485,6 +490,21 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
                 rustls::CertificateError::Revoked,
             ));
         }
+        if let Some(online) = &self.online {
+            match online.is_revoked(end_entity.as_ref()) {
+                Ok(true) => {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::Revoked,
+                    ))
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(rustls::Error::General(format!(
+                        "OCSP check failed: {error}"
+                    )))
+                }
+            }
+        }
         self.inner
             .verify_client_cert(end_entity, intermediates, now)
     }
@@ -510,6 +530,174 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+/// Online OCSP checker backed by a preconfigured responder URL.
+#[derive(Debug)]
+struct OcspOnline {
+    url: String,
+    ca_der: Vec<u8>,
+    cache: Mutex<HashMap<Vec<u8>, (bool, Instant)>>,
+}
+
+impl OcspOnline {
+    fn new(url: String, ca_der: Vec<u8>) -> Self {
+        Self {
+            url,
+            ca_der,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns true when the responder marks this certificate as revoked.
+    /// Unknown or failed checks are treated as revoked.
+    fn is_revoked(&self, cert_der: &[u8]) -> Result<bool, PgError> {
+        let (_, certificate) = x509_parser::parse_x509_certificate(cert_der)
+            .map_err(|error| PgError::Protocol(format!("OCSP: bad client certificate: {error}")))?;
+        let serial = certificate.raw_serial().to_vec();
+        {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((revoked, at)) = cache.get(&serial) {
+                if at.elapsed() < Duration::from_secs(60) {
+                    return Ok(*revoked);
+                }
+            }
+        }
+        let request = self.request_der(&serial)?;
+        let response = http_post(&self.url, &request)?;
+        let revoked = ocsp_revoked(&response, Some(&self.ca_der), &serial)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(serial, (revoked, Instant::now()));
+        Ok(revoked)
+    }
+
+    fn request_der(&self, serial: &[u8]) -> Result<Vec<u8>, PgError> {
+        use der::{Decode, Encode};
+        use sha1::{Digest, Sha1};
+        let ca = x509_cert::Certificate::from_der(&self.ca_der)
+            .map_err(|error| PgError::Protocol(format!("OCSP: bad CA certificate: {error}")))?;
+        let name_hash = Sha1::digest(
+            ca.tbs_certificate
+                .subject
+                .to_der()
+                .map_err(|error| PgError::Protocol(format!("OCSP: CA subject: {error}")))?,
+        );
+        let key_hash = Sha1::digest(
+            ca.tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .map_err(|error| PgError::Protocol(format!("OCSP: CA key: {error}")))?,
+        );
+        let cert_id = x509_ocsp::CertId {
+            hash_algorithm: spki::AlgorithmIdentifierOwned {
+                oid: der::asn1::ObjectIdentifier::new_unwrap("1.3.14.3.2.26"),
+                parameters: Some(der::Any::null()),
+            },
+            issuer_name_hash: der::asn1::OctetString::new(name_hash.to_vec())
+                .map_err(|error| PgError::Protocol(format!("OCSP: name hash: {error}")))?,
+            issuer_key_hash: der::asn1::OctetString::new(key_hash.to_vec())
+                .map_err(|error| PgError::Protocol(format!("OCSP: key hash: {error}")))?,
+            serial_number: x509_cert::serial_number::SerialNumber::new(serial)
+                .map_err(|error| PgError::Protocol(format!("OCSP: serial: {error}")))?,
+        };
+        let request = x509_ocsp::OcspRequest {
+            tbs_request: x509_ocsp::TbsRequest {
+                version: Default::default(),
+                requestor_name: None,
+                request_list: vec![x509_ocsp::Request {
+                    req_cert: cert_id,
+                    single_request_extensions: None,
+                }],
+                request_extensions: None,
+            },
+            optional_signature: None,
+        };
+        request
+            .to_der()
+            .map_err(|error| PgError::Protocol(format!("OCSP request: {error}")))
+    }
+}
+
+/// Minimal HTTP/1.1 POST for `http://` OCSP responders.
+fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, PgError> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        PgError::Protocol("OCSP responder URL must start with http://".to_string())
+    })?;
+    let (host_port, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse::<u16>()
+                .map_err(|_| PgError::Protocol(format!("bad OCSP responder port {port}")))?,
+        ),
+        None => (host_port, 80),
+    };
+    let mut stream = TcpStream::connect((host, port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/ocsp-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| PgError::Protocol("OCSP: malformed HTTP response".to_string()))?;
+    let head = String::from_utf8_lossy(&response[..header_end]);
+    let status = head.lines().next().unwrap_or("");
+    if !status.contains(" 200 ") {
+        return Err(PgError::Protocol(format!(
+            "OCSP responder returned {status}"
+        )));
+    }
+    Ok(response[header_end + 4..].to_vec())
+}
+
+/// Returns whether `serial` is revoked according to an OCSP response.
+fn ocsp_revoked(bytes: &[u8], ca_der: Option<&[u8]>, serial: &[u8]) -> Result<bool, PgError> {
+    use der::Decode;
+    let response = x509_ocsp::OcspResponse::from_der(bytes)
+        .map_err(|error| PgError::Protocol(format!("bad OCSP response: {error}")))?;
+    if !matches!(
+        response.response_status,
+        x509_ocsp::OcspResponseStatus::Successful
+    ) {
+        return Err(PgError::Protocol(
+            "OCSP responder returned a non-success status".to_string(),
+        ));
+    }
+    let Some(response_bytes) = response.response_bytes else {
+        return Err(PgError::Protocol(
+            "OCSP response has no responseBytes".to_string(),
+        ));
+    };
+    let basic = x509_ocsp::BasicOcspResponse::from_der(response_bytes.response.as_bytes())
+        .map_err(|error| PgError::Protocol(format!("bad OCSP basic response: {error}")))?;
+    verify_ocsp_signature(&basic, ca_der)?;
+    for single in &basic.tbs_response_data.responses {
+        if single.cert_id.serial_number.as_bytes() == serial {
+            return Ok(matches!(
+                single.cert_status,
+                x509_ocsp::CertStatus::Revoked(_)
+            ));
+        }
+    }
+    // The responder did not mention this certificate: reject rather than
+    // silently accepting it.
+    Ok(true)
 }
 
 /// Parses a pre-fetched OCSP response, verifies its signature, and returns
@@ -719,14 +907,29 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
                     .serials
                     .extend(load_ocsp(path, ca_certs.first().map(|cert| cert.as_ref()))?);
             }
+            let online = match (&options.tls_client_ocsp_url, ca_certs.first()) {
+                (Some(url), Some(ca)) => {
+                    Some(Arc::new(OcspOnline::new(url.clone(), ca.as_ref().to_vec())))
+                }
+                (Some(_), None) => {
+                    return Err(PgError::Protocol(
+                        "--tls-client-ocsp-url needs --tls-client-ca".to_string(),
+                    ))
+                }
+                (None, _) => None,
+            };
             let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
-                if revocation.fingerprints.is_empty() && revocation.serials.is_empty() {
+                if revocation.fingerprints.is_empty()
+                    && revocation.serials.is_empty()
+                    && online.is_none()
+                {
                     verifier
                 } else {
                     Arc::new(RevocationVerifier {
                         inner: verifier,
                         fingerprints: revocation.fingerprints,
                         serials: revocation.serials,
+                        online,
                     })
                 };
             builder.with_client_cert_verifier(verifier)
@@ -1085,11 +1288,134 @@ enum CopyFormat {
     Binary,
 }
 
+#[derive(Clone)]
+struct CopyOptions {
+    format: CopyFormat,
+    delimiter: u8,
+    null: String,
+    header: bool,
+    quote: u8,
+    escape: u8,
+}
+
+impl CopyOptions {
+    fn defaults(format: CopyFormat) -> Self {
+        match format {
+            CopyFormat::Csv => Self {
+                format,
+                delimiter: b',',
+                null: String::new(),
+                header: false,
+                quote: b'"',
+                escape: b'"',
+            },
+            _ => Self {
+                format,
+                delimiter: b'\t',
+                null: "\\N".to_string(),
+                header: false,
+                quote: b'"',
+                escape: b'"',
+            },
+        }
+    }
+}
+
+fn split_copy_options(inner: &str) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for character in inner.chars() {
+        match character {
+            '\'' => {
+                in_quote = !in_quote;
+                current.push(character);
+            }
+            ',' if !in_quote => {
+                items.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let mut parts = item.splitn(2, char::is_whitespace);
+            let key = parts.next()?.to_ascii_uppercase();
+            let value = parts
+                .next()
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|| "true".to_string());
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn copy_option_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("''", "'")
+    } else {
+        value.to_string()
+    }
+}
+
+fn copy_option_byte(value: &str, default: u8) -> u8 {
+    copy_option_value(value)
+        .as_bytes()
+        .first()
+        .copied()
+        .unwrap_or(default)
+}
+
+/// Parses the `(FORMAT csv, HEADER true, DELIMITER ';', NULL 'NULL', ...)`
+/// clause that follows `FROM STDIN` / `TO STDOUT`.
+fn parse_copy_options(tail: &str) -> CopyOptions {
+    let (Some(open), Some(close)) = (tail.find('('), tail.rfind(')')) else {
+        return CopyOptions::defaults(CopyFormat::Text);
+    };
+    if close <= open {
+        return CopyOptions::defaults(CopyFormat::Text);
+    }
+    let pairs = split_copy_options(&tail[open + 1..close]);
+    let format = pairs
+        .iter()
+        .find(|(key, _)| key == "FORMAT")
+        .map(
+            |(_, value)| match copy_option_value(value).to_ascii_lowercase().as_str() {
+                "csv" => CopyFormat::Csv,
+                "binary" => CopyFormat::Binary,
+                _ => CopyFormat::Text,
+            },
+        )
+        .unwrap_or(CopyFormat::Text);
+    let mut options = CopyOptions::defaults(format);
+    for (key, value) in pairs {
+        match key.as_str() {
+            "FORMAT" => {}
+            "HEADER" => {
+                let value = copy_option_value(&value).to_ascii_lowercase();
+                options.header = !matches!(value.as_str(), "false" | "off" | "0");
+            }
+            "DELIMITER" => options.delimiter = copy_option_byte(&value, options.delimiter),
+            "NULL" => options.null = copy_option_value(&value),
+            "QUOTE" => options.quote = copy_option_byte(&value, options.quote),
+            "ESCAPE" => options.escape = copy_option_byte(&value, options.escape),
+            _ => {}
+        }
+    }
+    options
+}
+
 struct CopyPlan {
     table: String,
     columns: Option<Vec<String>>,
     direction: CopyDirection,
-    format: CopyFormat,
+    options: CopyOptions,
 }
 
 /// Recognises `COPY <table> [(<cols>)] FROM STDIN` / `TO STDOUT`.
@@ -1106,14 +1432,7 @@ fn parse_copy(sql: &str) -> Option<CopyPlan> {
         let at = upper.rfind(" TO STDOUT")?;
         (&rest[..at], CopyDirection::Out, &rest[at..])
     };
-    let tail_upper = tail.to_ascii_uppercase();
-    let format = if tail_upper.contains("FORMAT CSV") {
-        CopyFormat::Csv
-    } else if tail_upper.contains("FORMAT BINARY") {
-        CopyFormat::Binary
-    } else {
-        CopyFormat::Text
-    };
+    let options = parse_copy_options(tail);
     let head = head.trim();
     let (table, columns) = match head.find('(') {
         Some(open) => {
@@ -1135,7 +1454,7 @@ fn parse_copy(sql: &str) -> Option<CopyPlan> {
         table,
         columns,
         direction,
-        format,
+        options,
     })
 }
 
@@ -1236,19 +1555,21 @@ fn handle_copy(
         };
         types.push(*data_type);
     }
-    match (plan.direction, plan.format) {
+    match (plan.direction, plan.options.format) {
         (CopyDirection::In, CopyFormat::Text) => {
-            copy_in(stream, engine, &plan.table, &columns, &types)
+            copy_in(stream, engine, &plan.table, &columns, &types, &plan.options)
         }
         (CopyDirection::In, CopyFormat::Csv) => {
-            copy_in_csv(stream, engine, &plan.table, &columns, &types)
+            copy_in_csv(stream, engine, &plan.table, &columns, &types, &plan.options)
         }
         (CopyDirection::In, CopyFormat::Binary) => {
             copy_in_binary(stream, engine, &plan.table, &columns, &types)
         }
-        (CopyDirection::Out, CopyFormat::Text) => copy_out(stream, engine, &plan.table, &columns),
+        (CopyDirection::Out, CopyFormat::Text) => {
+            copy_out(stream, engine, &plan.table, &columns, &plan.options)
+        }
         (CopyDirection::Out, CopyFormat::Csv) => {
-            copy_out_csv(stream, engine, &plan.table, &columns)
+            copy_out_csv(stream, engine, &plan.table, &columns, &plan.options)
         }
         (CopyDirection::Out, CopyFormat::Binary) => {
             copy_out_binary(stream, engine, &plan.table, &columns, &types)
@@ -1257,23 +1578,28 @@ fn handle_copy(
 }
 
 /// Parses one CSV line into fields. An unquoted empty field is `NULL`.
-fn parse_csv_line(line: &str) -> Vec<Option<String>> {
+fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<Option<String>> {
+    let quote = options.quote as char;
+    let escape = options.escape as char;
+    let delimiter = options.delimiter as char;
     let mut fields = Vec::new();
     let mut chars = line.chars().peekable();
     loop {
         let mut field = String::new();
         let mut quoted = false;
-        if chars.peek() == Some(&'"') {
+        if chars.peek() == Some(&quote) {
             quoted = true;
             chars.next();
             while let Some(character) = chars.next() {
-                if character == '"' {
-                    if chars.peek() == Some(&'"') {
+                if character == escape && escape == quote {
+                    if chars.peek() == Some(&quote) {
                         chars.next();
-                        field.push('"');
+                        field.push(quote);
                     } else {
                         break;
                     }
+                } else if character == quote {
+                    break;
                 } else {
                     field.push(character);
                 }
@@ -1283,38 +1609,41 @@ fn parse_csv_line(line: &str) -> Vec<Option<String>> {
             }
         } else {
             while let Some(&character) = chars.peek() {
-                if character == ',' {
+                if character == delimiter {
                     break;
                 }
                 field.push(character);
                 chars.next();
             }
         }
-        if quoted {
-            fields.push(Some(field));
-        } else if field.is_empty() {
+        if !quoted && field == options.null {
             fields.push(None);
         } else {
             fields.push(Some(field));
         }
-        if chars.next() != Some(',') {
+        if chars.next() != Some(delimiter) {
             break;
         }
     }
     fields
 }
 
-fn csv_field(value: Option<&str>) -> String {
+fn csv_field(value: Option<&str>, options: &CopyOptions) -> String {
     match value {
-        None => String::new(),
+        None => options.null.clone(),
         Some(text) => {
-            if text.is_empty()
-                || text.contains(',')
-                || text.contains('"')
+            let quote = options.quote as char;
+            let needs_quote = text.is_empty()
+                || text.contains(options.delimiter as char)
+                || text.contains(quote)
                 || text.contains('\n')
                 || text.contains('\r')
-            {
-                format!("\"{}\"", text.replace('"', "\"\""))
+                || text == options.null;
+            if needs_quote {
+                format!(
+                    "{quote}{}{quote}",
+                    text.replace(quote, &format!("{quote}{quote}"))
+                )
             } else {
                 text.to_string()
             }
@@ -1328,6 +1657,7 @@ fn copy_in_csv(
     table: &str,
     columns: &[String],
     types: &[DataType],
+    options: &CopyOptions,
 ) -> Result<bool, PgError> {
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(0);
@@ -1340,6 +1670,7 @@ fn copy_in_csv(
     let mut inserted = 0usize;
     let mut batch = String::new();
     let mut batched = 0usize;
+    let mut header_pending = options.header;
     loop {
         let Some((kind, payload)) = read_message(stream)? else {
             return Err(PgError::Protocol(
@@ -1348,9 +1679,13 @@ fn copy_in_csv(
         };
         match kind {
             b'd' => {
+                if header_pending {
+                    header_pending = false;
+                    continue;
+                }
                 let line = String::from_utf8_lossy(&payload);
                 let line = line.trim_end_matches(['\r', '\n']);
-                let values = parse_csv_line(line);
+                let values = parse_csv_line(line, options);
                 if values.len() != columns.len() {
                     return copy_failed(
                         stream,
@@ -1420,6 +1755,7 @@ fn copy_out_csv(
     engine: &mut SqlEngine,
     table: &str,
     columns: &[String],
+    options: &CopyOptions,
 ) -> Result<bool, PgError> {
     let sql = format!("SELECT {} FROM {table};", columns.join(", "));
     let results = match engine.execute_script(&sql) {
@@ -1433,6 +1769,17 @@ fn copy_out_csv(
         payload.extend_from_slice(&0i16.to_be_bytes());
     }
     write_message(stream, b'H', &payload)?;
+    if options.header {
+        let mut header = String::new();
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                header.push(options.delimiter as char);
+            }
+            header.push_str(column);
+        }
+        header.push('\n');
+        write_message(stream, b'd', header.as_bytes())?;
+    }
     let mut sent = 0usize;
     for result in results {
         if let QueryResult::Rows { rows, .. } = result {
@@ -1440,14 +1787,14 @@ fn copy_out_csv(
                 let mut line = String::new();
                 for (index, value) in row.iter().enumerate() {
                     if index > 0 {
-                        line.push(',');
+                        line.push(options.delimiter as char);
                     }
                     let text = if value.is_null() {
                         None
                     } else {
                         Some(value_text(value))
                     };
-                    line.push_str(&csv_field(text.as_deref()));
+                    line.push_str(&csv_field(text.as_deref(), options));
                 }
                 line.push('\n');
                 write_message(stream, b'd', line.as_bytes())?;
@@ -1738,6 +2085,7 @@ fn copy_in(
     table: &str,
     columns: &[String],
     types: &[DataType],
+    options: &CopyOptions,
 ) -> Result<bool, PgError> {
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(0); // text format
@@ -1750,6 +2098,7 @@ fn copy_in(
     let mut inserted = 0usize;
     let mut batch = String::new();
     let mut batched = 0usize;
+    let mut header_pending = options.header;
     loop {
         let Some((kind, payload)) = read_message(stream)? else {
             return Err(PgError::Protocol(
@@ -1758,9 +2107,13 @@ fn copy_in(
         };
         match kind {
             b'd' => {
+                if header_pending {
+                    header_pending = false;
+                    continue;
+                }
                 let line = String::from_utf8_lossy(&payload);
                 let line = line.trim_end_matches(['\r', '\n']);
-                let values: Vec<&str> = line.split('\t').collect();
+                let values: Vec<&str> = line.split(options.delimiter as char).collect();
                 if values.len() != columns.len() {
                     return copy_failed(
                         stream,
@@ -1784,7 +2137,7 @@ fn copy_in(
                     if index > 0 {
                         batch.push(',');
                     }
-                    if *value == "\\N" {
+                    if *value == options.null.as_str() {
                         batch.push_str("NULL");
                     } else {
                         batch.push_str(&copy_literal(value, types[index]));
@@ -1834,6 +2187,7 @@ fn copy_out(
     engine: &mut SqlEngine,
     table: &str,
     columns: &[String],
+    options: &CopyOptions,
 ) -> Result<bool, PgError> {
     let sql = format!("SELECT {} FROM {table};", columns.join(", "));
     let results = match engine.execute_script(&sql) {
@@ -1847,6 +2201,17 @@ fn copy_out(
         payload.extend_from_slice(&0i16.to_be_bytes());
     }
     write_message(stream, b'H', &payload)?;
+    if options.header {
+        let mut header = String::new();
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                header.push(options.delimiter as char);
+            }
+            header.push_str(column);
+        }
+        header.push('\n');
+        write_message(stream, b'd', header.as_bytes())?;
+    }
     let mut sent = 0usize;
     for result in results {
         if let QueryResult::Rows { rows, .. } = result {
@@ -1854,10 +2219,10 @@ fn copy_out(
                 let mut line = String::new();
                 for (index, value) in row.iter().enumerate() {
                     if index > 0 {
-                        line.push('\t');
+                        line.push(options.delimiter as char);
                     }
                     if value.is_null() {
-                        line.push_str("\\N");
+                        line.push_str(&options.null);
                     } else {
                         line.push_str(&copy_escape(&value_text(value)));
                     }
@@ -2305,10 +2670,154 @@ fn decode_binary_param(bytes: &[u8], oid: i32) -> Result<String, PgError> {
             Ok(f64::from_be_bytes(value).to_string())
         }
         25 | 1043 | 0 => Ok(String::from_utf8_lossy(bytes).to_string()),
+        1700 => decode_numeric_param(bytes),
+        1082 => decode_date_param(bytes),
+        1114 => decode_timestamp_param(bytes),
+        2950 => decode_uuid_param(bytes),
         other => Err(PgError::Protocol(format!(
             "unsupported binary parameter type oid {other}"
         ))),
     }
+}
+
+/// Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+fn civil_from_days(days: i32) -> (i32, u32, u32) {
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year as i32, month as u32, day as u32)
+}
+
+/// PostgreSQL `date` binary format: days since 2000-01-01.
+fn decode_date_param(bytes: &[u8]) -> Result<String, PgError> {
+    let days: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| PgError::Protocol("binary date parameter must be 4 bytes".to_string()))?;
+    let days = i32::from_be_bytes(days) + 10_957;
+    let (year, month, day) = civil_from_days(days);
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// PostgreSQL `timestamp` binary format: microseconds since 2000-01-01.
+fn decode_timestamp_param(bytes: &[u8]) -> Result<String, PgError> {
+    let micros: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| PgError::Protocol("binary timestamp parameter must be 8 bytes".to_string()))?;
+    let micros = i64::from_be_bytes(micros) + 10_957 * 86_400_000_000;
+    let days = micros.div_euclid(86_400_000_000) as i32;
+    let remainder = micros.rem_euclid(86_400_000_000);
+    let (year, month, day) = civil_from_days(days);
+    let seconds = remainder / 1_000_000;
+    let fraction = remainder % 1_000_000;
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    if fraction == 0 {
+        Ok(format!(
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+        ))
+    } else {
+        Ok(format!(
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{fraction:06}"
+        ))
+    }
+}
+
+/// PostgreSQL `uuid` binary format: 16 raw bytes.
+fn decode_uuid_param(bytes: &[u8]) -> Result<String, PgError> {
+    if bytes.len() != 16 {
+        return Err(PgError::Protocol(
+            "binary uuid parameter must be 16 bytes".to_string(),
+        ));
+    }
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// PostgreSQL `numeric` binary format: base-10000 digits.
+fn decode_numeric_param(bytes: &[u8]) -> Result<String, PgError> {
+    if bytes.len() < 8 || !bytes.len().is_multiple_of(2) {
+        return Err(PgError::Protocol(
+            "bad binary numeric parameter".to_string(),
+        ));
+    }
+    let ndigits = i16::from_be_bytes([bytes[0], bytes[1]]);
+    let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
+    let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let dscale = i16::from_be_bytes([bytes[6], bytes[7]]);
+    match sign {
+        0xC000 => return Ok("NaN".to_string()),
+        0xD000 => return Ok("Infinity".to_string()),
+        0xF000 => return Ok("-Infinity".to_string()),
+        _ => {}
+    }
+    if ndigits < 0 || dscale < 0 {
+        return Err(PgError::Protocol("bad binary numeric header".to_string()));
+    }
+    let ndigits = ndigits as usize;
+    if bytes.len() != 8 + ndigits * 2 {
+        return Err(PgError::Protocol(
+            "binary numeric length mismatch".to_string(),
+        ));
+    }
+    let mut digits = Vec::with_capacity(ndigits);
+    for index in 0..ndigits {
+        let at = 8 + index * 2;
+        digits.push(u16::from_be_bytes([bytes[at], bytes[at + 1]]));
+    }
+    // Every base-10000 digit is four decimal places wide.
+    let mut raw = String::with_capacity(ndigits * 4);
+    for digit in &digits {
+        raw.push_str(&format!("{digit:04}"));
+    }
+    let point = (weight as i64 + 1) * 4;
+    let mut integer = String::new();
+    let mut fraction = String::new();
+    if point <= 0 {
+        integer.push('0');
+        for _ in 0..(-point) {
+            fraction.push('0');
+        }
+        fraction.push_str(&raw);
+    } else if point as usize >= raw.len() {
+        integer.push_str(&raw);
+        for _ in 0..(point as usize - raw.len()) {
+            integer.push('0');
+        }
+    } else {
+        integer.push_str(&raw[..point as usize]);
+        fraction.push_str(&raw[point as usize..]);
+    }
+    let trimmed = integer.trim_start_matches('0');
+    let integer = if trimmed.is_empty() { "0" } else { trimmed };
+    let mut text = String::new();
+    if sign == 0x4000 {
+        text.push('-');
+    }
+    text.push_str(integer);
+    if dscale > 0 {
+        fraction.truncate(dscale as usize);
+        while fraction.len() < dscale as usize {
+            fraction.push('0');
+        }
+        text.push('.');
+        text.push_str(&fraction);
+    }
+    Ok(text)
 }
 
 fn substitute_params(
