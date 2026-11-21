@@ -17,7 +17,7 @@
    - StartupMessage v3（196608）；`SSLRequest`（80877103）回复 `N` 并要求重新 startup。
    - `Query`（`Q`）：执行 `SqlEngine::execute_script`，逐条返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
    - `Terminate`（`X`）断开；`Sync`（`S`）返回 `ReadyForQuery`。
-   - 扩展查询：`Parse` 保存 SQL 与参数 OID；`Bind` 把 `$n` 替换为字面量（按 OID 区分 int/bool/text）；`Describe` 返回 `ParameterDescription` + `NoData`；`Execute` 复用 simple query 的结果编码；`Close` 删除 prepared/portal。
+   - 扩展查询：`Parse` 保存 SQL 与参数 OID；`Bind` 把 `$n` 替换为字面量（按 OID 区分 int/bool/text）；`Describe` 返回 `ParameterDescription` + 真实 `RowDescription`（对 SELECT 用 `LIMIT 0` 准备取列名，参数用 `NULL` 占位；非 SELECT 返回 `NoData`）；`Execute` 复用 simple query 的结果编码；`Close` 删除 prepared/portal。
    - `Sync` 返回 `ReadyForQuery`，`Flush` 是 no-op。
    - 事务状态：连接级 `TxStatus`（Idle / InTransaction / Failed）；`BEGIN`/`START TRANSACTION` → `T`，语句失败 → `E`，`COMMIT`/`ROLLBACK` → `I`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝。
    - 空查询返回 `EmptyQueryResponse`。
@@ -35,7 +35,7 @@
 ## 后果 / 限制
 
 - **无 TLS**：`SSLRequest` 直接拒绝；只适合本地/受信网络。
-- **扩展查询只覆盖最小子集**：`Describe` 不返回结果列信息（`NoData`），`Execute` 忽略 row limit，参数只按文本格式处理。
+- **扩展查询只覆盖最小子集**：`Describe` 对 SELECT 返回列名/类型（全部 TEXT），非 SELECT 返回 `NoData`；`Execute` 忽略 row limit，参数只按文本格式处理。
 - **无认证**：任何能连上端口的客户端都可读写。
 - **串行 + 每连接独立引擎**：同一时刻只有一个连接在处理；连接数多时排队。
 - 所有列都是 TEXT，客户端看到的类型信息不精确。

@@ -16,7 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
 use tritdb_exec::Value;
-use tritdb_sql::{QueryResult, SqlEngine};
+use tritdb_sql::{parse_script, QueryResult, SqlEngine, Statement};
 
 const PROTOCOL_V3: i32 = 196_608;
 const SSL_REQUEST: i32 = 80_877_103;
@@ -109,7 +109,7 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
             b'X' => return Ok(()),
             b'P' => parse_prepared(&mut stream, &mut prepared, &payload)?,
             b'B' => bind_portal(&mut stream, &prepared, &mut portals, &payload)?,
-            b'D' => describe(&mut stream, &prepared, &portals, &payload)?,
+            b'D' => describe(&mut stream, &mut engine, &prepared, &portals, &payload)?,
             b'E' => execute_portal(&mut stream, &mut engine, &portals, &payload, &mut tx_status)?,
             b'C' => close_portal(&mut stream, &mut prepared, &mut portals, &payload)?,
             b'H' => {}
@@ -405,6 +405,7 @@ fn bind_portal(
 
 fn describe(
     stream: &mut TcpStream,
+    engine: &mut SqlEngine,
     prepared: &BTreeMap<String, Prepared>,
     portals: &BTreeMap<String, Bound>,
     payload: &[u8],
@@ -425,13 +426,13 @@ fn describe(
                 p.extend_from_slice(&oid.to_be_bytes());
             }
             write_message(stream, b't', &p)?;
-            write_message(stream, b'n', &[])?;
+            describe_result(stream, engine, &prepared.sql, &prepared.param_types)?;
         }
         b'P' => {
-            portals
+            let bound = portals
                 .get(&name)
                 .ok_or_else(|| PgError::Protocol(format!("unknown portal {name:?}")))?;
-            write_message(stream, b'n', &[])?;
+            describe_result(stream, engine, &bound.sql, &[])?;
         }
         other => {
             return Err(PgError::Protocol(format!(
@@ -441,6 +442,45 @@ fn describe(
         }
     }
     Ok(())
+}
+
+/// Writes a `RowDescription` when the statement is a `SELECT`; otherwise
+/// `NoData`.
+fn describe_result(
+    stream: &mut TcpStream,
+    engine: &mut SqlEngine,
+    sql: &str,
+    param_types: &[i32],
+) -> Result<(), PgError> {
+    match describe_columns(engine, sql, param_types) {
+        Ok(Some(columns)) => write_row_description(stream, &columns),
+        Ok(None) => write_message(stream, b'n', &[]),
+        Err(error) => write_error(stream, &error.to_string()),
+    }
+}
+
+/// Prepares a query with `LIMIT 0` to learn the result column names without
+/// producing rows. Unbound parameters are substituted with `NULL`.
+fn describe_columns(
+    engine: &mut SqlEngine,
+    sql: &str,
+    param_types: &[i32],
+) -> Result<Option<Vec<String>>, PgError> {
+    let placeholders = vec![None; param_types.len()];
+    let sql = substitute_params(sql, param_types, &placeholders)?;
+    let statements = parse_script(&sql).map_err(|error| PgError::Sql(error.to_string()))?;
+    let Some(Statement::Select(select)) = statements.first() else {
+        return Ok(None);
+    };
+    let mut limited = select.clone();
+    limited.limit = Some(0);
+    match engine
+        .execute_statement(&Statement::Select(limited))
+        .map_err(|error| PgError::Sql(error.to_string()))?
+    {
+        QueryResult::Rows { columns, .. } => Ok(Some(columns)),
+        QueryResult::Message(_) => Ok(None),
+    }
 }
 
 fn execute_portal(
