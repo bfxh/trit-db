@@ -84,6 +84,22 @@ pub enum Expr {
         /// Subquery; must return zero or one row and one column.
         query: Box<Query>,
     },
+    /// `[NOT] EXISTS (SELECT ...)`.
+    Exists {
+        /// Subquery.
+        query: Box<Query>,
+    },
+    /// `expr op ANY|ALL (SELECT ...)`.
+    Quantified {
+        /// Left operand.
+        expr: Box<Expr>,
+        /// Comparison operator.
+        op: BinaryOp,
+        /// `ANY` or `ALL`.
+        kind: Quantifier,
+        /// Subquery; must return exactly one column.
+        query: Box<Query>,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// Probe expression.
@@ -129,6 +145,15 @@ pub enum Expr {
         /// Argument.
         input: Option<Box<Expr>>,
     },
+}
+
+/// `ANY` / `ALL` quantifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quantifier {
+    /// `ANY`: true when at least one comparison is true.
+    Any,
+    /// `ALL`: true when every comparison is true.
+    All,
 }
 
 /// A `CREATE TABLE` column definition.

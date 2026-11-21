@@ -289,7 +289,10 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             left: Box::new(bind_expr(left, schema)?),
             right: Box::new(bind_expr(right, schema)?),
         }),
-        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => Err(SqlError::Unsupported(
+        Expr::InSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Quantified { .. } => Err(SqlError::Unsupported(
             "subquery must be materialized before binding".to_string(),
         )),
         Expr::Aggregate { .. } => Err(SqlError::Unsupported(
@@ -346,7 +349,8 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
-        Expr::ScalarSubquery { .. } => false,
+        Expr::Quantified { expr, .. } => expr_has_aggregate(expr),
+        Expr::ScalarSubquery { .. } | Expr::Exists { .. } => false,
         Expr::Aggregate { .. } => true,
     }
 }
@@ -544,7 +548,10 @@ fn bind_group_expr(
                 group_columns,
             )?),
         }),
-        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => Err(SqlError::Unsupported(
+        Expr::InSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Quantified { .. } => Err(SqlError::Unsupported(
             "subquery must be materialized before binding".to_string(),
         )),
         Expr::Aggregate { kind, input } => {
