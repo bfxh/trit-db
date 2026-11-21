@@ -20,6 +20,7 @@ webpki-roots = "1"
 x509-parser = { version = "0.18.1", features = ["verify"] }
 x509-ocsp = "0.2.1"
 der = "0.7"
+encoding_rs = "0.8"
 const-oid = "0.9"
 sha1 = "0.10"
 spki = "0.7"

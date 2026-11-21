@@ -193,6 +193,9 @@ pub struct ServerOptions {
     /// Extra PEM certificate trusted for HTTPS OCSP responders (e.g. a
     /// private CA). System roots are always used as well.
     pub tls_client_ocsp_ca: Option<PathBuf>,
+    /// Allow client certificates that an OCSP responder put on
+    /// `certificateHold` (only that reason).
+    pub tls_client_ocsp_allow_hold: bool,
     /// Reject clients that do not request TLS.
     pub require_tls: bool,
     /// Permit cleartext password authentication over a plaintext connection.
@@ -454,6 +457,7 @@ struct RevocationVerifier {
     fingerprints: Vec<[u8; 32]>,
     serials: Vec<Vec<u8>>,
     online: Option<Arc<OcspOnline>>,
+    allow_hold: bool,
 }
 
 impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
@@ -497,10 +501,14 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
         if let Some(online) = &self.online {
             match online.check_status(end_entity.as_ref()) {
                 Ok(OcspStatus::Revoked(reason)) => {
-                    eprintln!("pgwire: client certificate revoked (reason: {reason:?})");
-                    return Err(rustls::Error::InvalidCertificate(
-                        rustls::CertificateError::Revoked,
-                    ));
+                    if self.allow_hold && matches!(reason, Some(CrlReason::CertificateHold)) {
+                        eprintln!("pgwire: client certificate is on hold (allowed by policy)");
+                    } else {
+                        eprintln!("pgwire: client certificate revoked (reason: {reason:?})");
+                        return Err(rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::Revoked,
+                        ));
+                    }
                 }
                 Ok(OcspStatus::Good) => {}
                 Err(error) => {
@@ -859,6 +867,23 @@ fn verify_ocsp_signature(
     };
     let (_, signer) = x509_parser::parse_x509_certificate(&signer_der)
         .map_err(|error| PgError::Protocol(format!("bad OCSP signer: {error}")))?;
+    if basic.certs.is_some() {
+        let eku = signer
+            .extended_key_usage()
+            .map_err(|error| PgError::Protocol(format!("OCSP signer EKU: {error}")))?
+            .map(|extension| extension.value);
+        let Some(eku) = eku else {
+            return Err(PgError::Protocol(
+                "OCSP signer certificate has no extended key usage".to_string(),
+            ));
+        };
+        if !eku.any && !eku.ocsp_signing {
+            return Err(PgError::Protocol(
+                "OCSP signer certificate is not valid for OCSP signing (missing id-kp-OCSPSigning)"
+                    .to_string(),
+            ));
+        }
+    }
     let now = x509_parser::time::ASN1Time::now();
     if !signer.validity().is_valid_at(now) {
         return Err(PgError::Protocol(
@@ -1071,6 +1096,7 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
                         fingerprints: revocation.fingerprints,
                         serials: revocation.serials,
                         online,
+                        allow_hold: options.tls_client_ocsp_allow_hold,
                     })
                 };
             builder.with_client_cert_verifier(verifier)
@@ -1536,33 +1562,173 @@ fn copy_option_columns(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn copy_encoding_supported(encoding: &str) -> bool {
-    matches!(
-        encoding
-            .to_ascii_uppercase()
-            .replace(['-', '_'], "")
-            .as_str(),
-        "UTF8" | "LATIN1" | "ISO88591"
-    )
+/// Maps a PostgreSQL encoding name to the matching WHATWG codec.
+///
+/// `LATIN1` is deliberately not routed through here: WHATWG labels
+/// `iso-8859-1` as an alias of windows-1252, while PostgreSQL's `LATIN1`
+/// really is ISO-8859-1, so that one keeps its byte-for-byte path.
+fn copy_encoding_codec(encoding: &str) -> Option<&'static encoding_rs::Encoding> {
+    let label = match encoding
+        .to_ascii_uppercase()
+        .replace(['-', '_'], "")
+        .as_str()
+    {
+        "LATIN2" => "iso-8859-2",
+        "LATIN3" => "iso-8859-3",
+        "LATIN4" => "iso-8859-4",
+        "LATIN5" => "iso-8859-9",
+        "LATIN6" => "iso-8859-10",
+        "LATIN7" => "iso-8859-13",
+        "LATIN8" => "iso-8859-14",
+        "LATIN9" => "iso-8859-15",
+        "LATIN10" => "iso-8859-16",
+        "ISO88592" => "iso-8859-2",
+        "ISO88593" => "iso-8859-3",
+        "ISO88594" => "iso-8859-4",
+        "ISO88595" => "iso-8859-5",
+        "ISO88596" => "iso-8859-6",
+        "ISO88597" => "iso-8859-7",
+        "ISO88598" => "iso-8859-8",
+        "ISO88599" => "iso-8859-9",
+        "ISO885910" => "iso-8859-10",
+        "ISO885913" => "iso-8859-13",
+        "ISO885914" => "iso-8859-14",
+        "ISO885915" => "iso-8859-15",
+        "ISO885916" => "iso-8859-16",
+        "WIN1250" | "CP1250" => "windows-1250",
+        "WIN1251" | "CP1251" => "windows-1251",
+        "WIN1252" | "CP1252" => "windows-1252",
+        "WIN1253" | "CP1253" => "windows-1253",
+        "WIN1254" | "CP1254" => "windows-1254",
+        "WIN1255" | "CP1255" => "windows-1255",
+        "WIN1256" | "CP1256" => "windows-1256",
+        "WIN1257" | "CP1257" => "windows-1257",
+        "WIN1258" | "CP1258" => "windows-1258",
+        "WIN866" | "CP866" => "ibm866",
+        "WIN874" | "CP874" => "windows-874",
+        "KOI8R" => "koi8-r",
+        "KOI8U" => "koi8-u",
+        "SJIS" => "shift_jis",
+        "BIG5" => "big5",
+        "EUCJP" => "euc-jp",
+        "EUCKR" | "UHC" => "euc-kr",
+        "EUCCN" | "GBK" => "gbk",
+        "GB18030" => "gb18030",
+        _ => return None,
+    };
+    encoding_rs::Encoding::for_label(label.as_bytes())
 }
 
-fn copy_is_latin1(encoding: &str) -> bool {
+fn copy_encoding_supported(encoding: &str) -> bool {
+    let normalized = encoding.to_ascii_uppercase().replace(['-', '_'], "");
     matches!(
-        encoding
-            .to_ascii_uppercase()
-            .replace(['-', '_'], "")
-            .as_str(),
-        "LATIN1" | "ISO88591"
-    )
+        normalized.as_str(),
+        "UTF8" | "LATIN1" | "ISO88591" | "ASCII" | "UTF16LE" | "UTF16BE"
+    ) || copy_encoding_codec(encoding).is_some()
 }
 
 /// Decodes one COPY line using the declared encoding.
 fn decode_copy_line(bytes: &[u8], encoding: &str) -> String {
-    if copy_is_latin1(encoding) {
-        bytes.iter().map(|byte| *byte as char).collect()
-    } else {
-        String::from_utf8_lossy(bytes).to_string()
+    let normalized = encoding.to_ascii_uppercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "LATIN1" | "ISO88591" => bytes.iter().map(|byte| *byte as char).collect(),
+        "ASCII" => bytes
+            .iter()
+            .map(|byte| {
+                if *byte < 0x80 {
+                    *byte as char
+                } else {
+                    '\u{FFFD}'
+                }
+            })
+            .collect(),
+        "UTF16LE" => decode_utf16(bytes, true),
+        "UTF16BE" => decode_utf16(bytes, false),
+        _ => match copy_encoding_codec(encoding) {
+            Some(codec) => codec.decode_without_bom_handling(bytes).0.into_owned(),
+            None => String::from_utf8_lossy(bytes).to_string(),
+        },
     }
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Encodes one COPY line as UTF-8 into the declared encoding.
+///
+/// PostgreSQL refuses to write characters the target encoding cannot
+/// represent, so an unrepresentable character is an error rather than a
+/// substitution.
+fn encode_copy_line(text: &str, encoding: &str) -> Result<Vec<u8>, String> {
+    let normalized = encoding.to_ascii_uppercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "LATIN1" | "ISO88591" => {
+            let mut out = Vec::with_capacity(text.len());
+            for character in text.chars() {
+                let code = character as u32;
+                if code > 0xFF {
+                    return Err(format!(
+                        "character U+{code:04X} has no equivalent in encoding {encoding}"
+                    ));
+                }
+                out.push(code as u8);
+            }
+            Ok(out)
+        }
+        "ASCII" => {
+            let mut out = Vec::with_capacity(text.len());
+            for character in text.chars() {
+                let code = character as u32;
+                if code >= 0x80 {
+                    return Err(format!(
+                        "character U+{code:04X} has no equivalent in encoding {encoding}"
+                    ));
+                }
+                out.push(code as u8);
+            }
+            Ok(out)
+        }
+        "UTF16LE" => Ok(encode_utf16(text, true)),
+        "UTF16BE" => Ok(encode_utf16(text, false)),
+        _ => match copy_encoding_codec(encoding) {
+            Some(codec) => {
+                let (bytes, _, had_errors) = codec.encode(text);
+                if had_errors {
+                    return Err(format!(
+                        "characters have no equivalent in encoding {encoding}"
+                    ));
+                }
+                Ok(bytes.into_owned())
+            }
+            None => Ok(text.as_bytes().to_vec()),
+        },
+    }
+}
+
+fn encode_utf16(text: &str, little_endian: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        let bytes = if little_endian {
+            unit.to_le_bytes()
+        } else {
+            unit.to_be_bytes()
+        };
+        out.extend_from_slice(&bytes);
+    }
+    out
 }
 
 fn copy_option_byte(value: &str, default: u8) -> u8 {
@@ -2006,7 +2172,11 @@ fn copy_out_csv(
             header.push_str(column);
         }
         header.push('\n');
-        write_message(stream, b'd', header.as_bytes())?;
+        let header = match encode_copy_line(&header, &options.encoding) {
+            Ok(bytes) => bytes,
+            Err(message) => return copy_failed(stream, &message),
+        };
+        write_message(stream, b'd', &header)?;
     }
     let mut sent = 0usize;
     for result in results {
@@ -2025,7 +2195,11 @@ fn copy_out_csv(
                     line.push_str(&csv_field(text.as_deref(), options));
                 }
                 line.push('\n');
-                write_message(stream, b'd', line.as_bytes())?;
+                let bytes = match encode_copy_line(&line, &options.encoding) {
+                    Ok(bytes) => bytes,
+                    Err(message) => return copy_failed(stream, &message),
+                };
+                write_message(stream, b'd', &bytes)?;
                 sent += 1;
             }
         }
@@ -2438,7 +2612,11 @@ fn copy_out(
             header.push_str(column);
         }
         header.push('\n');
-        write_message(stream, b'd', header.as_bytes())?;
+        let header = match encode_copy_line(&header, &options.encoding) {
+            Ok(bytes) => bytes,
+            Err(message) => return copy_failed(stream, &message),
+        };
+        write_message(stream, b'd', &header)?;
     }
     let mut sent = 0usize;
     for result in results {
@@ -2456,7 +2634,11 @@ fn copy_out(
                     }
                 }
                 line.push('\n');
-                write_message(stream, b'd', line.as_bytes())?;
+                let bytes = match encode_copy_line(&line, &options.encoding) {
+                    Ok(bytes) => bytes,
+                    Err(message) => return copy_failed(stream, &message),
+                };
+                write_message(stream, b'd', &bytes)?;
                 sent += 1;
             }
         }

@@ -1,6 +1,6 @@
 # M7 第一刀：最小 PostgreSQL wire protocol
 
-状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` / TLS（rustls，含 mTLS、热轮换、指纹吊销）/ trust、cleartext、MD5、SCRAM-SHA-256（含持久化 verifier）认证、COPY（text/csv/binary + 自定义选项）、二进制结果与参数（含 numeric/date/timestamp/uuid）、CRL/预取 OCSP/在线 OCSP（http/https + nonce + 证书链/有效期/新鲜度）吊销、COPY `FORCE_* (*)` 与 LATIN1 转码已实现；OCSP 响应者 EKU 未做
+状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` / TLS（rustls，含 mTLS、热轮换、指纹吊销）/ trust、cleartext、MD5、SCRAM-SHA-256（含持久化 verifier）认证、COPY（text/csv/binary + 自定义选项）、二进制结果与参数（含 numeric/date/timestamp/uuid）、CRL/预取 OCSP/在线 OCSP（http/https + nonce + 证书链/有效期/新鲜度）吊销、COPY `FORCE_* (*)` 与 LATIN1 转码、OCSP 响应者 EKU（`id-kp-OCSPSigning`）与 `certificateHold` 策略、COPY 多编码族（ASCII / UTF-16LE/BE / ISO-8859-1..16 / Windows-1250..1258 / WIN866 / WIN874 / KOI8-R/U / GBK / GB18030 / Big5 / Shift_JIS / EUC-JP/KR，入方向解码 + 出方向编码）已实现
 
 日期：2026-11-21
 
@@ -29,7 +29,7 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - StartupMessage v3（196608）→ `AuthenticationOk` + `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 - `SSLRequest`（80877103）→ 配置证书时回 `S` 并做 TLS 握手；否则回 `N`，客户端用明文重试。
 - 认证：默认 `AuthenticationOk`（trust）；`--auth password` 发 `AuthenticationCleartextPassword`（3）；`--auth md5` 发 `AuthenticationMD5Password`（5）+ 4 字节 salt；`--auth scram-sha-256` 走 `AuthenticationSASL`（10）→ `SASLContinue`（11）→ `SASLFinal`（12）→ `AuthenticationOk`；`--scram-verifier-file` 直接加载 `SCRAM-SHA-256$<iterations>:<salt>$<stored>:<server>` verifier。
-- 吊销：`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，验签后按序列号）或每行一个 SHA-256 指纹；`--tls-client-ocsp` 解析预取的 DER OCSP 响应；`--tls-client-ocsp-url` 在线向 responder 发 `application/ocsp-request`（SHA-1 `CertID`、16 字节 nonce 并校验回显、60 秒缓存，支持 `http://` 与 `https://`；响应者证书链/有效期与 `thisUpdate`/`nextUpdate` 新鲜度也校验）；两者都先验签再按 `CertStatus::Revoked` 判定，命中即 `CertificateError::Revoked`，吊销原因写入日志。
+- 吊销：`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，验签后按序列号）或每行一个 SHA-256 指纹；`--tls-client-ocsp` 解析预取的 DER OCSP 响应；`--tls-client-ocsp-url` 在线向 responder 发 `application/ocsp-request`（SHA-1 `CertID`、16 字节 nonce 并校验回显、60 秒缓存，支持 `http://` 与 `https://`；响应者证书链/有效期与 `thisUpdate`/`nextUpdate` 新鲜度也校验）；两者都先验签再按 `CertStatus::Revoked` 判定，命中即 `CertificateError::Revoked`，吊销原因写入日志；响应者自带证书时必须带 `id-kp-OCSPSigning`（或 `anyExtendedKeyUsage`）扩展，否则拒绝；在线查询看到吊销原因 `certificateHold` 时默认同样拒绝，加 `--tls-client-ocsp-allow-hold` 则放行并记日志（预取响应只按序列号判定，不受该开关影响）。
 - mTLS：`--tls-client-ca` 提供 CA 时用 `WebPkiClientVerifier` 校验客户端证书。
 - 证书热轮换：`--tls-cert`/`--tls-key`/`--tls-client-ca` 的内容哈希变化后，下一个 TLS 连接使用新证书；重载失败保留旧证书。
 - `Query`（`Q`）→ 执行 `execute_script`，每个结果返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
@@ -37,8 +37,8 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - `Terminate`（`X`）断开。
 - 空查询 → `EmptyQueryResponse`；SQL 错误 → `ErrorResponse` + `ReadyForQuery`。
 - 事务状态：`BEGIN`/`START TRANSACTION` → `ReadyForQuery('T')`；语句失败 → `'E'`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝；`COMMIT`/`ROLLBACK` → `'I'`。
-- `COPY <table> [(cols)] FROM STDIN` → `CopyInResponse`（`G`）+ `CopyData`（`d`）行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；支持 `text`（`\N` 为 NULL）、`csv`（引号/`""` 转义）与 `binary`（`PGCOPY` 头 + 每行字段长度），并接受 `HEADER`/`DELIMITER`/`NULL`/`QUOTE`/`ESCAPE`/`FORCE_NULL (cols|*)`/`FORCE_NOT_NULL (cols|*)`/`ENCODING 'UTF8'|'LATIN1'`（LATIN1 逐字节转码）；按列类型构造 `INSERT`（每 1024 行一批）。
-- `COPY <table> [(cols)] TO STDOUT` → `CopyOutResponse`（`H`）+ `CopyData` 行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；同样支持三种格式。
+- `COPY <table> [(cols)] FROM STDIN` → `CopyInResponse`（`G`）+ `CopyData`（`d`）行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；支持 `text`（`\N` 为 NULL）、`csv`（引号/`""` 转义）与 `binary`（`PGCOPY` 头 + 每行字段长度），并接受 `HEADER`/`DELIMITER`/`NULL`/`QUOTE`/`ESCAPE`/`FORCE_NULL (cols|*)`/`FORCE_NOT_NULL (cols|*)`/`ENCODING '<编码名>'`（按声明编码解码后再构造 `INSERT`；LATIN1 逐字节、ASCII 非 7 位字节替换为 U+FFFD、UTF-16 按 2 字节码元解码，其余编码族经 `encoding_rs` 解码——覆盖 `LATIN2`..`LATIN10`/`ISO_8859_5..8`、`WIN1250..1258`、`WIN866`、`WIN874`、`KOI8R`、`KOI8U`、`GBK`、`GB18030`、`BIG5`、`SJIS`、`EUC_JP`、`EUC_KR`、`UHC`）；按列类型构造 `INSERT`（每 1024 行一批）。
+- `COPY <table> [(cols)] TO STDOUT` → `CopyOutResponse`（`H`）+ `CopyData` 行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；同样支持三种格式；`ENCODING` 也作用于出方向，每行按目标编码编码后发送，目标编码无法表示某个字符时报错（`character U+XXXX has no equivalent in encoding <name>`，与 PostgreSQL 一致，不做替换）。
 - 二进制结果：扩展查询 `Bind` 的 result format code（0/1，或每列一个）；`RowDescription` 的每列 format code 与 `DataRow` 编码一致（`int8` 8 字节 BE、`bool` 1 字节、`text` UTF-8）。
 
 ## 4. 类型与命令标签
@@ -56,10 +56,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')；`Describe('S')` 返回 `ParameterDescription` + `RowDescription(id, name)`，非 SELECT 返回 `NoData`；4 个并发连接同时查询；密码认证接受/拒绝、trust 不发密码请求、`SSLRequest` 在无 TLS 时回 `N`；自签证书下 TLS 握手 + 查询、`--require-tls` 拒绝明文；MD5 与 SCRAM 各自接受正确密码、拒绝错误密码；mTLS 接受 CA 签发的客户端证书、拒绝无证书客户端；证书文件替换后新连接使用新证书；cleartext 密码在明文连接下默认拒绝（需 `--allow-plaintext-password`）；SCRAM verifier 文件往返 + 登录、错误密码拒绝；吊销列表命中时客户端证书被拒；COPY FROM STDIN 插入两行（含 `\N`）后可查询、COPY TO STDOUT 输出文本行与 `\N`；扩展查询二进制结果（int8/bool/text 的字节编码与 RowDescription format code）、简单查询仍为文本。
+端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')；`Describe('S')` 返回 `ParameterDescription` + `RowDescription(id, name)`，非 SELECT 返回 `NoData`；4 个并发连接同时查询；密码认证接受/拒绝、trust 不发密码请求、`SSLRequest` 在无 TLS 时回 `N`；自签证书下 TLS 握手 + 查询、`--require-tls` 拒绝明文；MD5 与 SCRAM 各自接受正确密码、拒绝错误密码；mTLS 接受 CA 签发的客户端证书、拒绝无证书客户端；证书文件替换后新连接使用新证书；cleartext 密码在明文连接下默认拒绝（需 `--allow-plaintext-password`）；SCRAM verifier 文件往返 + 登录、错误密码拒绝；吊销列表命中时客户端证书被拒；COPY FROM STDIN 插入两行（含 `\N`）后可查询、COPY TO STDOUT 输出文本行与 `\N`；扩展查询二进制结果（int8/bool/text 的字节编码与 RowDescription format code）、简单查询仍为文本；`ENCODING 'UTF16LE'`/`'WIN1252'`/`'GBK'`/`'KOI8R'` 的 COPY 入方向转码；`COPY TO STDOUT (ENCODING 'GBK')` 输出 GBK 字节、`ENCODING 'LATIN1'` 遇中文字符报错；不支持的名字（如 `MULE_INTERNAL`）被拒绝；OCSP 响应者缺 `id-kp-OCSPSigning` 时拒绝；`certificateHold` 默认拒绝、`--tls-client-ocsp-allow-hold` 放行。
 
-## 6. 还没做
-
-- **OCSP 响应者 EKU**：不检查 `id-kp-OCSPSigning` 扩展；
-- **OCSP 吊销原因策略**：原因只写日志，不按原因拒绝；
-- **COPY 编码**：只支持 UTF-8 与 ISO-8859-1，没有其他转码；

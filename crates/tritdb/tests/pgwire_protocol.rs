@@ -1932,6 +1932,7 @@ fn ocsp_responder_response(
     client_der: &[u8],
     revoked: bool,
     nonce: Option<Vec<u8>>,
+    reason: Option<x509_cert::ext::pkix::CrlReason>,
 ) -> Vec<u8> {
     use der::asn1::{BitString, GeneralizedTime, ObjectIdentifier, OctetString};
     use der::{Any, Decode, Encode};
@@ -1963,7 +1964,7 @@ fn ocsp_responder_response(
     let status = if revoked {
         x509_ocsp::CertStatus::revoked(x509_ocsp::RevokedInfo {
             revocation_time: this_update,
-            revocation_reason: None,
+            revocation_reason: reason,
         })
     } else {
         x509_ocsp::CertStatus::good()
@@ -2095,6 +2096,7 @@ fn serve_mtls_with_ocsp_url(
     client_cert: &rcgen::Certificate,
     client_key: &rcgen::KeyPair,
     ocsp_ca: Option<std::path::PathBuf>,
+    allow_hold: bool,
 ) -> (TempDir, std::net::SocketAddr, rcgen::CertifiedKey) {
     let server =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
@@ -2116,6 +2118,7 @@ fn serve_mtls_with_ocsp_url(
         tls_client_ca: Some(ca_path),
         tls_client_ocsp_url: Some(url),
         tls_client_ocsp_ca: ocsp_ca,
+        tls_client_ocsp_allow_hold: allow_hold,
         require_tls: true,
         ..Default::default()
     });
@@ -2185,6 +2188,7 @@ fn ocsp_online_https_responder() {
                 &client_der,
                 false,
                 ocsp_request_nonce(request),
+                None,
             )
         },
     );
@@ -2200,6 +2204,7 @@ fn ocsp_online_https_responder() {
         &client_cert,
         &client_key,
         Some(trust_path),
+        false,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
@@ -2220,6 +2225,7 @@ fn ocsp_online_rejects_revoked_client_certificate() {
             &client_der,
             true,
             ocsp_request_nonce(request),
+            None,
         )
     });
     let (dir, addr, server) = serve_mtls_with_ocsp_url(
@@ -2229,6 +2235,7 @@ fn ocsp_online_rejects_revoked_client_certificate() {
         &client_cert,
         &client_key,
         None,
+        false,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
@@ -2252,6 +2259,7 @@ fn ocsp_online_accepts_good_client_certificate() {
             &client_der,
             false,
             ocsp_request_nonce(request),
+            None,
         )
     });
     let (dir, addr, server) = serve_mtls_with_ocsp_url(
@@ -2261,6 +2269,7 @@ fn ocsp_online_accepts_good_client_certificate() {
         &client_cert,
         &client_key,
         None,
+        false,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
@@ -2281,6 +2290,7 @@ fn ocsp_online_rejects_mismatched_nonce() {
             &client_der,
             false,
             Some(vec![0u8; 16]),
+            None,
         )
     });
     let (dir, addr, server) = serve_mtls_with_ocsp_url(
@@ -2290,6 +2300,7 @@ fn ocsp_online_rejects_mismatched_nonce() {
         &client_cert,
         &client_key,
         None,
+        false,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
@@ -2311,6 +2322,7 @@ fn ocsp_online_rejects_when_responder_fails() {
         &client_cert,
         &client_key,
         None,
+        false,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
@@ -2397,7 +2409,7 @@ fn copy_rejects_unsupported_encoding() {
 
     query(
         &mut stream,
-        "COPY t FROM STDIN (FORMAT csv, ENCODING 'KOI8R');",
+        "COPY t FROM STDIN (FORMAT csv, ENCODING 'MULE_INTERNAL');",
     );
     let messages = read_until_ready(&mut stream);
     assert!(
@@ -2470,4 +2482,238 @@ fn copy_latin1_encoding_is_transcoded() {
         .map(|(_, payload)| parse_row(payload))
         .expect("DataRow");
     assert_eq!(row, vec![Some("1".into()), Some("é".into())]);
+}
+
+#[test]
+fn copy_utf16le_encoding_is_transcoded() {
+    let (_dir, mut stream) = start_server("pgproto-copy-utf16");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT text, ENCODING 'UTF16LE');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    // "1\t\u{00e9}\n" in UTF-16LE.
+    write_message(
+        &mut stream,
+        b'd',
+        &[0x31, 0x00, 0x09, 0x00, 0xE9, 0x00, 0x0A, 0x00],
+    );
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(row, vec![Some("1".into()), Some("é".into())]);
+}
+
+#[test]
+fn copy_windows1252_encoding_is_transcoded() {
+    let (_dir, mut stream) = start_server("pgproto-copy-win1252");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT text, ENCODING 'WIN1252');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    // 0x80 is the euro sign in Windows-1252.
+    write_message(&mut stream, b'd', &[0x31, 0x09, 0x80, 0x0A]);
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(row, vec![Some("1".into()), Some("€".into())]);
+}
+
+#[test]
+fn ocsp_online_hold_is_rejected_by_default() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 21);
+    let ca_der = ca_cert.der().as_ref().to_vec();
+    let ca_key_der = ca_key.serialize_der();
+    let client_der = client_cert.der().as_ref().to_vec();
+    let url = start_ocsp_responder(move |request| {
+        ocsp_responder_response(
+            &ca_der,
+            &ca_key_der,
+            &client_der,
+            true,
+            ocsp_request_nonce(request),
+            Some(x509_cert::ext::pkix::CrlReason::CertificateHold),
+        )
+    });
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-hold",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+        None,
+        false,
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    assert!(
+        tls_select_one(addr, client).is_err(),
+        "certificateHold must reject without --tls-client-ocsp-allow-hold"
+    );
+}
+
+#[test]
+fn ocsp_online_allow_hold_policy() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 22);
+    let ca_der = ca_cert.der().as_ref().to_vec();
+    let ca_key_der = ca_key.serialize_der();
+    let client_der = client_cert.der().as_ref().to_vec();
+    let url = start_ocsp_responder(move |request| {
+        ocsp_responder_response(
+            &ca_der,
+            &ca_key_der,
+            &client_der,
+            true,
+            ocsp_request_nonce(request),
+            Some(x509_cert::ext::pkix::CrlReason::CertificateHold),
+        )
+    });
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-hold-ok",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+        None,
+        true,
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    tls_select_one(addr, client).expect("certificateHold is allowed by policy");
+}
+
+#[test]
+fn copy_gbk_encoding_is_transcoded() {
+    let (_dir, mut stream) = start_server("pgproto-copy-gbk");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT text, ENCODING 'GBK');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    // "1\t中\n" with 中 as GBK D6 D0.
+    write_message(&mut stream, b'd', &[0x31, 0x09, 0xD6, 0xD0, 0x0A]);
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(row, vec![Some("1".into()), Some("中".into())]);
+}
+
+#[test]
+fn copy_koi8r_encoding_is_transcoded() {
+    let (_dir, mut stream) = start_server("pgproto-copy-koi8r");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT text, ENCODING 'KOI8R');",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    // "1\tя\n" with я as KOI8-R D1.
+    write_message(&mut stream, b'd', &[0x31, 0x09, 0xD1, 0x0A]);
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t;");
+    let messages = read_until_ready(&mut stream);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow");
+    assert_eq!(row, vec![Some("1".into()), Some("я".into())]);
+}
+
+#[test]
+fn copy_to_stdout_encodes_into_target_encoding() {
+    let (_dir, mut stream) = start_server("pgproto-copy-out-gbk");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT); \
+         INSERT INTO t VALUES (1, '中');",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "COPY t TO STDOUT (ENCODING 'GBK');");
+    let (kind, _) = read_message(&mut stream).expect("CopyOutResponse");
+    assert_eq!(kind, b'H');
+    let (kind, payload) = read_message(&mut stream).expect("copy data");
+    assert_eq!(kind, b'd');
+    assert_eq!(payload, vec![0x31, 0x09, 0xD6, 0xD0, 0x0A]);
+    let (kind, _) = read_message(&mut stream).expect("copy done");
+    assert_eq!(kind, b'c');
+    let _ = read_until_ready(&mut stream);
+}
+
+#[test]
+fn copy_to_stdout_rejects_unrepresentable_character() {
+    let (_dir, mut stream) = start_server("pgproto-copy-out-latin1");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT); \
+         INSERT INTO t VALUES (1, '中');",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "COPY t TO STDOUT (ENCODING 'LATIN1');");
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        has_error(&messages),
+        "LATIN1 cannot represent 中: {messages:?}"
+    );
 }

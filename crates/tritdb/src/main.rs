@@ -99,7 +99,7 @@ fn print_help() {
         "        [--auth trust|password|md5|scram-sha-256 --password <pwd>|--password-file <file>]"
     );
     println!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
-    println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http(s)://...>] [--tls-client-ocsp-ca <pem>]]");
+    println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http(s)://...>] [--tls-client-ocsp-ca <pem>] [--tls-client-ocsp-allow-hold]]");
     println!("        [--allow-plaintext-password]");
     println!("        [--scram-verifier-file <file>]");
     println!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
@@ -1801,6 +1801,12 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         return Err("--tls-client-ocsp-url needs --tls-client-ca".to_string());
     }
     let tls_client_ocsp_ca = arg_value(args, "--tls-client-ocsp-ca").map(std::path::PathBuf::from);
+    let tls_client_ocsp_allow_hold = args
+        .iter()
+        .any(|argument| argument == "--tls-client-ocsp-allow-hold");
+    if tls_client_ocsp_allow_hold && tls_client_ocsp_url.is_none() {
+        return Err("--tls-client-ocsp-allow-hold needs --tls-client-ocsp-url".to_string());
+    }
     if tls_cert.is_some() != tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be given together".to_string());
     }
@@ -1831,6 +1837,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_client_ocsp,
         tls_client_ocsp_url,
         tls_client_ocsp_ca,
+        tls_client_ocsp_allow_hold,
         require_tls,
         allow_plaintext_password,
     };

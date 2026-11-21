@@ -271,6 +271,22 @@ fn serve_rejects_incomplete_auth_and_tls_flags() {
         stderr(&output)
     );
 
+    // The hold policy only applies to an online responder.
+    let output = run([
+        "serve",
+        "--db",
+        db,
+        "--tls-client-ca",
+        "ca.pem",
+        "--tls-client-ocsp-allow-hold",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("needs --tls-client-ocsp-url"),
+        "stderr: {}",
+        stderr(&output)
+    );
+
     // `scram-verifier` writes a verifier file; `--scram-verifier-file`
     // cannot be combined with a cleartext password source.
     let verifier_path = dir.join("scram.verifier");
