@@ -103,7 +103,8 @@ fn print_help() {
     println!(
         "  graph neighbors [--wal graph.wal --name g | --nodes N --edges ...] --node 0 [--hops 1]"
     );
-    println!("  graph knn --points \"1,2;3,4\" [--labels T,U] --query \"1,2\" [--k 3]");
+    println!("  graph put-points --wal graph.wal --name p --points \"1,2;3,4\" [--labels T,U]");
+    println!("  graph knn [--wal graph.wal --name p | --points \"1,2;3,4\"] [--labels T,U] --query \"1,2\" [--k 3]");
     println!("  cas put --store dir --file blob");
     println!("  cas get --store dir --hash <hex> --out blob");
     println!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
@@ -1158,6 +1159,7 @@ fn run_graph(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         Some("build") => graph_build(args),
         Some("load") => graph_load(args),
+        Some("put-points") => graph_put_points(args),
         Some("reach") => graph_reach(args),
         Some("neighbors") => graph_neighbors(args),
         Some("knn") => graph_knn(args),
@@ -1390,7 +1392,9 @@ fn graph_neighbors(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn graph_knn(args: &[String]) -> Result<(), String> {
+fn graph_put_points(args: &[String]) -> Result<(), String> {
+    let wal = required_arg(args, "--wal")?;
+    let name = required_arg(args, "--name")?;
     let vectors = parse_points(&required_arg(args, "--points")?)?;
     let labels = parse_truth_list(arg_value(args, "--labels").as_deref())?;
     if !labels.is_empty() && labels.len() != vectors.len() {
@@ -1400,8 +1404,6 @@ fn graph_knn(args: &[String]) -> Result<(), String> {
             vectors.len()
         ));
     }
-    let query = parse_vector(&required_arg(args, "--query")?)?;
-    let k = arg_usize(args, "--k", 3);
     let points: Vec<tritdb_exec::graph::Point> = vectors
         .into_iter()
         .enumerate()
@@ -1411,6 +1413,55 @@ fn graph_knn(args: &[String]) -> Result<(), String> {
             label: labels.get(id).copied().unwrap_or(TruthValue::True),
         })
         .collect();
+    let bytes = tritdb_exec::graph::encode_points(&points);
+    let store = TxnStore::open(std::path::Path::new(&wal))
+        .map_err(|error| format!("open {wal}: {error}"))?;
+    let mut txn = store.begin().map_err(|error| error.to_string())?;
+    txn.put(format!("points/{name}").as_bytes(), &bytes)
+        .map_err(|error| error.to_string())?;
+    let info = txn.commit().map_err(|error| error.to_string())?;
+    println!(
+        "name={name} points={} bytes={} txn={} lsn={}",
+        points.len(),
+        bytes.len(),
+        info.txn_id,
+        info.commit_lsn
+    );
+    Ok(())
+}
+
+fn graph_knn(args: &[String]) -> Result<(), String> {
+    let points = if let Some(wal) = arg_value(args, "--wal") {
+        let name = required_arg(args, "--name")?;
+        let store = TxnStore::open(std::path::Path::new(&wal))
+            .map_err(|error| format!("open {wal}: {error}"))?;
+        let bytes = store
+            .get(format!("points/{name}").as_bytes())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("points {name} not found in {wal}"))?;
+        tritdb_exec::graph::decode_points(&bytes).map_err(|error| error.to_string())?
+    } else {
+        let vectors = parse_points(&required_arg(args, "--points")?)?;
+        let labels = parse_truth_list(arg_value(args, "--labels").as_deref())?;
+        if !labels.is_empty() && labels.len() != vectors.len() {
+            return Err(format!(
+                "--labels has {} values for {} points",
+                labels.len(),
+                vectors.len()
+            ));
+        }
+        vectors
+            .into_iter()
+            .enumerate()
+            .map(|(id, vector)| tritdb_exec::graph::Point {
+                id: id as u32,
+                vector,
+                label: labels.get(id).copied().unwrap_or(TruthValue::True),
+            })
+            .collect()
+    };
+    let query = parse_vector(&required_arg(args, "--query")?)?;
+    let k = arg_usize(args, "--k", 3);
     let answer =
         tritdb_exec::graph::annotated_knn(&points, &query, k).map_err(|error| error.to_string())?;
     for (name, bucket) in [

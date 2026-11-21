@@ -39,6 +39,9 @@ M3 的 `tritdb-exec::ann` 已经有 K3/Belnap 注解、精确模型计数和最�
    - `AnnotatedGraph::encode()` 输出 magic `TRGR`、版本字节、node/edge 计数（`u32` LE）、`node_count + 1` 个 offsets、`edge_count` 个 targets、每条边 1 字节标签（`0` False、`1` Unknown、`2` True）。
    - `decode()` 校验 magic/version/长度/offsets 单调/行内 target 严格递增/标签码，坏字节返回 `BadEncoding`。
    - `graph build` 把编码写进 `TxnStore` 的 `graph/<name>` value（单事务提交）；`graph load` 和带 `--wal/--name` 的 `reach/neighbors` 从同一 key 读回。
+6. **向量持久化 `TRPN`**
+   - `encode_points` / `decode_points`：magic `TRPN`、版本、点数量，每点 `id`、标签、维度、`i64` 坐标。
+   - `graph put-points --wal --name --points [--labels]` 写 `points/<name>`；`graph knn --wal --name --query --k` 读回后执行 k-NN。
 
 ## 理由
 
@@ -49,7 +52,7 @@ M3 的 `tritdb-exec::ann` 已经有 K3/Belnap 注解、精确模型计数和最�
 
 ## 后果 / 限制
 
-- **持久化在 `TxnStore`**：整张图是 `graph/<name>` 下的一个 value，不是 pstore 页、没有 manifest/chunk 级增量；每次加载完整解码，不支持局部更新。
+- **持久化在 `TxnStore`**：图与点集分别是 `graph/<name>` / `points/<name>` 下的一个 value，不是 pstore 页、没有 manifest/chunk 级增量；每次加载完整解码，不支持局部更新。
 - **没有近似索引**：`annotated_knn` 是精确扫描，不是 HNSW/IVF；维度上限 64，坐标是 `i64`。
 - **边是单标签、无权重**：多重图、边权、节点标签都未支持。
 - **没有递归 SQL 语法**：`graph` 目前只是 CLI/库 API，`WITH RECURSIVE` 之类尚未进 parser。
@@ -69,4 +72,5 @@ cargo fmt --all -- --check
 - 三值可达：全 `TRUE` → `certain`、含 `UNKNOWN` → `contingent`、`FALSE` 断边 → `impossible`、`max_hops` 截断、零跳自反；
 - BFS：一跳/两跳层与顺序；
 - k-NN：距离排序、平局按 `id`、T/U/F 分组、维度不一致与 `i128` 溢出；
-- `TRGR`：往返保持节点/边/标签，坏 magic/版本/长度/标签/offsets 都被拒绝。
+- `TRGR`：往返保持节点/边/标签，坏 magic/版本/长度/标签/offsets 都被拒绝；
+- `TRPN`：往返保持点/标签/坐标，坏 magic/长度/标签被拒绝。
