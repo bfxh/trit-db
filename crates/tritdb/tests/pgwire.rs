@@ -154,3 +154,124 @@ fn simple_query_roundtrip() {
 
     stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
 }
+
+fn write_framed(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
+    let mut message = vec![kind];
+    message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+    message.extend_from_slice(payload);
+    stream.write_all(&message).expect("write message");
+}
+
+fn write_parse(stream: &mut TcpStream, statement: &str, sql: &str, param_oids: &[i32]) {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(statement.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(sql.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&(param_oids.len() as i16).to_be_bytes());
+    for oid in param_oids {
+        payload.extend_from_slice(&oid.to_be_bytes());
+    }
+    write_framed(stream, b'P', &payload);
+}
+
+fn write_bind(stream: &mut TcpStream, portal: &str, statement: &str, params: &[Option<&[u8]>]) {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(portal.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(statement.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&0i16.to_be_bytes()); // no parameter format codes
+    payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    for param in params {
+        match param {
+            None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(value) => {
+                payload.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                payload.extend_from_slice(value);
+            }
+        }
+    }
+    payload.extend_from_slice(&0i16.to_be_bytes()); // no result format codes
+    write_framed(stream, b'B', &payload);
+}
+
+fn write_describe_portal(stream: &mut TcpStream, portal: &str) {
+    let mut payload = vec![b'P'];
+    payload.extend_from_slice(portal.as_bytes());
+    payload.push(0);
+    write_framed(stream, b'D', &payload);
+}
+
+fn write_execute(stream: &mut TcpStream, portal: &str) {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(portal.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&0i32.to_be_bytes()); // no row limit
+    write_framed(stream, b'E', &payload);
+}
+
+fn write_sync(stream: &mut TcpStream) {
+    write_framed(stream, b'S', &[]);
+}
+
+#[test]
+fn extended_query_roundtrip() {
+    let dir = TempDir::new("pgwire-extended");
+    let db = dir.join("pg.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT); INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    write_parse(
+        &mut stream,
+        "",
+        "SELECT id, name FROM t WHERE id > $1 ORDER BY id;",
+        &[20],
+    );
+    write_bind(&mut stream, "", "", &[Some(b"1")]);
+    write_describe_portal(&mut stream, "");
+    write_execute(&mut stream, "");
+    write_sync(&mut stream);
+
+    let messages = read_until_ready(&mut stream);
+    let kinds: Vec<u8> = messages.iter().map(|(kind, _)| *kind).collect();
+    assert!(kinds.contains(&b'1'), "missing ParseComplete: {kinds:?}");
+    assert!(kinds.contains(&b'2'), "missing BindComplete: {kinds:?}");
+    assert!(kinds.contains(&b'n'), "missing NoData: {kinds:?}");
+
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2".to_string()), Some("b".to_string())],
+            vec![Some("3".to_string()), Some("c".to_string())],
+        ]
+    );
+
+    let tags: Vec<String> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'C')
+        .map(|(_, payload)| String::from_utf8_lossy(&payload[..payload.len() - 1]).to_string())
+        .collect();
+    assert_eq!(tags, vec!["SELECT 2"], "tags: {tags:?}");
+
+    stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
+}

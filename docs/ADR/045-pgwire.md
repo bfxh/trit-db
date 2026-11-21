@@ -17,7 +17,8 @@
    - StartupMessage v3（196608）；`SSLRequest`（80877103）回复 `N` 并要求重新 startup。
    - `Query`（`Q`）：执行 `SqlEngine::execute_script`，逐条返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
    - `Terminate`（`X`）断开；`Sync`（`S`）返回 `ReadyForQuery`。
-   - 扩展查询（`Parse`/`Bind`/`Describe`/`Execute`/`Close`）返回 `ErrorResponse`。
+   - 扩展查询：`Parse` 保存 SQL 与参数 OID；`Bind` 把 `$n` 替换为字面量（按 OID 区分 int/bool/text）；`Describe` 返回 `ParameterDescription` + `NoData`；`Execute` 复用 simple query 的结果编码；`Close` 删除 prepared/portal。
+   - `Sync` 返回 `ReadyForQuery`，`Flush` 是 no-op。
    - 空查询返回 `EmptyQueryResponse`。
 3. **类型与格式**
    - 所有列统一声明为 `TEXT`（oid 25）、文本格式；值编码：`INT` 十进制、`TEXT` 原文、`BOOL` → `t`/`f`、`Logic` → `TRUE/FALSE/BOTH/NEITHER`、`Ł` → `0.000`、`ℕ` 十进制、`NULL` → -1 长度。
@@ -33,7 +34,7 @@
 ## 后果 / 限制
 
 - **无 TLS**：`SSLRequest` 直接拒绝；只适合本地/受信网络。
-- **无扩展查询**：`psql` 默认 simple query，但很多驱动默认扩展查询（`Parse`/`Bind`），需要显式设置。
+- **扩展查询只覆盖最小子集**：`Describe` 不返回结果列信息（`NoData`），`Execute` 忽略 row limit，参数只按文本格式处理。
 - **无认证**：任何能连上端口的客户端都可读写。
 - **串行 + 每连接独立引擎**：同一时刻只有一个连接在处理；连接数多时排队。
 - 所有列都是 TEXT，客户端看到的类型信息不精确。

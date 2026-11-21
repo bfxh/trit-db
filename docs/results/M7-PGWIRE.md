@@ -1,6 +1,6 @@
 # M7 第一刀：最小 PostgreSQL wire protocol
 
-状态：startup / simple Query / Terminate / Sync 已实现；扩展查询、TLS、认证、事务状态未做
+状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync 已实现；TLS、认证、事务状态未做
 
 日期：2026-11-21
 
@@ -9,8 +9,9 @@
 ```text
 crates/tritdb-pgwire/Cargo.toml
 crates/tritdb-pgwire/src/lib.rs   serve / 协议编解码 / 类型文本化
+                                  Parse/Bind/Describe/Execute/Close / $n 参数替换
 crates/tritdb/src/main.rs         serve --db ... [--listen ...]
-crates/tritdb/tests/pgwire.rs     1 个端到端测试
+crates/tritdb/tests/pgwire.rs     2 个端到端测试
 docs/ADR/045-pgwire.md
 ```
 
@@ -27,7 +28,8 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - StartupMessage v3（196608）→ `AuthenticationOk` + `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 - `SSLRequest`（80877103）→ 回 `N`，客户端用明文重试。
 - `Query`（`Q`）→ 执行 `execute_script`，每个结果返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
-- `Terminate`（`X`）断开；`Sync`（`S`）回 `ReadyForQuery`。
+- 扩展查询：`Parse`（SQL + 参数 OID）、`Bind`（`$n` → 字面量）、`Describe`（`ParameterDescription` + `NoData`）、`Execute`（复用 simple query 编码）、`Close`；`Sync` 回 `ReadyForQuery`。
+- `Terminate`（`X`）断开。
 - 空查询 → `EmptyQueryResponse`；SQL 错误 → `ErrorResponse` + `ReadyForQuery`。
 - `Parse` / `Bind` / `Describe` / `Execute` / `Close` → `ErrorResponse`（提示用 simple query）。
 
@@ -40,17 +42,16 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 ## 5. 验收
 
 ```bash
-cargo test -p tritdb --test pgwire   # 1 passed
+cargo test -p tritdb --test pgwire   # 2 passed
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-端到端测试：startup → `CREATE TABLE` / `INSERT`（标签正确）→ `SELECT`（列名与值）→ 错误查询得到 `ErrorResponse` → `Terminate`。
+端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`。
 
 ## 6. 还没做
 
-- **扩展查询协议**：`Parse`/`Bind`/`Describe`/`Execute`；多数驱动默认走它；
 - **TLS**：`SSLRequest` 直接拒绝；
 - **认证**：无密码，任何能连上端口的客户端都可读写；
 - **事务状态**：`BEGIN`/`COMMIT` 未映射，`ReadyForQuery` 始终 `I`；
