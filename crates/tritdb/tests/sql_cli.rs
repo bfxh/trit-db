@@ -932,16 +932,19 @@ fn correlated_subqueries_in_where() {
         assert!(text.lines().any(|line| line == expected), "out: {text}");
     }
 
-    // Correlated subqueries in the projection are outside the supported subset.
+    // Correlated subqueries in the projection are evaluated per row.
     let output = run([
         "sql",
         "--db",
         db,
         "--sql",
-        "SELECT id, (SELECT MAX(u.id) FROM u WHERE u.x = t.y) AS m FROM t;",
+        "SELECT id, (SELECT MAX(u.id) FROM u WHERE u.x = t.y) AS m FROM t ORDER BY id;",
     ]);
-    assert!(!output.status.success(), "correlated projection must fail");
-    assert!(stderr(&output).contains("materialized before binding"));
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t2"), "out: {text}");
+    assert!(text.contains("2\t3"), "out: {text}");
+    assert!(text.contains("3\tNULL"), "out: {text}");
 }
 
 #[test]
@@ -1041,4 +1044,64 @@ fn exists_and_quantified_subqueries() {
     for expected in ["1", "2", "3"] {
         assert!(text.lines().any(|line| line == expected), "out: {text}");
     }
+}
+
+#[test]
+fn correlated_subquery_in_projection() {
+    let dir = TempDir::new("sql-corr-projection");
+    let db = dir.join("corr.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, y INT NOT NULL); \
+         INSERT INTO t VALUES (1,10),(2,20),(3,30); \
+         CREATE TABLE u (id INT NOT NULL, x INT NOT NULL); \
+         INSERT INTO u VALUES (1,10),(2,10),(3,20);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, (SELECT MAX(u.id) FROM u WHERE u.x = t.y) AS m FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t2"), "out: {text}");
+    assert!(text.contains("2\t3"), "out: {text}");
+    assert!(text.contains("3\tNULL"), "out: {text}");
+    assert!(
+        text.lines().any(|line| line.starts_with("id\tm")),
+        "out: {text}"
+    );
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, (SELECT MAX(u.id) FROM u WHERE u.x = t.y) AS m FROM t \
+         WHERE id > 1 ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(!text.contains("1\t2"), "out: {text}");
+    assert!(text.contains("2\t3"), "out: {text}");
+    assert!(text.contains("3\tNULL"), "out: {text}");
+
+    // Aggregates and a correlated select list are outside the supported subset.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT MAX(id), (SELECT MAX(u.id) FROM u WHERE u.x = t.y) AS m FROM t;",
+    ]);
+    assert!(!output.status.success(), "aggregate + correlated must fail");
+    assert!(stderr(&output).contains("aggregates are not supported"));
 }

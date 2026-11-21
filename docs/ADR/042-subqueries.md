@@ -28,13 +28,12 @@
    - `execute_query` 统一做物化，覆盖 `WITH` 的 seed/step、`INSERT ... SELECT`、`IN (SELECT ...)` 嵌套。
 
 3. **相关：逐行替换后执行**
-   - `WHERE` 中出现引用外层限定列（`outer.col`）的子查询时，`select` 走 `select_with_correlated_filter`：
+   - `WHERE` 或投影中出现引用外层限定列（`outer.col`）的子查询时，`select` 走 `select_with_correlated`：
      1. `build_from` 得到外层表；
-     2. 每行把子查询中的 `outer.col` 替换成 `Literal(row[col])`；
-     3. 执行替换后的子查询，得到 `IN` 列表或标量；
-     4. 绑定并求值该行 filter，保留 `TRUE` 行；
-     5. 清空 filter，用 `execute_select` 做投影/分组/排序。
-   - 只支持 `WHERE`；投影 / `HAVING` / `ORDER BY` 中的相关子查询仍报 `Unsupported`。
+     2. `WHERE` 中的相关子查询：每行把 `outer.col` 替换成 `Literal(row[col])`，执行子查询，求值 filter，保留 `TRUE` 行；
+     3. 投影中的相关子查询：每行求值整个投影表达式，结果写入隐藏列 `__corrN`，投影项替换成对该列的引用；
+     4. 只清空已逐行求值的相关 filter，用 `execute_select` 做投影/排序。
+   - 投影相关子查询要求没有 `GROUP BY`、聚合、`HAVING`；`ORDER BY` 中的相关子查询仍报 `Unsupported`。
    - 外层列必须用外层表名或别名限定；未限定列按内层列解析。
 
 4. **语义**
@@ -42,7 +41,7 @@
    - `EXISTS`：子查询有行 → `TRUE`，否则 `FALSE`；`NOT EXISTS` 由 `Not` 包裹。
    - `ANY` / `ALL`：逐值比较后按三值 `OR` / `AND` 合并；空集 `ANY` → `FALSE`、`ALL` → `TRUE`。
    - 标量：0 行 → `NULL`；多行 → `Unsupported`；多列 → `Unsupported`。
-   - 相关子查询不支持：子查询里引用外层列会解析失败并报 `UnknownColumn`。
+   - 相关子查询只支持 `WHERE` 与投影；外层列必须限定。
 
 ## 理由
 
@@ -52,7 +51,7 @@
 
 ## 后果 / 限制
 
-- **相关子查询只在 `WHERE`**：投影 / `HAVING` / `ORDER BY` 中的相关子查询报 `Unsupported`；外层列必须限定。
+- **相关子查询只在 `WHERE` 与投影**：`HAVING` / `ORDER BY` 中的相关子查询、以及带 `GROUP BY`/聚合/`HAVING` 的相关投影报 `Unsupported`；外层列必须限定。
 - **逐行执行**：相关子查询是 nested-loop 求值（外层行数 × 子查询成本），不是为大数据集设计的。
 - **物化内存**：`IN` 子查询把结果全部转成字面量，超大结果集会占用内存。
 - **多列 `IN`**：不支持（`(a, b) IN (SELECT ...)`）。
@@ -70,5 +69,5 @@ cargo fmt --all -- --check
 - `IN` / `NOT IN` 过滤、标量投影、标量零行 `NULL`；
 - `WITH c AS (...) UPDATE ... WHERE id IN (SELECT id FROM c)` 与 `DELETE`；
 - 标量多行、`IN` 多列报错；
-- 相关 `IN` / 相关标量（`WHERE`）、非相关路径回归、投影相关子查询被拒绝；
+- 相关 `IN` / 相关标量（`WHERE`）、非相关路径回归、投影相关子查询与普通 filter 组合、聚合场景被拒绝；
 - `EXISTS` / `NOT EXISTS` / `> ANY` / `> ALL` / `<> ALL`、空集 `ANY` → 空、空集 `ALL` → 全保留。

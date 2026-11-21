@@ -355,7 +355,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
     }
 }
 
-fn select_has_aggregate(select: &Select) -> bool {
+pub(crate) fn select_has_aggregate(select: &Select) -> bool {
     select.items.iter().any(|item| match item {
         SelectItem::Wildcard => false,
         SelectItem::Expr { expr, .. } => expr_has_aggregate(expr),
