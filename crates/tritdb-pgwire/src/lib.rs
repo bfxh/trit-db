@@ -17,10 +17,16 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use md5::{Digest as _, Md5};
+
 use tritdb_exec::Value;
 use tritdb_sql::{parse_script, QueryResult, SqlEngine, Statement};
 
 const PROTOCOL_V3: i32 = 196_608;
+/// SCRAM-SHA-256 iteration count used for new challenges.
+const SCRAM_ITERATIONS: u32 = 4_096;
 const SSL_REQUEST: i32 = 80_877_103;
 
 /// Server errors.
@@ -64,6 +70,10 @@ pub enum AuthMode {
     Trust,
     /// Ask for a cleartext password and compare it with this value.
     Password(String),
+    /// `AuthenticationMD5Password`: `md5(md5(password + user) + salt)`.
+    Md5(String),
+    /// SASL `SCRAM-SHA-256` (RFC 5802 / RFC 7677).
+    ScramSha256(String),
 }
 
 /// Server-side options. `Default` is trust auth with plain text connections,
@@ -76,8 +86,12 @@ pub struct ServerOptions {
     pub tls_cert: Option<PathBuf>,
     /// PEM private key; requires `tls_cert` to enable TLS.
     pub tls_key: Option<PathBuf>,
+    /// PEM CA bundle used to verify client certificates (mTLS).
+    pub tls_client_ca: Option<PathBuf>,
     /// Reject clients that do not request TLS.
     pub require_tls: bool,
+    /// Permit cleartext password authentication over a plaintext connection.
+    pub allow_plaintext_password: bool,
 }
 
 impl ServerOptions {
@@ -91,10 +105,25 @@ impl ServerOptions {
 enum Startup {
     /// The client disconnected cleanly.
     Closed,
-    /// A plain protocol-v3 startup packet.
-    Plain,
+    /// A plain protocol-v3 startup packet (with its `user` parameter).
+    Plain { user: Option<String> },
     /// The client asked to negotiate TLS first.
     SslRequest,
+}
+
+/// Extracts the `user` parameter from a startup packet body.
+fn parse_startup_user(body: &[u8]) -> Option<String> {
+    let mut fields = body[4..].split(|byte| *byte == 0);
+    while let Some(key) = fields.next() {
+        let value = fields.next()?;
+        if key.is_empty() {
+            return None;
+        }
+        if key == b"user" {
+            return Some(String::from_utf8_lossy(value).to_string());
+        }
+    }
+    None
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -108,37 +137,204 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+fn random_bytes<const N: usize>() -> Result<[u8; N], PgError> {
+    let mut bytes = [0u8; N];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| PgError::Protocol(format!("random bytes: {error}")))?;
+    Ok(bytes)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("write hex");
+    }
+    out
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    hex_lower(&Md5::digest(bytes))
+}
+
+/// PBKDF2-HMAC-SHA256 with a 32-byte output (a single block).
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut block = Vec::with_capacity(salt.len() + 4);
+    block.extend_from_slice(salt);
+    block.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = tritdb_cas::hmac_sha256(password, &block);
+    let mut acc = u;
+    for _ in 1..iterations {
+        u = tritdb_cas::hmac_sha256(password, &u);
+        for (left, right) in acc.iter_mut().zip(u) {
+            *left ^= right;
+        }
+    }
+    acc
+}
+
+fn read_password_message(stream: &mut dyn ReadWrite) -> Result<Vec<u8>, PgError> {
+    let Some((kind, payload)) = read_message(stream)? else {
+        return Err(PgError::Protocol(
+            "client closed the connection during authentication".to_string(),
+        ));
+    };
+    if kind != b'p' {
+        write_error(stream, "expected a PasswordMessage")?;
+        return Err(PgError::Protocol(format!(
+            "expected PasswordMessage, got {}",
+            kind as char
+        )));
+    }
+    Ok(payload)
+}
+
+fn auth_failed(stream: &mut dyn ReadWrite) -> Result<(), PgError> {
+    write_error(stream, "password authentication failed")?;
+    Err(PgError::Protocol(
+        "password authentication failed".to_string(),
+    ))
+}
+
+fn authenticate_md5(
+    stream: &mut dyn ReadWrite,
+    password: &str,
+    user: Option<&str>,
+) -> Result<(), PgError> {
+    let Some(user) = user else {
+        write_error(stream, "MD5 authentication requires a username")?;
+        return Err(PgError::Protocol("missing startup username".to_string()));
+    };
+    let salt = random_bytes::<4>()?;
+    let mut request = Vec::with_capacity(8);
+    request.extend_from_slice(&5i32.to_be_bytes());
+    request.extend_from_slice(&salt);
+    write_message(stream, b'R', &request)?;
+
+    let payload = read_password_message(stream)?;
+    let supplied = String::from_utf8_lossy(&payload)
+        .trim_end_matches('\0')
+        .to_string();
+    let inner = md5_hex(format!("{password}{user}").as_bytes());
+    let mut outer_input = inner.into_bytes();
+    outer_input.extend_from_slice(&salt);
+    let expected = md5_hex(&outer_input);
+    if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+        write_message(stream, b'R', &0i32.to_be_bytes())
+    } else {
+        auth_failed(stream)
+    }
+}
+
+fn authenticate_scram(stream: &mut dyn ReadWrite, password: &str) -> Result<(), PgError> {
+    // AuthenticationSASL (10) advertising SCRAM-SHA-256.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&10i32.to_be_bytes());
+    payload.extend_from_slice(b"SCRAM-SHA-256\0\0");
+    write_message(stream, b'R', &payload)?;
+
+    let initial = read_password_message(stream)?;
+    let (mechanism, cursor) = read_cstring(&initial, 0)?;
+    if mechanism != "SCRAM-SHA-256" {
+        write_error(stream, &format!("unsupported SASL mechanism {mechanism}"))?;
+        return Err(PgError::Protocol(format!(
+            "unsupported SASL mechanism {mechanism}"
+        )));
+    }
+    let length = read_i32(&initial, cursor)?;
+    if length < 0 {
+        write_error(stream, "bad SASL initial response")?;
+        return Err(PgError::Protocol("bad SASL initial response".to_string()));
+    }
+    let start = cursor + 4;
+    let end = start + length as usize;
+    let client_first = initial
+        .get(start..end)
+        .ok_or_else(|| PgError::Protocol("truncated SASL initial response".to_string()))?;
+    let client_first = String::from_utf8_lossy(client_first).to_string();
+
+    // Skip the GS2 header ("n,," / "y,,"); the rest is the bare message.
+    let bare_start = client_first
+        .find(",,")
+        .map(|index| index + 2)
+        .ok_or_else(|| PgError::Protocol("malformed SCRAM client-first-message".to_string()))?;
+    let client_first_bare = client_first[bare_start..].to_string();
+    let client_nonce = client_first_bare
+        .split(',')
+        .find_map(|part| part.strip_prefix("r="))
+        .ok_or_else(|| PgError::Protocol("missing SCRAM client nonce".to_string()))?
+        .to_string();
+
+    let nonce = format!("{client_nonce}{}", hex_lower(&random_bytes::<18>()?));
+    let salt = random_bytes::<16>()?;
+    let server_first = format!("r={nonce},s={},i={SCRAM_ITERATIONS}", BASE64.encode(salt));
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&11i32.to_be_bytes());
+    payload.extend_from_slice(server_first.as_bytes());
+    write_message(stream, b'R', &payload)?;
+
+    let final_message = read_password_message(stream)?;
+    let client_final = String::from_utf8_lossy(&final_message)
+        .trim_end_matches('\0')
+        .to_string();
+    let Some(proof_at) = client_final.rfind(",p=") else {
+        write_error(stream, "malformed SCRAM client-final-message")?;
+        return Err(PgError::Protocol(
+            "malformed SCRAM client-final-message".to_string(),
+        ));
+    };
+    let client_final_without_proof = client_final[..proof_at].to_string();
+    let proof = BASE64
+        .decode(&client_final[proof_at + 3..])
+        .map_err(|error| PgError::Protocol(format!("bad SCRAM proof: {error}")))?;
+    if proof.len() != 32 {
+        write_error(stream, "bad SCRAM proof length")?;
+        return Err(PgError::Protocol("bad SCRAM proof length".to_string()));
+    }
+
+    let salted = pbkdf2_sha256(password.as_bytes(), &salt, SCRAM_ITERATIONS);
+    let client_key = tritdb_cas::hmac_sha256(&salted, b"Client Key");
+    let stored_key = tritdb_cas::sha256(&client_key);
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let client_signature = tritdb_cas::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let mut recovered = [0u8; 32];
+    for (index, value) in recovered.iter_mut().enumerate() {
+        *value = proof[index] ^ client_signature[index];
+    }
+    if !constant_time_eq(&tritdb_cas::sha256(&recovered), &stored_key) {
+        return auth_failed(stream);
+    }
+    let server_key = tritdb_cas::hmac_sha256(&salted, b"Server Key");
+    let server_signature = tritdb_cas::hmac_sha256(&server_key, auth_message.as_bytes());
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&12i32.to_be_bytes());
+    payload.extend_from_slice(format!("v={}", BASE64.encode(server_signature)).as_bytes());
+    write_message(stream, b'R', &payload)?;
+    write_message(stream, b'R', &0i32.to_be_bytes())
+}
+
 /// Runs the authentication exchange configured on the server.
-fn authenticate(stream: &mut dyn ReadWrite, auth: &AuthMode) -> Result<(), PgError> {
+fn authenticate(
+    stream: &mut dyn ReadWrite,
+    auth: &AuthMode,
+    user: Option<&str>,
+) -> Result<(), PgError> {
     match auth {
         AuthMode::Trust => write_message(stream, b'R', &0i32.to_be_bytes()),
         AuthMode::Password(expected) => {
-            // AuthenticationCleartextPassword (code 3).
             write_message(stream, b'R', &3i32.to_be_bytes())?;
-            let Some((kind, payload)) = read_message(stream)? else {
-                return Err(PgError::Protocol(
-                    "client closed the connection during authentication".to_string(),
-                ));
-            };
-            if kind != b'p' {
-                write_error(stream, "expected a PasswordMessage")?;
-                return Err(PgError::Protocol(format!(
-                    "expected PasswordMessage, got {}",
-                    kind as char
-                )));
-            }
+            let payload = read_password_message(stream)?;
             let supplied = String::from_utf8_lossy(&payload)
                 .trim_end_matches('\0')
                 .to_string();
             if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
                 write_message(stream, b'R', &0i32.to_be_bytes())
             } else {
-                write_error(stream, "password authentication failed")?;
-                Err(PgError::Protocol(
-                    "password authentication failed".to_string(),
-                ))
+                auth_failed(stream)
             }
         }
+        AuthMode::Md5(password) => authenticate_md5(stream, password, user),
+        AuthMode::ScramSha256(password) => authenticate_scram(stream, password),
     }
 }
 
@@ -162,13 +358,99 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
         .map_err(|error| PgError::Protocol(format!("bad private key PEM: {error}")))?
         .ok_or_else(|| PgError::Protocol("private key file contains no key".to_string()))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|error| PgError::Protocol(format!("TLS versions: {error}")))?
-        .with_no_client_auth()
+        .map_err(|error| PgError::Protocol(format!("TLS versions: {error}")))?;
+    let builder = match &options.tls_client_ca {
+        Some(ca_path) => {
+            let ca_bytes = std::fs::read(ca_path)?;
+            let ca_certs = rustls_pemfile::certs(&mut ca_bytes.as_slice())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| PgError::Protocol(format!("bad client CA PEM: {error}")))?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in ca_certs {
+                roots
+                    .add(cert)
+                    .map_err(|error| PgError::Protocol(format!("client CA: {error}")))?;
+            }
+            let verifier_provider = Arc::new(rustls::crypto::ring::default_provider());
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                verifier_provider,
+            )
+            .build()
+            .map_err(|error| PgError::Protocol(format!("client verifier: {error}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let config = builder
         .with_single_cert(certs, key)
         .map_err(|error| PgError::Protocol(format!("TLS certificate: {error}")))?;
     Ok(Arc::new(config))
+}
+
+/// Reloads the TLS configuration when its files change on disk.
+struct TlsReloader {
+    options: ServerOptions,
+    cached: Mutex<CachedTls>,
+}
+
+struct CachedTls {
+    fingerprint: [u8; 32],
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl TlsReloader {
+    fn new(options: &ServerOptions) -> Result<Self, PgError> {
+        let fingerprint = tls_fingerprint(options)?;
+        let config = load_tls_config(options)?;
+        Ok(Self {
+            options: options.clone(),
+            cached: Mutex::new(CachedTls {
+                fingerprint,
+                config,
+            }),
+        })
+    }
+
+    /// Returns the current configuration, reloading it when the PEM files
+    /// changed. A reload failure keeps the previous certificate.
+    fn snapshot(&self) -> Result<Arc<rustls::ServerConfig>, PgError> {
+        let fingerprint = tls_fingerprint(&self.options)?;
+        let mut cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cached.fingerprint != fingerprint {
+            match load_tls_config(&self.options) {
+                Ok(config) => {
+                    cached.config = config;
+                    cached.fingerprint = fingerprint;
+                    eprintln!("pgwire: reloaded TLS certificate");
+                }
+                Err(error) => eprintln!(
+                    "pgwire: TLS reload failed, keeping the previous certificate: {error}"
+                ),
+            }
+        }
+        Ok(Arc::clone(&cached.config))
+    }
+}
+
+fn tls_fingerprint(options: &ServerOptions) -> Result<[u8; 32], PgError> {
+    let mut input = Vec::new();
+    for path in [
+        options.tls_cert.as_ref(),
+        options.tls_key.as_ref(),
+        options.tls_client_ca.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        input.extend_from_slice(&std::fs::read(path)?);
+    }
+    Ok(tritdb_cas::sha256(&input))
 }
 
 /// Serves connections until the listener is closed or fails.
@@ -185,8 +467,18 @@ pub fn serve_with_options(
     listener: TcpListener,
     options: Arc<ServerOptions>,
 ) -> Result<(), PgError> {
+    if matches!(options.auth, AuthMode::Password(_))
+        && !options.tls_enabled()
+        && !options.allow_plaintext_password
+    {
+        return Err(PgError::Protocol(
+            "cleartext password authentication over a plaintext connection needs \
+             allow_plaintext_password (or enable TLS)"
+                .to_string(),
+        ));
+    }
     let tls = if options.tls_enabled() {
-        Some(load_tls_config(&options)?)
+        Some(Arc::new(TlsReloader::new(&options)?))
     } else {
         None
     };
@@ -223,16 +515,18 @@ fn handle_connection(
     engine: Arc<Mutex<SqlEngine>>,
     mut stream: TcpStream,
     options: Arc<ServerOptions>,
-    tls: Option<Arc<rustls::ServerConfig>>,
+    tls: Option<Arc<TlsReloader>>,
 ) -> Result<(), PgError> {
     // Postgres-style clients send one small message per round trip; leaving
     // Nagle on makes every response wait for the peer's delayed ACK (~40 ms on
     // Linux). Disable it per connection.
     stream.set_nodelay(true)?;
 
+    let user: Option<String>;
     let mut conn: Box<dyn ReadWrite> = match read_startup(&mut stream)? {
         Startup::Closed => return Ok(()),
-        Startup::Plain => {
+        Startup::Plain { user: name } => {
+            user = name;
             if options.require_tls {
                 write_error(&mut stream, "TLS is required by this server")?;
                 return Err(PgError::Protocol("TLS is required".to_string()));
@@ -240,13 +534,14 @@ fn handle_connection(
             Box::new(stream)
         }
         Startup::SslRequest => match tls.as_ref() {
-            Some(config) => {
+            Some(reloader) => {
                 stream.write_all(b"S")?;
-                let server = rustls::ServerConnection::new(Arc::clone(config))
+                let config = reloader.snapshot()?;
+                let server = rustls::ServerConnection::new(config)
                     .map_err(|error| PgError::Protocol(format!("TLS handshake: {error}")))?;
                 let mut tls_stream = rustls::StreamOwned::new(server, stream);
                 match read_startup(&mut tls_stream)? {
-                    Startup::Plain => {}
+                    Startup::Plain { user: name } => user = name,
                     Startup::Closed => return Ok(()),
                     Startup::SslRequest => {
                         return Err(PgError::Protocol(
@@ -259,7 +554,8 @@ fn handle_connection(
             None => {
                 stream.write_all(b"N")?;
                 match read_startup(&mut stream)? {
-                    Startup::Plain => {
+                    Startup::Plain { user: name } => {
+                        user = name;
                         if options.require_tls {
                             write_error(&mut stream, "TLS is required by this server")?;
                             return Err(PgError::Protocol("TLS is required".to_string()));
@@ -278,7 +574,7 @@ fn handle_connection(
     };
 
     let stream: &mut dyn ReadWrite = conn.as_mut();
-    authenticate(stream, &options.auth)?;
+    authenticate(stream, &options.auth, user.as_deref())?;
     // A few ParameterStatus values that clients expect.
     write_parameter(stream, "server_version", "14.0")?;
     write_parameter(stream, "server_encoding", "UTF8")?;
@@ -354,8 +650,9 @@ fn read_startup(stream: &mut dyn ReadWrite) -> Result<Startup, PgError> {
             "unsupported protocol version {protocol}"
         )));
     }
-    // The rest is key\0value\0...\0; we accept and ignore parameters.
-    Ok(Startup::Plain)
+    // The rest is key\0value\0...\0; keep the `user` parameter.
+    let user = parse_startup_user(&body);
+    Ok(Startup::Plain { user })
 }
 
 /// Reads one backend message, returning `None` on clean EOF.

@@ -7,6 +7,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use md5::{Digest as _, Md5};
 use tritdb_testkit::TempDir;
 
 fn start_server(name: &str) -> (TempDir, TcpStream) {
@@ -393,6 +396,7 @@ fn terminate_closes_connection_cleanly() {
 fn password_auth_accepts_correct_password() {
     let options = tritdb_pgwire::ServerOptions {
         auth: tritdb_pgwire::AuthMode::Password("s3cret".to_string()),
+        allow_plaintext_password: true,
         ..Default::default()
     };
     let (_dir, mut stream) = start_server_with("pgproto-auth-ok", options);
@@ -419,6 +423,7 @@ fn password_auth_accepts_correct_password() {
 fn password_auth_rejects_wrong_password() {
     let options = tritdb_pgwire::ServerOptions {
         auth: tritdb_pgwire::AuthMode::Password("s3cret".to_string()),
+        allow_plaintext_password: true,
         ..Default::default()
     };
     let (_dir, mut stream) = start_server_with("pgproto-auth-bad", options);
@@ -578,4 +583,458 @@ fn tls_disabled_still_refuses_ssl_request() {
     let mut reply = [0u8; 1];
     stream.read_exact(&mut reply).expect("ssl reply");
     assert_eq!(reply[0], b'N', "without TLS the server must answer 'N'");
+}
+
+fn write_startup_with_user<S: Write>(stream: &mut S, user: &str) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&196_608i32.to_be_bytes());
+    body.extend_from_slice(b"user\0");
+    body.extend_from_slice(user.as_bytes());
+    body.push(0);
+    body.push(0);
+    let mut message = Vec::new();
+    message.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    message.extend_from_slice(&body);
+    stream.write_all(&message).expect("startup with user");
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    let digest = Md5::digest(bytes);
+    let mut out = String::with_capacity(32);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut block = salt.to_vec();
+    block.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = tritdb_cas::hmac_sha256(password, &block);
+    let mut acc = u;
+    for _ in 1..iterations {
+        u = tritdb_cas::hmac_sha256(password, &u);
+        for (left, right) in acc.iter_mut().zip(u) {
+            *left ^= right;
+        }
+    }
+    acc
+}
+
+fn auth_code(payload: &[u8]) -> i32 {
+    i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+}
+
+#[test]
+fn md5_auth_accepts_correct_password() {
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::Md5("s3cret".to_string()),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-md5-ok", options);
+    write_startup_with_user(&mut stream, "tester");
+
+    let (kind, payload) = read_message(&mut stream).expect("MD5 request");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 5);
+    let salt = &payload[4..8];
+
+    let inner = md5_hex(b"s3crettester");
+    let mut outer_input = inner.into_bytes();
+    outer_input.extend_from_slice(salt);
+    let response = md5_hex(&outer_input);
+    write_message(&mut stream, b'p', format!("{response}\0").as_bytes());
+
+    let messages = read_until_ready(&mut stream);
+    assert!(!has_error(&messages), "MD5 login failed: {messages:?}");
+    assert_eq!(ready_status(&messages), Some(b'I'));
+
+    query(&mut stream, "SELECT 1;");
+    let messages = read_until_ready(&mut stream);
+    assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+}
+
+#[test]
+fn md5_auth_rejects_wrong_password() {
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::Md5("s3cret".to_string()),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-md5-bad", options);
+    write_startup_with_user(&mut stream, "tester");
+
+    let (kind, payload) = read_message(&mut stream).expect("MD5 request");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 5);
+    let salt = &payload[4..8];
+
+    let inner = md5_hex(b"wrongtester");
+    let mut outer_input = inner.into_bytes();
+    outer_input.extend_from_slice(salt);
+    let response = md5_hex(&outer_input);
+    write_message(&mut stream, b'p', format!("{response}\0").as_bytes());
+
+    let messages = read_until_ready(&mut stream);
+    assert!(has_error(&messages), "wrong MD5 password must be rejected");
+}
+
+#[test]
+fn scram_auth_accepts_correct_password() {
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::ScramSha256("s3cret".to_string()),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-scram-ok", options);
+    write_startup_with_user(&mut stream, "tester");
+
+    // AuthenticationSASL (10) + mechanism list.
+    let (kind, payload) = read_message(&mut stream).expect("SASL");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 10);
+    assert!(payload[4..].starts_with(b"SCRAM-SHA-256\0"));
+
+    let client_nonce = "clientnonce123456";
+    let client_first_bare = format!("n=,r={client_nonce}");
+    let client_first = format!("n,,{client_first_bare}");
+    let mut initial = Vec::new();
+    initial.extend_from_slice(b"SCRAM-SHA-256\0");
+    initial.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    initial.extend_from_slice(client_first.as_bytes());
+    write_message(&mut stream, b'p', &initial);
+
+    // AuthenticationSASLContinue (11).
+    let (kind, payload) = read_message(&mut stream).expect("SASLContinue");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 11);
+    let server_first = String::from_utf8_lossy(&payload[4..]).to_string();
+    let mut nonce = String::new();
+    let mut salt = Vec::new();
+    let mut iterations = 0u32;
+    for part in server_first.split(',') {
+        if let Some(value) = part.strip_prefix("r=") {
+            nonce = value.to_string();
+        }
+        if let Some(value) = part.strip_prefix("s=") {
+            salt = BASE64.decode(value).expect("base64 salt");
+        }
+        if let Some(value) = part.strip_prefix("i=") {
+            iterations = value.parse().expect("iterations");
+        }
+    }
+    assert!(nonce.starts_with(client_nonce));
+    assert!(!salt.is_empty());
+    assert!(iterations > 0);
+
+    let salted = pbkdf2_sha256(b"s3cret", &salt, iterations);
+    let client_key = tritdb_cas::hmac_sha256(&salted, b"Client Key");
+    let stored_key = tritdb_cas::sha256(&client_key);
+    let client_final_without_proof = format!("c=biws,r={nonce}");
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let client_signature = tritdb_cas::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let mut proof = [0u8; 32];
+    for (index, value) in proof.iter_mut().enumerate() {
+        *value = client_key[index] ^ client_signature[index];
+    }
+    let client_final = format!("{client_final_without_proof},p={}", BASE64.encode(proof));
+    write_message(&mut stream, b'p', client_final.as_bytes());
+
+    // AuthenticationSASLFinal (12) carries the server signature.
+    let (kind, payload) = read_message(&mut stream).expect("SASLFinal");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 12);
+    let server_key = tritdb_cas::hmac_sha256(&salted, b"Server Key");
+    let server_signature = tritdb_cas::hmac_sha256(&server_key, auth_message.as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&payload[4..]),
+        format!("v={}", BASE64.encode(server_signature))
+    );
+
+    let messages = read_until_ready(&mut stream);
+    assert!(!has_error(&messages), "SCRAM login failed: {messages:?}");
+    assert_eq!(ready_status(&messages), Some(b'I'));
+
+    query(&mut stream, "SELECT 1;");
+    let messages = read_until_ready(&mut stream);
+    assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+}
+
+#[test]
+fn scram_auth_rejects_wrong_password() {
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::ScramSha256("s3cret".to_string()),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-scram-bad", options);
+    write_startup_with_user(&mut stream, "tester");
+
+    let (kind, payload) = read_message(&mut stream).expect("SASL");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 10);
+
+    let client_first_bare = "n=,r=clientnonce";
+    let client_first = format!("n,,{client_first_bare}");
+    let mut initial = Vec::new();
+    initial.extend_from_slice(b"SCRAM-SHA-256\0");
+    initial.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    initial.extend_from_slice(client_first.as_bytes());
+    write_message(&mut stream, b'p', &initial);
+
+    let (kind, payload) = read_message(&mut stream).expect("SASLContinue");
+    assert_eq!(kind, b'R');
+    assert_eq!(auth_code(&payload), 11);
+    let server_first = String::from_utf8_lossy(&payload[4..]).to_string();
+    let mut nonce = String::new();
+    let mut salt = Vec::new();
+    let mut iterations = 0u32;
+    for part in server_first.split(',') {
+        if let Some(value) = part.strip_prefix("r=") {
+            nonce = value.to_string();
+        }
+        if let Some(value) = part.strip_prefix("s=") {
+            salt = BASE64.decode(value).expect("base64 salt");
+        }
+        if let Some(value) = part.strip_prefix("i=") {
+            iterations = value.parse().expect("iterations");
+        }
+    }
+
+    // Deliberately derive the proof from the wrong password.
+    let salted = pbkdf2_sha256(b"wrong", &salt, iterations);
+    let client_key = tritdb_cas::hmac_sha256(&salted, b"Client Key");
+    let stored_key = tritdb_cas::sha256(&client_key);
+    let client_final_without_proof = format!("c=biws,r={nonce}");
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let client_signature = tritdb_cas::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let mut proof = [0u8; 32];
+    for (index, value) in proof.iter_mut().enumerate() {
+        *value = client_key[index] ^ client_signature[index];
+    }
+    let client_final = format!("{client_final_without_proof},p={}", BASE64.encode(proof));
+    write_message(&mut stream, b'p', client_final.as_bytes());
+
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        has_error(&messages),
+        "wrong SCRAM password must be rejected"
+    );
+}
+
+fn ssl_request_bytes() -> Vec<u8> {
+    let mut request = Vec::new();
+    request.extend_from_slice(&8i32.to_be_bytes());
+    request.extend_from_slice(&80_877_103i32.to_be_bytes());
+    request
+}
+
+fn startup_bytes() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&196_608i32.to_be_bytes());
+    body.push(0);
+    let mut message = Vec::new();
+    message.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    message.extend_from_slice(&body);
+    message
+}
+
+fn make_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().expect("CA key");
+    let cert = params.self_signed(&key).expect("CA certificate");
+    (cert, key)
+}
+
+fn make_client_cert(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+) -> (rcgen::Certificate, rcgen::KeyPair) {
+    let params = rcgen::CertificateParams::new(vec!["client".to_string()]).expect("client params");
+    let key = rcgen::KeyPair::generate().expect("client key");
+    let cert = params
+        .signed_by(&key, ca_cert, ca_key)
+        .expect("client certificate");
+    (cert, key)
+}
+
+fn tls_client_config_with_cert(
+    server_cert: &rcgen::Certificate,
+    client_cert: &rcgen::Certificate,
+    client_key: &rcgen::KeyPair,
+) -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(server_cert.der().clone())
+        .expect("trust server certificate");
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(client_key.serialize_der());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(vec![client_cert.der().clone()], key_der.into())
+        .expect("client auth");
+    std::sync::Arc::new(config)
+}
+
+fn tls_client_config_trusting(
+    server_cert: &rcgen::Certificate,
+) -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(server_cert.der().clone())
+        .expect("trust server certificate");
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    std::sync::Arc::new(config)
+}
+
+/// Opens a TLS connection, sends startup + `SELECT 1`, and checks a DataRow.
+fn tls_select_one(
+    addr: std::net::SocketAddr,
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+) -> Result<(), String> {
+    let mut tcp = TcpStream::connect(addr).map_err(|error| error.to_string())?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| error.to_string())?;
+    tcp.write_all(&ssl_request_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut reply = [0u8; 1];
+    tcp.read_exact(&mut reply)
+        .map_err(|error| error.to_string())?;
+    if reply[0] != b'S' {
+        return Err(format!("server refused TLS: {}", reply[0] as char));
+    }
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("server name");
+    let connection = rustls::ClientConnection::new(client_config, server_name)
+        .map_err(|error| error.to_string())?;
+    let mut tls = rustls::StreamOwned::new(connection, tcp);
+
+    tls.write_all(&startup_bytes())
+        .map_err(|error| format!("write startup: {error}"))?;
+    let messages = read_until_ready(&mut tls);
+    if ready_status(&messages) != Some(b'I') {
+        return Err(format!("startup failed: {messages:?}"));
+    }
+    query(&mut tls, "SELECT 1;");
+    let messages = read_until_ready(&mut tls);
+    if messages.iter().any(|(kind, _)| *kind == b'D') {
+        Ok(())
+    } else {
+        Err(format!("no DataRow: {messages:?}"))
+    }
+}
+
+#[test]
+fn mtls_accepts_client_certificate_and_rejects_missing_one() {
+    let server =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert(&ca_cert, &ca_key);
+
+    let dir = TempDir::new("pgproto-mtls");
+    let db = dir.join("mtls.db");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server-key.pem");
+    let ca_path = dir.join("ca.pem");
+    std::fs::write(&cert_path, server.cert.pem()).expect("server cert");
+    std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("CA cert");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        tls_client_ca: Some(ca_path),
+        require_tls: true,
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db, listener, options);
+    });
+
+    // A client certificate issued by the configured CA is accepted.
+    let trusted = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    tls_select_one(addr, trusted).expect("mTLS handshake with client cert");
+
+    // Without a client certificate the handshake fails.
+    let untrusted = tls_client_config_trusting(&server.cert);
+    let mut tcp = TcpStream::connect(addr).expect("connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    tcp.write_all(&ssl_request_bytes()).expect("ssl request");
+    let mut reply = [0u8; 1];
+    tcp.read_exact(&mut reply).expect("ssl reply");
+    assert_eq!(reply[0], b'S');
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("server name");
+    let connection = rustls::ClientConnection::new(untrusted, server_name).expect("client");
+    let mut tls = rustls::StreamOwned::new(connection, tcp);
+    // TLS 1.3 buffers outgoing data, so the failure surfaces on read.
+    let _ = tls.write_all(&startup_bytes());
+    let mut buffer = [0u8; 8];
+    let outcome = tls.read(&mut buffer);
+    assert!(
+        matches!(outcome, Err(_) | Ok(0)),
+        "a client without a certificate must fail the handshake, got {outcome:?}"
+    );
+}
+
+#[test]
+fn tls_certificate_is_reloaded_when_files_change() {
+    let cert1 = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert1");
+    let cert2 = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert2");
+
+    let dir = TempDir::new("pgproto-reload");
+    let db = dir.join("reload.db");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server-key.pem");
+    std::fs::write(&cert_path, cert1.cert.pem()).expect("cert1");
+    std::fs::write(&key_path, cert1.key_pair.serialize_pem()).expect("key1");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path.clone()),
+        tls_key: Some(key_path.clone()),
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db, listener, options);
+    });
+
+    // The initial certificate works.
+    tls_select_one(addr, tls_client_config_trusting(&cert1.cert)).expect("first certificate");
+
+    // Rotate the files in place; the next connection must pick them up.
+    std::fs::write(&cert_path, cert2.cert.pem()).expect("cert2");
+    std::fs::write(&key_path, cert2.key_pair.serialize_pem()).expect("key2");
+
+    tls_select_one(addr, tls_client_config_trusting(&cert2.cert)).expect("reloaded certificate");
+    assert!(
+        tls_select_one(addr, tls_client_config_trusting(&cert1.cert)).is_err(),
+        "the old certificate must no longer be served"
+    );
+}
+
+#[test]
+fn cleartext_password_over_plaintext_requires_opt_in() {
+    let dir = TempDir::new("pgproto-plain-guard");
+    let db = dir.join("guard.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::Password("s3cret".to_string()),
+        ..Default::default()
+    });
+    let error = tritdb_pgwire::serve_with_options(db, listener, options)
+        .expect_err("cleartext password without TLS must be refused");
+    assert!(
+        error.to_string().contains("allow_plaintext_password"),
+        "unexpected error: {error}"
+    );
 }
