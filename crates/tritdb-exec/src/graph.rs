@@ -22,6 +22,12 @@ pub const MAX_DIMENSIONS: usize = 64;
 pub const TRGR_MAGIC: &[u8; 4] = b"TRGR";
 /// Version of the persisted graph encoding.
 pub const TRGR_VERSION: u8 = 1;
+/// Magic header of the persisted point set encoding.
+pub const TRPN_MAGIC: &[u8; 4] = b"TRPN";
+/// Version of the persisted point set encoding.
+pub const TRPN_VERSION: u8 = 1;
+/// Maximum points accepted by [`encode_points`] / [`decode_points`].
+pub const MAX_POINTS: usize = 4096;
 
 /// Structured graph errors.
 #[derive(Debug)]
@@ -76,6 +82,13 @@ pub enum GraphError {
     DistanceOverflow,
     /// A stored `TRGR` graph is malformed.
     BadEncoding(&'static str),
+    /// Too many points for a persisted point set.
+    TooManyPoints {
+        /// Requested points.
+        points: usize,
+        /// Maximum supported.
+        max: usize,
+    },
 }
 
 impl fmt::Display for GraphError {
@@ -110,7 +123,10 @@ impl fmt::Display for GraphError {
             GraphError::DistanceOverflow => {
                 write!(formatter, "squared distance does not fit in i128")
             }
-            GraphError::BadEncoding(reason) => write!(formatter, "bad TRGR graph: {reason}"),
+            GraphError::BadEncoding(reason) => write!(formatter, "bad encoded data: {reason}"),
+            GraphError::TooManyPoints { points, max } => {
+                write!(formatter, "too many points: {points} > {max}")
+            }
         }
     }
 }
@@ -629,6 +645,86 @@ const fn label_from_code(code: u8) -> Option<TruthValue> {
     }
 }
 
+/// Encodes labelled points as `TRPN`.
+///
+/// Layout: magic `TRPN`, version byte, point count (`u32` LE), then per point
+/// `id` (`u32` LE), label byte, dimension count (`u32` LE) and `i64`
+/// coordinates.
+pub fn encode_points(points: &[Point]) -> Vec<u8> {
+    let mut size = 9;
+    for point in points {
+        size += 9 + point.vector.len() * 8;
+    }
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend_from_slice(TRPN_MAGIC);
+    bytes.push(TRPN_VERSION);
+    bytes.extend_from_slice(&(points.len() as u32).to_le_bytes());
+    for point in points {
+        bytes.extend_from_slice(&point.id.to_le_bytes());
+        bytes.push(label_code(point.label));
+        bytes.extend_from_slice(&(point.vector.len() as u32).to_le_bytes());
+        for coordinate in &point.vector {
+            bytes.extend_from_slice(&coordinate.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// Decodes a `TRPN` point set produced by [`encode_points`].
+pub fn decode_points(bytes: &[u8]) -> Result<Vec<Point>, GraphError> {
+    if bytes.len() < 9 || &bytes[0..4] != TRPN_MAGIC {
+        return Err(GraphError::BadEncoding("bad TRPN header"));
+    }
+    if bytes[4] != TRPN_VERSION {
+        return Err(GraphError::BadEncoding("unsupported TRPN version"));
+    }
+    let count = read_u32(bytes, 5) as usize;
+    if count > MAX_POINTS {
+        return Err(GraphError::TooManyPoints {
+            points: count,
+            max: MAX_POINTS,
+        });
+    }
+    let mut cursor = 9;
+    let mut points = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor + 9 > bytes.len() {
+            return Err(GraphError::BadEncoding("TRPN truncated point header"));
+        }
+        let id = read_u32(bytes, cursor);
+        cursor += 4;
+        let label =
+            label_from_code(bytes[cursor]).ok_or(GraphError::BadEncoding("bad TRPN label"))?;
+        cursor += 1;
+        let dimensions = read_u32(bytes, cursor) as usize;
+        cursor += 4;
+        if dimensions > MAX_DIMENSIONS {
+            return Err(GraphError::TooManyDimensions {
+                dimensions,
+                max: MAX_DIMENSIONS,
+            });
+        }
+        let needed = dimensions
+            .checked_mul(8)
+            .ok_or(GraphError::BadEncoding("TRPN size overflows"))?;
+        if cursor + needed > bytes.len() {
+            return Err(GraphError::BadEncoding("TRPN truncated coordinates"));
+        }
+        let mut vector = Vec::with_capacity(dimensions);
+        for _ in 0..dimensions {
+            let mut coordinate = [0u8; 8];
+            coordinate.copy_from_slice(&bytes[cursor..cursor + 8]);
+            cursor += 8;
+            vector.push(i64::from_le_bytes(coordinate));
+        }
+        points.push(Point { id, vector, label });
+    }
+    if cursor != bytes.len() {
+        return Err(GraphError::BadEncoding("TRPN trailing bytes"));
+    }
+    Ok(points)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +944,56 @@ mod tests {
         truncated.pop();
         assert!(matches!(
             AnnotatedGraph::decode(&truncated),
+            Err(GraphError::BadEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn trpn_roundtrips_points() {
+        let points = vec![
+            Point {
+                id: 0,
+                vector: vec![1, -2],
+                label: TruthValue::True,
+            },
+            Point {
+                id: 7,
+                vector: vec![3],
+                label: TruthValue::Unknown,
+            },
+        ];
+        let bytes = encode_points(&points);
+        assert_eq!(&bytes[0..4], TRPN_MAGIC);
+        assert_eq!(decode_points(&bytes).expect("decode"), points);
+    }
+
+    #[test]
+    fn trpn_rejects_corrupt_bytes() {
+        let points = vec![Point {
+            id: 0,
+            vector: vec![1],
+            label: TruthValue::False,
+        }];
+        let bytes = encode_points(&points);
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            decode_points(&bad_magic),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        let mut bad_label = bytes.clone();
+        bad_label[14] = 9;
+        assert!(matches!(
+            decode_points(&bad_label),
+            Err(GraphError::BadEncoding(_))
+        ));
+
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(matches!(
+            decode_points(&truncated),
             Err(GraphError::BadEncoding(_))
         ));
     }

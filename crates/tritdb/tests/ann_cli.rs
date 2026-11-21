@@ -195,3 +195,51 @@ fn graph_cli_persists_and_reloads_a_graph() {
     let corrupt = run(&["graph", "load", "--wal", wal_text, "--name", "net"]);
     assert!(!corrupt.status.success(), "corrupt graph must fail");
 }
+
+#[test]
+fn graph_cli_persists_points_and_knn() {
+    let dir = TempDir::new("graph-points");
+    let wal = dir.join("points.wal");
+    let wal_text = wal.to_str().expect("wal path");
+
+    let output = run(&[
+        "graph",
+        "put-points",
+        "--wal",
+        wal_text,
+        "--name",
+        "p",
+        "--points",
+        "0,0;1,0;2,0",
+        "--labels",
+        "T,U,F",
+    ]);
+    assert!(output.status.success(), "stderr: {:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("name=p"), "out: {text}");
+    assert!(text.contains("points=3"), "out: {text}");
+
+    // Another CLI invocation reopens the store and reads the points back.
+    let knn = run(&[
+        "graph", "knn", "--wal", wal_text, "--name", "p", "--query", "0,0", "--k", "2",
+    ]);
+    assert!(knn.status.success(), "stderr: {:?}", knn);
+    let text = stdout(&knn);
+    assert!(
+        text.contains("label=TRUE rank=0 id=0 distance=0"),
+        "out: {text}"
+    );
+    assert!(
+        text.contains("label=UNKNOWN rank=0 id=1 distance=1"),
+        "out: {text}"
+    );
+    assert!(
+        text.contains("certain=1 uncertain=1 excluded=1"),
+        "out: {text}"
+    );
+
+    let missing = run(&[
+        "graph", "knn", "--wal", wal_text, "--name", "missing", "--query", "0,0",
+    ]);
+    assert!(!missing.status.success(), "missing points must fail");
+}
