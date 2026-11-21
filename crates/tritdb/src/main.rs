@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
         Some("txn") => run_txn(&args),
         Some("pstore") => run_pstore(&args),
         Some("sql") => run_sql(&args),
+        Some("serve") => run_serve(&args),
         Some("models") => run_models(&args),
         Some("repair") => run_repair(&args),
         Some("graph") => run_graph(&args),
@@ -92,6 +93,7 @@ fn print_help() {
     println!("  pstore checkpoint --data pstore.pages --wal pstore.wal");
     println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
     println!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
+    println!("  serve --db sql.db [--listen 127.0.0.1:5432]");
     println!("  sql --db sql.db --file script.sql");
     println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
     println!("  repair --facts 2 --denial 0,1 --query 0");
@@ -1712,6 +1714,16 @@ fn parse_var_name(name: &str, vars: usize) -> Result<usize, String> {
 
 fn parse_bool_expr(text: &str, vars: usize) -> Result<tritdb_exec::ann::BoolExpr, String> {
     BoolParser::new(text, vars).parse()
+}
+
+fn run_serve(args: &[String]) -> Result<(), String> {
+    let db = required_arg(args, "--db")?;
+    let listen = arg_value(args, "--listen").unwrap_or_else(|| "127.0.0.1:5432".to_string());
+    let listener =
+        std::net::TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
+    let local = listener.local_addr().map_err(|error| error.to_string())?;
+    println!("listening={local} db={db}");
+    tritdb_pgwire::serve(std::path::PathBuf::from(db), listener).map_err(|error| error.to_string())
 }
 
 fn run_sql(args: &[String]) -> Result<(), String> {
