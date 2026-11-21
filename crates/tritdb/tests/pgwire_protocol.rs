@@ -1038,3 +1038,146 @@ fn cleartext_password_over_plaintext_requires_opt_in() {
         "unexpected error: {error}"
     );
 }
+
+/// Performs the SCRAM-SHA-256 client exchange. Returns an error when the
+/// server rejects the credentials.
+fn scram_login<S: Read + Write>(stream: &mut S, password: &str) -> Result<(), String> {
+    let (kind, payload) = read_message(stream).ok_or("no AuthenticationSASL")?;
+    if kind != b'R' || auth_code(&payload) != 10 {
+        return Err(format!("expected AuthenticationSASL, got {kind}"));
+    }
+    let client_nonce = "clientnonce123456";
+    let client_first_bare = format!("n=,r={client_nonce}");
+    let client_first = format!("n,,{client_first_bare}");
+    let mut initial = Vec::new();
+    initial.extend_from_slice(b"SCRAM-SHA-256\0");
+    initial.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    initial.extend_from_slice(client_first.as_bytes());
+    write_message(stream, b'p', &initial);
+
+    let (kind, payload) = read_message(stream).ok_or("no SASLContinue")?;
+    if kind != b'R' || auth_code(&payload) != 11 {
+        return Err(format!("expected SASLContinue, got {kind}"));
+    }
+    let server_first = String::from_utf8_lossy(&payload[4..]).to_string();
+    let mut nonce = String::new();
+    let mut salt = Vec::new();
+    let mut iterations = 0u32;
+    for part in server_first.split(',') {
+        if let Some(value) = part.strip_prefix("r=") {
+            nonce = value.to_string();
+        }
+        if let Some(value) = part.strip_prefix("s=") {
+            salt = BASE64.decode(value).map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = part.strip_prefix("i=") {
+            iterations = value.parse().map_err(|_| "bad iterations".to_string())?;
+        }
+    }
+    let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
+    let client_key = tritdb_cas::hmac_sha256(&salted, b"Client Key");
+    let stored_key = tritdb_cas::sha256(&client_key);
+    let client_final_without_proof = format!("c=biws,r={nonce}");
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let client_signature = tritdb_cas::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let mut proof = [0u8; 32];
+    for (index, value) in proof.iter_mut().enumerate() {
+        *value = client_key[index] ^ client_signature[index];
+    }
+    let client_final = format!("{client_final_without_proof},p={}", BASE64.encode(proof));
+    write_message(stream, b'p', client_final.as_bytes());
+
+    let (kind, payload) = read_message(stream).ok_or("no SASLFinal")?;
+    if kind != b'R' || auth_code(&payload) != 12 {
+        return Err(format!("expected SASLFinal, got {kind}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn scram_verifier_roundtrip_and_login() {
+    let verifier =
+        tritdb_pgwire::ScramVerifier::from_password("s3cret", 4_096).expect("derive verifier");
+    let encoded = verifier.encode();
+    let parsed = tritdb_pgwire::ScramVerifier::parse(&encoded).expect("parse verifier");
+    assert_eq!(parsed, verifier, "verifier roundtrip");
+
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::ScramSha256Verifier(parsed),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-scram-verifier", options);
+    write_startup_with_user(&mut stream, "tester");
+    scram_login(&mut stream, "s3cret").expect("SCRAM login with a persisted verifier");
+    let messages = read_until_ready(&mut stream);
+    assert!(!has_error(&messages), "login failed: {messages:?}");
+    assert_eq!(ready_status(&messages), Some(b'I'));
+
+    query(&mut stream, "SELECT 1;");
+    let messages = read_until_ready(&mut stream);
+    assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+}
+
+#[test]
+fn scram_verifier_rejects_wrong_password() {
+    let verifier =
+        tritdb_pgwire::ScramVerifier::from_password("s3cret", 4_096).expect("derive verifier");
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::ScramSha256Verifier(verifier),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-scram-verifier-bad", options);
+    write_startup_with_user(&mut stream, "tester");
+    assert!(
+        scram_login(&mut stream, "wrong").is_err(),
+        "wrong password must be rejected"
+    );
+    let messages = read_until_ready(&mut stream);
+    assert!(has_error(&messages) || messages.is_empty());
+}
+
+#[test]
+fn revoked_client_certificate_is_rejected() {
+    let server =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert(&ca_cert, &ca_key);
+
+    let dir = TempDir::new("pgproto-revoked");
+    let db = dir.join("revoked.db");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server-key.pem");
+    let ca_path = dir.join("ca.pem");
+    let revoked_path = dir.join("revoked.txt");
+    std::fs::write(&cert_path, server.cert.pem()).expect("server cert");
+    std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("CA cert");
+
+    let fingerprint = tritdb_cas::sha256(client_cert.der().as_ref());
+    let mut revoked = String::from("# revoked client certificates\n");
+    for byte in fingerprint {
+        revoked.push_str(&format!("{byte:02x}"));
+    }
+    revoked.push('\n');
+    std::fs::write(&revoked_path, revoked).expect("revocation list");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        tls_client_ca: Some(ca_path),
+        tls_client_revoked: Some(revoked_path),
+        require_tls: true,
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db, listener, options);
+    });
+
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    assert!(
+        tls_select_one(addr, client).is_err(),
+        "a revoked client certificate must be rejected"
+    );
+}

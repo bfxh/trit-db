@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -62,6 +62,94 @@ impl From<std::io::Error> for PgError {
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
+/// A persisted SCRAM-SHA-256 verifier, in PostgreSQL's on-disk form:
+/// `SCRAM-SHA-256$<iterations>:<base64 salt>$<base64 stored key>:<base64 server key>`.
+///
+/// Holding only the verifier means the server never needs the cleartext
+/// password at runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScramVerifier {
+    /// PBKDF2 iteration count.
+    pub iterations: u32,
+    /// PBKDF2 salt.
+    pub salt: Vec<u8>,
+    /// `SHA256(HMAC(SaltedPassword, "Client Key"))`.
+    pub stored_key: [u8; 32],
+    /// `HMAC(SaltedPassword, "Server Key")`.
+    pub server_key: [u8; 32],
+}
+
+impl ScramVerifier {
+    /// Derives a verifier from a cleartext password with a fresh random salt.
+    pub fn from_password(password: &str, iterations: u32) -> Result<Self, PgError> {
+        if iterations == 0 {
+            return Err(PgError::Protocol(
+                "SCRAM iteration count must be greater than 0".to_string(),
+            ));
+        }
+        let salt = random_bytes::<16>()?;
+        let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
+        let client_key = tritdb_cas::hmac_sha256(&salted, b"Client Key");
+        Ok(Self {
+            iterations,
+            salt: salt.to_vec(),
+            stored_key: tritdb_cas::sha256(&client_key),
+            server_key: tritdb_cas::hmac_sha256(&salted, b"Server Key"),
+        })
+    }
+
+    /// Serializes the verifier in PostgreSQL's `SCRAM-SHA-256$...` form.
+    pub fn encode(&self) -> String {
+        format!(
+            "SCRAM-SHA-256${}:{}${}:{}",
+            self.iterations,
+            BASE64.encode(&self.salt),
+            BASE64.encode(self.stored_key),
+            BASE64.encode(self.server_key)
+        )
+    }
+
+    /// Parses a `SCRAM-SHA-256$...` verifier (one trailing newline is allowed).
+    pub fn parse(text: &str) -> Result<Self, PgError> {
+        let rest = text.trim().strip_prefix("SCRAM-SHA-256$").ok_or_else(|| {
+            PgError::Protocol("verifier must start with SCRAM-SHA-256$".to_string())
+        })?;
+        let (params, keys) = rest
+            .split_once('$')
+            .ok_or_else(|| PgError::Protocol("verifier is missing its key section".to_string()))?;
+        let (iterations, salt) = params
+            .split_once(':')
+            .ok_or_else(|| PgError::Protocol("verifier is missing iterations:salt".to_string()))?;
+        let (stored, server) = keys.split_once(':').ok_or_else(|| {
+            PgError::Protocol("verifier is missing stored:server keys".to_string())
+        })?;
+        let iterations: u32 = iterations
+            .parse()
+            .map_err(|_| PgError::Protocol("bad verifier iteration count".to_string()))?;
+        if iterations == 0 {
+            return Err(PgError::Protocol(
+                "verifier iteration count must be greater than 0".to_string(),
+            ));
+        }
+        let decode_key = |value: &str, label: &str| -> Result<[u8; 32], PgError> {
+            let bytes = BASE64
+                .decode(value)
+                .map_err(|error| PgError::Protocol(format!("bad {label}: {error}")))?;
+            bytes
+                .try_into()
+                .map_err(|_| PgError::Protocol(format!("{label} must be 32 bytes")))
+        };
+        Ok(Self {
+            iterations,
+            salt: BASE64
+                .decode(salt)
+                .map_err(|error| PgError::Protocol(format!("bad verifier salt: {error}")))?,
+            stored_key: decode_key(stored, "verifier stored key")?,
+            server_key: decode_key(server, "verifier server key")?,
+        })
+    }
+}
+
 /// How the server authenticates clients.
 #[derive(Clone, Debug, Default)]
 pub enum AuthMode {
@@ -72,8 +160,11 @@ pub enum AuthMode {
     Password(String),
     /// `AuthenticationMD5Password`: `md5(md5(password + user) + salt)`.
     Md5(String),
-    /// SASL `SCRAM-SHA-256` (RFC 5802 / RFC 7677).
+    /// SASL `SCRAM-SHA-256` derived from a cleartext password at connect time.
     ScramSha256(String),
+    /// SASL `SCRAM-SHA-256` backed by a persisted verifier (no cleartext
+    /// password needed at runtime).
+    ScramSha256Verifier(ScramVerifier),
 }
 
 /// Server-side options. `Default` is trust auth with plain text connections,
@@ -88,6 +179,9 @@ pub struct ServerOptions {
     pub tls_key: Option<PathBuf>,
     /// PEM CA bundle used to verify client certificates (mTLS).
     pub tls_client_ca: Option<PathBuf>,
+    /// File of revoked client-certificate SHA-256 fingerprints, one hex digest
+    /// per line (`#` starts a comment).
+    pub tls_client_revoked: Option<PathBuf>,
     /// Reject clients that do not request TLS.
     pub require_tls: bool,
     /// Permit cleartext password authentication over a plaintext connection.
@@ -226,7 +320,7 @@ fn authenticate_md5(
     }
 }
 
-fn authenticate_scram(stream: &mut dyn ReadWrite, password: &str) -> Result<(), PgError> {
+fn authenticate_scram(stream: &mut dyn ReadWrite, verifier: &ScramVerifier) -> Result<(), PgError> {
     // AuthenticationSASL (10) advertising SCRAM-SHA-256.
     let mut payload = Vec::new();
     payload.extend_from_slice(&10i32.to_be_bytes());
@@ -266,8 +360,11 @@ fn authenticate_scram(stream: &mut dyn ReadWrite, password: &str) -> Result<(), 
         .to_string();
 
     let nonce = format!("{client_nonce}{}", hex_lower(&random_bytes::<18>()?));
-    let salt = random_bytes::<16>()?;
-    let server_first = format!("r={nonce},s={},i={SCRAM_ITERATIONS}", BASE64.encode(salt));
+    let server_first = format!(
+        "r={nonce},s={},i={}",
+        BASE64.encode(&verifier.salt),
+        verifier.iterations
+    );
     let mut payload = Vec::new();
     payload.extend_from_slice(&11i32.to_be_bytes());
     payload.extend_from_slice(server_first.as_bytes());
@@ -292,20 +389,16 @@ fn authenticate_scram(stream: &mut dyn ReadWrite, password: &str) -> Result<(), 
         return Err(PgError::Protocol("bad SCRAM proof length".to_string()));
     }
 
-    let salted = pbkdf2_sha256(password.as_bytes(), &salt, SCRAM_ITERATIONS);
-    let client_key = tritdb_cas::hmac_sha256(&salted, b"Client Key");
-    let stored_key = tritdb_cas::sha256(&client_key);
     let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
-    let client_signature = tritdb_cas::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let client_signature = tritdb_cas::hmac_sha256(&verifier.stored_key, auth_message.as_bytes());
     let mut recovered = [0u8; 32];
     for (index, value) in recovered.iter_mut().enumerate() {
         *value = proof[index] ^ client_signature[index];
     }
-    if !constant_time_eq(&tritdb_cas::sha256(&recovered), &stored_key) {
+    if !constant_time_eq(&tritdb_cas::sha256(&recovered), &verifier.stored_key) {
         return auth_failed(stream);
     }
-    let server_key = tritdb_cas::hmac_sha256(&salted, b"Server Key");
-    let server_signature = tritdb_cas::hmac_sha256(&server_key, auth_message.as_bytes());
+    let server_signature = tritdb_cas::hmac_sha256(&verifier.server_key, auth_message.as_bytes());
     let mut payload = Vec::new();
     payload.extend_from_slice(&12i32.to_be_bytes());
     payload.extend_from_slice(format!("v={}", BASE64.encode(server_signature)).as_bytes());
@@ -334,8 +427,107 @@ fn authenticate(
             }
         }
         AuthMode::Md5(password) => authenticate_md5(stream, password, user),
-        AuthMode::ScramSha256(password) => authenticate_scram(stream, password),
+        AuthMode::ScramSha256(password) => {
+            let verifier = ScramVerifier::from_password(password, SCRAM_ITERATIONS)?;
+            authenticate_scram(stream, &verifier)
+        }
+        AuthMode::ScramSha256Verifier(verifier) => authenticate_scram(stream, verifier),
     }
+}
+
+/// Wraps a client-certificate verifier and rejects certificates whose SHA-256
+/// fingerprint appears in a revocation list.
+#[derive(Debug)]
+struct RevocationVerifier {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    revoked: Vec<[u8; 32]>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let fingerprint = tritdb_cas::sha256(end_entity.as_ref());
+        if self
+            .revoked
+            .iter()
+            .any(|revoked| constant_time_eq(revoked, &fingerprint))
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked,
+            ));
+        }
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Parses a revocation list: one SHA-256 hex fingerprint per line,
+/// `#` starts a comment, `:`/`-`/spaces inside a fingerprint are ignored.
+fn load_revoked(path: &Path) -> Result<Vec<[u8; 32]>, PgError> {
+    let text = std::fs::read_to_string(path)?;
+    let mut revoked = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let hex: String = line
+            .chars()
+            .filter(|character| !matches!(character, ':' | '-' | ' '))
+            .collect();
+        if hex.len() != 64 {
+            return Err(PgError::Protocol(format!(
+                "revoked fingerprint must be 64 hex characters: {line}"
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+            let pair = std::str::from_utf8(chunk)
+                .map_err(|_| PgError::Protocol(format!("bad hex in {line}")))?;
+            bytes[index] = u8::from_str_radix(pair, 16)
+                .map_err(|_| PgError::Protocol(format!("bad hex in {line}")))?;
+        }
+        revoked.push(bytes);
+    }
+    Ok(revoked)
 }
 
 fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>, PgError> {
@@ -380,6 +572,14 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
             )
             .build()
             .map_err(|error| PgError::Protocol(format!("client verifier: {error}")))?;
+            let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+                match &options.tls_client_revoked {
+                    Some(path) => Arc::new(RevocationVerifier {
+                        inner: verifier,
+                        revoked: load_revoked(path)?,
+                    }),
+                    None => verifier,
+                };
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
