@@ -12,6 +12,7 @@
 
 1. **新 crate `tritdb-pgwire`**（零外部依赖，`std::net`）：
    - `serve(db: PathBuf, listener: TcpListener)`：打开一个共享 `SqlEngine`（`Arc<Mutex<...>>`），accept 后为每个连接 spawn 一个线程；语句在引擎锁上串行化。
+   - 每个连接都设置 `TCP_NODELAY`：协议是「一条小消息一次往返」，Nagle + delayed ACK 会让 Linux 上每次往返多等约 40 ms。
    - `handle_connection`：startup → `AuthenticationOk` + 若干 `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 2. **协议子集**
    - StartupMessage v3（196608）；`SSLRequest`（80877103）回复 `N` 并要求重新 startup。
