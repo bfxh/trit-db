@@ -28,7 +28,7 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - StartupMessage v3（196608）→ `AuthenticationOk` + `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 - `SSLRequest`（80877103）→ 回 `N`，客户端用明文重试。
 - `Query`（`Q`）→ 执行 `execute_script`，每个结果返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
-- 扩展查询：`Parse`（SQL + 参数 OID）、`Bind`（`$n` → 字面量）、`Describe`（`ParameterDescription` + 真实 `RowDescription`；SELECT 用 `LIMIT 0` 准备、参数用 `NULL` 占位；非 SELECT → `NoData`）、`Execute`（复用 simple query 编码）、`Close`；`Sync` 回 `ReadyForQuery`。
+- 扩展查询：`Parse`（SQL + 参数 OID）、`Bind`（`$n` → 字面量）、`Describe`（`ParameterDescription` + 真实 `RowDescription`；SELECT 用 `LIMIT 1` 取样、参数用 `NULL` 占位；非 SELECT → `NoData`）、`Execute`（复用 simple query 编码）、`Close`；`Sync` 回 `ReadyForQuery`。
 - `Terminate`（`X`）断开。
 - 空查询 → `EmptyQueryResponse`；SQL 错误 → `ErrorResponse` + `ReadyForQuery`。
 - 事务状态：`BEGIN`/`START TRANSACTION` → `ReadyForQuery('T')`；语句失败 → `'E'`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝；`COMMIT`/`ROLLBACK` → `'I'`。
