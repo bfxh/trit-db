@@ -17,6 +17,8 @@ const PACKED_CHUNK: usize = 4096;
 const STATS_MAGIC: [u8; 4] = *b"TRSS";
 const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
+/// Upper bound on rows decoded from one table value (memory-DoS guard).
+const MAX_ROWS: u64 = 1 << 20;
 
 /// Builds the key for a table.
 pub fn table_key(name: &str) -> Vec<u8> {
@@ -429,12 +431,18 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
         let set_count = reader
             .u32()
             .ok_or_else(|| corrupt("missing unique set count"))? as usize;
+        if set_count > MAX_COLUMNS {
+            return Err(corrupt("too many unique sets"));
+        }
         let mut sets = Vec::with_capacity(set_count);
         for _ in 0..set_count {
             let count = reader
                 .u32()
                 .ok_or_else(|| corrupt("missing unique column count"))?
                 as usize;
+            if count > MAX_COLUMNS {
+                return Err(corrupt("too many unique columns"));
+            }
             let mut indices = Vec::with_capacity(count);
             for _ in 0..count {
                 let index = reader
@@ -454,6 +462,9 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
     };
     let checks = if version >= 3 {
         let count = reader.u32().ok_or_else(|| corrupt("missing check count"))? as usize;
+        if count > MAX_COLUMNS {
+            return Err(corrupt("too many checks"));
+        }
         let mut checks = Vec::with_capacity(count);
         for _ in 0..count {
             let len = reader
@@ -470,6 +481,9 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
         Vec::new()
     };
     let row_count = reader.u64().ok_or_else(|| corrupt("missing row count"))?;
+    if row_count > MAX_ROWS {
+        return Err(corrupt("too many rows"));
+    }
     let mut rows = Vec::new();
     for _ in 0..row_count {
         let mut row = Vec::with_capacity(column_count);
