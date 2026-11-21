@@ -65,9 +65,20 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
   等值键分组 + 单 `INT` 时间键、右表按组稳定排序、`NULL` 键/时间不匹配、左外语义；
   语义与 SQLSTATE 见 `docs/ADR/046-asof-join.md`。
 
-### 5.1 还没做
+### 5.1 K3 列扫描向量化（可选读路径）
 
-- **三值列存块**：`TritVec` 还没作为表的物理列格式（目前是内存向量）；
+`tritdb-exec::batch::K3Column` 与 `Table::k3_column(index)`：
+
+- 把 `LOGIC K3` / `LOGIC BELNAP` 列从行值物化成 `TritVec`（`r3` 打包）；
+- **只读路径**：存储仍是行式 `Value`，写路径不变；非注解列返回 `None`；
+- `batch_filter_indices` 现在用 `K3Column::from_rows` 构建原子列（一次物化 + 打包），
+  `NULL` / `BOTH` / `NEITHER` 映射 `UNKNOWN`（与 `WHERE` 语义一致）；
+- 测试：`k3_column_round_trips_row_values`（往返 / 过滤 / 越界）、
+  `table_k3_column_only_for_annotation_columns`（类型校验）；批量 WHERE 的 debug 对拍继续覆盖。
+
+### 5.2 还没做
+
+- **三值列存块**：`TritVec` 还没作为表的物理列格式（当前物化在内存，读路径可选）；
 
 ## 6. 验收
 

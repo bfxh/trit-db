@@ -249,6 +249,21 @@ pub struct Table {
     pub rows: Vec<Row>,
 }
 
+impl Table {
+    /// Materializes a `LOGIC K3` / `LOGIC BELNAP` column as a packed K3 vector.
+    ///
+    /// This is the optional vectorized read path: storage stays row-based, but
+    /// scans can materialize annotation columns for [`batch::eval_predicate`].
+    /// Returns `None` for other column types or a missing column.
+    pub fn k3_column(&self, index: usize) -> Option<batch::K3Column> {
+        let column = self.schema.columns.get(index)?;
+        if !matches!(column.data_type, DataType::Logic | DataType::Belnap) {
+            return None;
+        }
+        batch::K3Column::from_rows(&self.rows, index)
+    }
+}
+
 /// SQL three-valued logic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TruthValue {
@@ -938,6 +953,35 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_k3_column_only_for_annotation_columns() {
+        let schema = Schema::new(vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Int,
+                not_null: true,
+                unique: false,
+                check: None,
+            },
+            Column {
+                name: "flag".to_string(),
+                data_type: DataType::Logic,
+                not_null: false,
+                unique: false,
+                check: None,
+            },
+        ]);
+        let table = Table {
+            name: "t".to_string(),
+            schema,
+            rows: vec![vec![Value::Int(1), Value::Bool(true)]],
+        };
+        assert!(table.k3_column(0).is_none());
+        let column = table.k3_column(1).expect("logic column");
+        assert_eq!(column.get(0), Some(crate::batch::K3::True));
+        assert!(table.k3_column(2).is_none());
+    }
 
     fn truth(op: BinaryOp, left: TruthValue, right: TruthValue) -> TruthValue {
         let schema = Schema::new(vec![

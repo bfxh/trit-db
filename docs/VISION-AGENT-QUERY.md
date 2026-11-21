@@ -104,7 +104,7 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 |---|---|---|
 | M8（本刀） | `tritvec` 内核：`TritVec` + K3 动词/归约 + `TritInt` 平衡三进制加减 | 真值表、打包往返、归一化、溢出 |
 | M9（已落地） | 查询级确定性等级：`certainty(expr)` 返回 `CERTAIN/CONTINGENT/IMPOSSIBLE`，普通查询也带答案等级 | 与 `UNDER REPAIR` 的答案对拍（同词汇、同枚举） |
-| M10（批处理原语 + DML WHERE + ASOF JOIN 已落地） | 三值批量谓词 + asof join（`tritdb-exec::batch`），SELECT/UPDATE/DELETE 的纯注解列 WHERE 已切批量路径，`ASOF JOIN` 语法可用（等值键 + 时间键，ADR 046）；三值列存块待做 | 谓词对标量真值表对拍、asof 对暴力对拍、WHERE 在 debug 构建与行式路径逐查询对拍、ASOF JOIN 集成测试 |
+| M10（批处理原语 + DML WHERE + ASOF JOIN 已落地） | 三值批量谓词 + asof join（`tritdb-exec::batch`），SELECT/UPDATE/DELETE 的纯注解列 WHERE 已切批量路径，`ASOF JOIN` 语法可用（等值键 + 时间键，ADR 046）；`LOGIC K3` 列可物化为 `TritVec`（可选读路径）；三值列存块待做 | 谓词对标量真值表对拍、asof 对暴力对拍、WHERE 在 debug 构建与行式路径逐查询对拍、ASOF JOIN 集成测试 |
 
 ## 6. 明确不做的事
 

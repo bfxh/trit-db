@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tritdb_exec::{
     ann::B4,
-    batch::{eval_predicate, filter_indices, TriPredicate, TritVec, K3},
+    batch::{eval_predicate, filter_indices, K3Column, TriPredicate, TritVec},
     certainty_of_value, compare_values, eval, truth_of, truth_projection, truth_text, BinaryOp,
     Column, DataType, ExecError, Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
 };
@@ -5147,17 +5147,6 @@ fn passes_filter(filter: Option<&ExecExpr>, schema: &Schema, row: &Row) -> Resul
     Ok(truth_of(&eval(filter, schema, row)?)? == TruthValue::True)
 }
 
-/// Maps an annotation value to K3 for the batch path.
-///
-/// `BOTH`/`NEITHER` and `NULL` are `UNKNOWN`: they do not pass `WHERE`.
-fn k3_of_value(value: &Value) -> K3 {
-    match value {
-        Value::Bool(true) | Value::Logic(B4::True) => K3::True,
-        Value::Bool(false) | Value::Logic(B4::False) => K3::False,
-        _ => K3::Unknown,
-    }
-}
-
 /// Builds a batch predicate for `expr`, or `None` when it must stay row-wise.
 ///
 /// Only `AND`/`OR`/`NOT` over `LOGIC K3` / `LOGIC BELNAP` columns qualify;
@@ -5237,11 +5226,8 @@ fn batch_filter_indices(filter: &ExecExpr, schema: &Schema, rows: &[Row]) -> Opt
     }
     let columns: Vec<TritVec> = atoms
         .iter()
-        .map(|index| {
-            let values: Vec<K3> = rows.iter().map(|row| k3_of_value(&row[*index])).collect();
-            TritVec::new(&values)
-        })
-        .collect();
+        .map(|index| K3Column::from_rows(rows, *index).map(|column| column.packed().clone()))
+        .collect::<Option<Vec<_>>>()?;
     let truth = eval_predicate(&predicate, &columns).ok()?;
     Some(filter_indices(&truth))
 }

@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::ann::B4;
+use crate::{Row, Value};
 use tritdb_tritvec::TritVecError;
 pub use tritdb_tritvec::{TritVec, K3};
 
@@ -121,6 +123,66 @@ pub fn eval_predicate(predicate: &TriPredicate, atoms: &[TritVec]) -> Result<Tri
             }
             Ok(accumulator)
         }
+    }
+}
+
+/// A packed K3 column materialized from row values.
+///
+/// This is the optional vectorized read path for `LOGIC K3` / `LOGIC BELNAP`
+/// columns: storage stays row-based, but a scan can materialize one column as
+/// `r3`-packed trits and feed it to [`eval_predicate`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct K3Column {
+    packed: TritVec,
+}
+
+impl K3Column {
+    /// Materializes column `index` from `rows`.
+    ///
+    /// Returns `None` when the column is missing from any row; an empty row
+    /// set materializes as an empty column.
+    pub fn from_rows(rows: &[Row], index: usize) -> Option<Self> {
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            values.push(k3_of_value(row.get(index)?));
+        }
+        Some(Self {
+            packed: TritVec::new(&values),
+        })
+    }
+
+    /// Number of rows.
+    pub const fn len(&self) -> usize {
+        self.packed.len()
+    }
+
+    /// True when the column holds no rows.
+    pub const fn is_empty(&self) -> bool {
+        self.packed.is_empty()
+    }
+
+    /// One element.
+    pub fn get(&self, row: usize) -> Option<K3> {
+        self.packed.get(row)
+    }
+
+    /// The packed representation.
+    pub const fn packed(&self) -> &TritVec {
+        &self.packed
+    }
+
+    /// Rows whose value is `TRUE` (SQL `WHERE` keeps only `TRUE`).
+    pub fn filter_true(&self) -> Vec<usize> {
+        filter_indices(&self.packed)
+    }
+}
+
+/// Maps a value to K3: `BOTH`, `NEITHER` and `NULL` are `UNKNOWN`.
+pub fn k3_of_value(value: &Value) -> K3 {
+    match value {
+        Value::Bool(true) | Value::Logic(B4::True) => K3::True,
+        Value::Bool(false) | Value::Logic(B4::False) => K3::False,
+        _ => K3::Unknown,
     }
 }
 
@@ -326,6 +388,29 @@ mod tests {
                 current: 2
             })
         );
+    }
+
+    #[test]
+    fn k3_column_round_trips_row_values() {
+        let rows: Vec<Row> = vec![
+            vec![Value::Bool(true)],
+            vec![Value::Bool(false)],
+            vec![Value::Null],
+            vec![Value::Logic(B4::Both)],
+            vec![Value::Logic(B4::True)],
+        ];
+        let column = K3Column::from_rows(&rows, 0).expect("column");
+        assert_eq!(column.len(), 5);
+        assert_eq!(column.get(0), Some(K3::True));
+        assert_eq!(column.get(1), Some(K3::False));
+        assert_eq!(column.get(2), Some(K3::Unknown));
+        assert_eq!(column.get(3), Some(K3::Unknown));
+        assert_eq!(column.get(4), Some(K3::True));
+        assert_eq!(column.filter_true(), vec![0, 4]);
+        assert_eq!(K3Column::from_rows(&rows, 1), None);
+        let empty = K3Column::from_rows(&[], 0).expect("empty column");
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
     }
 
     #[test]
