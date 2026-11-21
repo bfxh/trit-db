@@ -723,9 +723,13 @@ fn http_post(url: &str, body: &[u8], extra_root: Option<&[u8]>) -> Result<Vec<u8
 fn post_stream<S: Read + Write>(mut stream: S, request: &[u8]) -> Result<Vec<u8>, PgError> {
     stream.write_all(request)?;
     let mut response = Vec::new();
+    // OCSP responses are tiny; cap the read so a hostile responder cannot
+    // exhaust memory.
+    const MAX_OCSP_RESPONSE: u64 = 1024 * 1024;
+    let mut limited = (&mut stream).take(MAX_OCSP_RESPONSE);
     // Responders may close the connection without a TLS `close_notify`; keep
     // whatever was already received.
-    if let Err(error) = stream.read_to_end(&mut response) {
+    if let Err(error) = limited.read_to_end(&mut response) {
         if response.is_empty() {
             return Err(PgError::Io(error));
         }
@@ -1817,8 +1821,13 @@ fn parse_copy(sql: &str) -> Option<CopyPlan> {
         }
         None => (head.trim().trim_matches('"').to_ascii_lowercase(), None),
     };
-    if table.is_empty() {
+    if !is_plain_identifier(&table) {
         return None;
+    }
+    if let Some(columns) = &columns {
+        if columns.iter().any(|column| !is_plain_identifier(column)) {
+            return None;
+        }
     }
     Some(CopyPlan {
         table,
@@ -1826,6 +1835,14 @@ fn parse_copy(sql: &str) -> Option<CopyPlan> {
         direction,
         options,
     })
+}
+
+/// Identifier-shaped names only: COPY must never smuggle SQL text.
+fn is_plain_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
 }
 
 fn copy_quote(value: &str) -> String {
@@ -3275,7 +3292,7 @@ fn substitute_params(
                 )));
             }
             let oid = param_types.get(index - 1).copied().unwrap_or(0);
-            output.push_str(&param_literal(&params[index - 1], oid));
+            output.push_str(&param_literal(&params[index - 1], oid)?);
             continue;
         }
         output.push(character);
@@ -3283,31 +3300,30 @@ fn substitute_params(
     Ok(output)
 }
 
-fn param_literal(value: &Option<String>, oid: i32) -> String {
+fn param_literal(value: &Option<String>, oid: i32) -> Result<String, PgError> {
     let Some(text) = value else {
-        return "NULL".to_string();
+        return Ok("NULL".to_string());
     };
     match oid {
-        20 | 21 | 23 => text.clone(),
-        16 => {
-            if text == "t" || text.eq_ignore_ascii_case("true") {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }
-        25 | 1043 => format!("'{}'", text.replace('\'', "''")),
-        _ => {
-            if text.parse::<i64>().is_ok() {
-                text.clone()
-            } else if text.eq_ignore_ascii_case("true") || text == "t" {
-                "TRUE".to_string()
-            } else if text.eq_ignore_ascii_case("false") || text == "f" {
-                "FALSE".to_string()
-            } else {
-                format!("'{}'", text.replace('\'', "''"))
-            }
-        }
+        20 | 21 | 23 => text
+            .parse::<i64>()
+            .map(|_| text.clone())
+            .map_err(|_| PgError::Protocol(format!("invalid integer parameter {text:?}"))),
+        16 => Ok(if text == "t" || text.eq_ignore_ascii_case("true") {
+            "TRUE".to_string()
+        } else {
+            "FALSE".to_string()
+        }),
+        25 | 1043 => Ok(format!("'{}'", text.replace('\'', "''"))),
+        _ => Ok(if text.parse::<i64>().is_ok() {
+            text.clone()
+        } else if text.eq_ignore_ascii_case("true") || text == "t" {
+            "TRUE".to_string()
+        } else if text.eq_ignore_ascii_case("false") || text == "f" {
+            "FALSE".to_string()
+        } else {
+            format!("'{}'", text.replace('\'', "''"))
+        }),
     }
 }
 
@@ -3487,4 +3503,40 @@ fn command_tag(message: &str) -> String {
         return "ANALYZE".to_string();
     }
     "OK".to_string()
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn integer_parameter_values_must_be_numbers() {
+        // A client can declare an int8 parameter and send SQL text.
+        let result = substitute_params("SELECT $1", &[23], &[Some("1; DROP TABLE t".into())]);
+        assert!(
+            result.is_err(),
+            "integer parameter accepted SQL text: {result:?}"
+        );
+        // A real integer still substitutes.
+        assert_eq!(
+            substitute_params("SELECT $1", &[23], &[Some("7".into())]).unwrap(),
+            "SELECT 7"
+        );
+    }
+
+    #[test]
+    fn copy_table_names_cannot_carry_statements() {
+        let plan = parse_copy("COPY t; DROP TABLE x FROM STDIN");
+        assert!(
+            plan.is_none() || !plan.unwrap().table.contains(';'),
+            "COPY table name leaked a statement"
+        );
+    }
+
+    #[test]
+    fn parameter_substitution_respects_escaped_quotes() {
+        let sql = substitute_params("SELECT 'it''s', $1", &[23], &[Some("7".into())])
+            .expect("substitute");
+        assert!(sql.ends_with(", 7"), "escaped quotes confused $1: {sql}");
+    }
 }
