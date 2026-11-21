@@ -76,9 +76,20 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
 - 测试：`k3_column_round_trips_row_values`（往返 / 过滤 / 越界）、
   `table_k3_column_only_for_annotation_columns`（类型校验）；批量 WHERE 的 debug 对拍继续覆盖。
 
-### 5.2 还没做
+### 5.2 三值列存块（TRSQ v4）
 
-- **三值列存块**：`TritVec` 还没作为表的物理列格式（当前物化在内存，读路径可选）；
+表格式升到 v4：行数据之后追加「K3 打包段」（`K3PK` + 段版本 + 段数 + 每段
+`column_index` / `row_count` / `packed_len` / packed bytes），只对 `LOGIC K3` 列打包。
+
+- 写路径：行值保持 v3 编码，段是附加的列存块（第一版冗余，空间优化留 v5）；
+- 读路径：v4 严格校验（列类型、行数、段内容逐字节与 `K3Column::from_rows` 一致），
+  v3 无段回退到行值；段损坏报 `CorruptTable`，不静默回退；
+- 语义与边界见 `docs/ADR/047-k3-column-blocks.md`。
+
+### 5.3 还没做
+
+- **行内跳过 K3 列（v5）**：让段替代行值，获得空间收益；
+- **Belnap 打包**：`BOTH`/`NEITHER` 需要 2 trit/值，不在 v4 范围。
 
 ## 6. 验收
 

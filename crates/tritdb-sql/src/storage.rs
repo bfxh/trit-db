@@ -1,3 +1,4 @@
+use tritdb_exec::batch::K3Column;
 use tritdb_exec::{Column, DataType, ExecError, Schema, Table, Value};
 
 use crate::error::SqlError;
@@ -9,7 +10,9 @@ pub const TABLE_KEY_PREFIX: &str = "sql/table/";
 pub const STATS_KEY_PREFIX: &str = "sql/stats/";
 
 const TABLE_MAGIC: [u8; 4] = *b"TRSQ";
-const TABLE_VERSION: u8 = 3;
+const TABLE_VERSION: u8 = 4;
+const PACKED_MAGIC: [u8; 4] = *b"K3PK";
+const PACKED_VERSION: u8 = 1;
 const STATS_MAGIC: [u8; 4] = *b"TRSS";
 const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
@@ -117,6 +120,26 @@ pub fn encode_table(table: &Table) -> Result<Vec<u8>, SqlError> {
         for (value, column) in row.iter().zip(&table.schema.columns) {
             encode_value(&mut out, value, column.data_type, &table.name, &column.name)?;
         }
+    }
+    // v4: optional packed K3 columns (see ADR 047). The row values stay, so
+    // the segment is a redundant but strictly checked column block for now.
+    let packed: Vec<(usize, K3Column)> = table
+        .schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.data_type == DataType::Logic)
+        .filter_map(|(index, _)| table.k3_column(index).map(|column| (index, column)))
+        .collect();
+    out.extend_from_slice(&PACKED_MAGIC);
+    out.push(PACKED_VERSION);
+    put_u32(&mut out, packed.len())?;
+    for (index, column) in packed {
+        put_u32(&mut out, index)?;
+        put_u32(&mut out, column.len())?;
+        let bytes = column.packed().bytes();
+        put_u32(&mut out, bytes.len())?;
+        out.extend_from_slice(bytes);
     }
     Ok(out)
 }
@@ -400,6 +423,59 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
         }
         rows.push(row);
     }
+    if version >= 4 {
+        let magic = reader
+            .bytes
+            .get(reader.pos..reader.pos + 4)
+            .ok_or_else(|| corrupt("missing K3 segment magic"))?;
+        if magic != PACKED_MAGIC.as_slice() {
+            return Err(corrupt("bad K3 segment magic"));
+        }
+        reader.pos += 4;
+        let segment_version = reader
+            .u8()
+            .ok_or_else(|| corrupt("missing K3 segment version"))?;
+        if segment_version != PACKED_VERSION {
+            return Err(corrupt("unsupported K3 segment version"));
+        }
+        let segment_count = reader
+            .u32()
+            .ok_or_else(|| corrupt("missing K3 segment count"))?
+            as usize;
+        for _ in 0..segment_count {
+            let column_index = reader
+                .u32()
+                .ok_or_else(|| corrupt("missing K3 column index"))?
+                as usize;
+            let row_count = reader
+                .u32()
+                .ok_or_else(|| corrupt("missing K3 row count"))?
+                as usize;
+            let packed_len = reader
+                .u32()
+                .ok_or_else(|| corrupt("missing K3 packed length"))?
+                as usize;
+            let segment = reader
+                .bytes
+                .get(reader.pos..reader.pos + packed_len)
+                .ok_or_else(|| corrupt("truncated K3 segment"))?;
+            reader.pos += packed_len;
+            let column = columns
+                .get(column_index)
+                .ok_or_else(|| corrupt("K3 segment column index out of range"))?;
+            if column.data_type != DataType::Logic {
+                return Err(corrupt("K3 segment on a non-LOGIC K3 column"));
+            }
+            if row_count != rows.len() {
+                return Err(corrupt("K3 segment row count does not match the table"));
+            }
+            let expected = K3Column::from_rows(&rows, column_index)
+                .ok_or_else(|| corrupt("K3 segment column"))?;
+            if expected.packed().bytes() != segment {
+                return Err(corrupt("K3 segment does not match the row data"));
+            }
+        }
+    }
     if reader.pos != bytes.len() {
         return Err(corrupt("trailing bytes"));
     }
@@ -480,6 +556,81 @@ mod tests {
     use crate::stats::analyze_table;
 
     use super::*;
+
+    #[test]
+    fn table_v4_round_trips_k3_packed_segments() {
+        let table = Table {
+            name: "k3".to_string(),
+            schema: Schema::new(vec![
+                Column::new("id", DataType::Int),
+                Column::new("flag", DataType::Logic),
+            ]),
+            rows: vec![
+                vec![Value::Int(1), Value::Bool(true)],
+                vec![Value::Int(2), Value::Bool(false)],
+                vec![Value::Int(3), Value::Null],
+            ],
+        };
+        let bytes = encode_table(&table).expect("encode");
+        assert!(
+            bytes.windows(4).any(|window| window == b"K3PK"),
+            "v4 must carry a packed segment"
+        );
+        let decoded = decode_table("k3", &bytes).expect("decode");
+        assert_eq!(decoded.rows, table.rows);
+    }
+
+    #[test]
+    fn table_v4_without_k3_columns_still_decodes() {
+        let table = Table {
+            name: "plain".to_string(),
+            schema: Schema::new(vec![Column::new("id", DataType::Int)]),
+            rows: vec![vec![Value::Int(7)]],
+        };
+        let bytes = encode_table(&table).expect("encode");
+        assert!(bytes.windows(4).any(|window| window == b"K3PK"));
+        let decoded = decode_table("plain", &bytes).expect("decode");
+        assert_eq!(decoded.rows, table.rows);
+    }
+
+    #[test]
+    fn table_v4_rejects_a_tampered_k3_segment() {
+        let table = Table {
+            name: "k3".to_string(),
+            schema: Schema::new(vec![Column::new("flag", DataType::Logic)]),
+            rows: vec![vec![Value::Bool(true)], vec![Value::Bool(false)]],
+        };
+        let mut bytes = encode_table(&table).expect("encode");
+        let segment = bytes
+            .windows(4)
+            .position(|window| window == b"K3PK")
+            .expect("segment");
+        // magic(4) + version(1) + count(4) + column(4) + rows(4) + len(4)
+        let packed_start = segment + 4 + 1 + 4 + 4 + 4 + 4;
+        bytes[packed_start] ^= 0x01;
+        assert!(matches!(
+            decode_table("k3", &bytes),
+            Err(SqlError::CorruptTable { .. })
+        ));
+    }
+
+    #[test]
+    fn table_v3_without_segments_still_decodes() {
+        let table = Table {
+            name: "k3".to_string(),
+            schema: Schema::new(vec![Column::new("flag", DataType::Logic)]),
+            rows: vec![vec![Value::Bool(true)], vec![Value::Null]],
+        };
+        let mut bytes = encode_table(&table).expect("encode");
+        let segment = bytes
+            .windows(4)
+            .position(|window| window == b"K3PK")
+            .expect("segment");
+        bytes.truncate(segment);
+        bytes[4] = 3; // version byte after the 4-byte magic
+        let decoded = decode_table("k3", &bytes).expect("v3 fallback");
+        assert_eq!(decoded.rows, table.rows);
+    }
 
     fn table() -> Table {
         Table {
