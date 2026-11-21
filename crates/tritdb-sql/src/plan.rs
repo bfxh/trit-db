@@ -987,8 +987,12 @@ fn scan_name(table: &str, alias: Option<&str>) -> String {
 }
 
 fn push_string(out: &mut String, value: &str) {
+    // Echo only a bounded prefix: a 16 MiB literal must not turn every
+    // EXPLAIN line into a 16 MiB string.
+    const MAX_ECHO_CHARS: usize = 128;
     out.push('"');
-    for ch in value.chars() {
+    let mut chars = value.chars();
+    for ch in chars.by_ref().take(MAX_ECHO_CHARS) {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -997,6 +1001,9 @@ fn push_string(out: &mut String, value: &str) {
             '\t' => out.push_str("\\t"),
             other => out.push(other),
         }
+    }
+    if chars.next().is_some() {
+        out.push('…');
     }
     out.push('"');
 }
@@ -1081,5 +1088,22 @@ fn join_kind_name(kind: JoinKind) -> &'static str {
         JoinKind::Right => "right",
         JoinKind::Full => "full",
         JoinKind::Asof => "asof",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_echo_is_bounded() {
+        let mut out = String::new();
+        push_string(&mut out, &"x".repeat(4096));
+        assert!(out.chars().count() < 256, "echo must be bounded: {out}");
+        assert!(out.contains('…'));
+
+        let mut out = String::new();
+        push_string(&mut out, "short");
+        assert_eq!(out, "\"short\"");
     }
 }

@@ -1884,6 +1884,42 @@ mod tests {
     }
 
     #[test]
+    fn pitr_recovers_across_wal_segments() {
+        let dir = TempDir::new();
+        let path = dir.wal();
+        // A tiny segment limit forces several WAL segments before the archive.
+        let store = TxnStore::open_with_wal_limit(&path, 1024).expect("open");
+        let mut last_lsn = 0;
+        for index in 0..20u64 {
+            let mut txn = store.begin().expect("begin");
+            txn.put(format!("k{index}").as_bytes(), b"v").expect("put");
+            last_lsn = txn.commit().expect("commit").commit_lsn;
+        }
+        store.checkpoint_archive_keep(8).expect("archive");
+        drop(store);
+
+        let view = TxnStore::recover_at(&path, last_lsn).expect("pitr across segments");
+        assert_eq!(view.entries.len(), 20);
+        for index in 0..20u64 {
+            let key = format!("k{index}");
+            assert!(
+                view.entries
+                    .iter()
+                    .any(|(entry, _)| entry == key.as_bytes()),
+                "missing {key} after cross-segment PITR"
+            );
+        }
+
+        // Pruning history down to one archive must keep the latest target
+        // recoverable.
+        let store = TxnStore::open(&path).expect("reopen");
+        store.checkpoint_archive_keep(1).expect("archive keep 1");
+        drop(store);
+        let view = TxnStore::recover_at(&path, last_lsn).expect("pitr after prune");
+        assert_eq!(view.entries.len(), 20);
+    }
+
+    #[test]
     fn concurrent_archived_checkpoints_keep_recovery_intact() {
         let dir = TempDir::new();
         let path = dir.wal();

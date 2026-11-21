@@ -2582,9 +2582,17 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn arg_usize(args: &[String], flag: &str, default: usize) -> usize {
-    arg_value(args, flag)
+    let value = arg_value(args, flag)
         .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+        .unwrap_or(default);
+    // A bench flag like `--rows 1000000000` must fail fast instead of trying
+    // to allocate the whole range.
+    const MAX_BENCH_ARG: usize = 1 << 24;
+    if value > MAX_BENCH_ARG {
+        eprintln!("{flag} must be at most {MAX_BENCH_ARG}");
+        std::process::exit(2);
+    }
+    value
 }
 
 #[derive(Clone, Copy, Debug)]

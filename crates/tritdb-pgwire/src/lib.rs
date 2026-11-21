@@ -44,6 +44,10 @@ const MAX_PREPARED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PORTALS: usize = 1024;
 /// Upper bound on rows one `COPY` may insert.
 const MAX_COPY_ROWS: usize = 1 << 20;
+/// Upper bound on one batched `INSERT` string assembled by `COPY ... FROM
+/// STDIN`. Without it, 1024 rows of up to 16 MiB each could build a
+/// multi-gigabyte statement before it is executed.
+const MAX_COPY_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// SCRAM-SHA-256 iteration count used for new challenges.
 const SCRAM_ITERATIONS: u32 = 4_096;
 const SSL_REQUEST: i32 = 80_877_103;
@@ -2299,7 +2303,7 @@ fn copy_in_csv(
                         &format!("COPY inserts more than {MAX_COPY_ROWS} rows"),
                     );
                 }
-                if batched >= 1024 {
+                if batched >= 1024 || batch.len() >= MAX_COPY_BATCH_BYTES {
                     batch.push(';');
                     if let Err(error) = engine.execute_script(&batch) {
                         return copy_failed_sql(stream, &error);
@@ -2592,7 +2596,7 @@ fn copy_in_binary(
                     &format!("COPY inserts more than {MAX_COPY_ROWS} rows"),
                 );
             }
-            if batched >= 1024 {
+            if batched >= 1024 || batch.len() >= MAX_COPY_BATCH_BYTES {
                 batch.push(';');
                 if let Err(error) = engine.execute_script(&batch) {
                     return copy_failed_sql(stream, &error);
@@ -2734,7 +2738,7 @@ fn copy_in(
                         &format!("COPY inserts more than {MAX_COPY_ROWS} rows"),
                     );
                 }
-                if batched >= 1024 {
+                if batched >= 1024 || batch.len() >= MAX_COPY_BATCH_BYTES {
                     batch.push(';');
                     if let Err(error) = engine.execute_script(&batch) {
                         return copy_failed_sql(stream, &error);
@@ -3701,6 +3705,18 @@ fn command_tag(message: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn copy_literal_quotes_hostile_text() {
+        assert_eq!(copy_literal("a'b", DataType::Text), "'a''b'");
+        assert_eq!(
+            copy_literal("1; DROP TABLE t", DataType::Int),
+            "'1; DROP TABLE t'"
+        );
+        assert_eq!(copy_literal("42", DataType::Int), "42");
+        assert_eq!(copy_literal("TRUE", DataType::Bool), "TRUE");
+        assert_eq!(copy_literal("a\\b", DataType::Text), "'a\\b'");
+    }
 
     #[test]
     fn unterminated_csv_quotes_are_rejected() {
