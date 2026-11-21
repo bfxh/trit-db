@@ -24,6 +24,7 @@ use md5::{Digest as _, Md5};
 
 use tritdb_exec::{DataType, Value};
 use tritdb_sql::{parse_script, QueryResult, SqlEngine, Statement};
+use x509_cert::ext::pkix::CrlReason;
 
 const PROTOCOL_V3: i32 = 196_608;
 /// SCRAM-SHA-256 iteration count used for new challenges.
@@ -186,9 +187,12 @@ pub struct ServerOptions {
     /// DER-encoded OCSP response (pre-fetched) used to revoke client
     /// certificates.
     pub tls_client_ocsp: Option<PathBuf>,
-    /// OCSP responder URL (`http://...`) used to check client certificates
-    /// online. Requires `tls_client_ca`.
+    /// OCSP responder URL (`http://` or `https://`) used to check client
+    /// certificates online. Requires `tls_client_ca`.
     pub tls_client_ocsp_url: Option<String>,
+    /// Extra PEM certificate trusted for HTTPS OCSP responders (e.g. a
+    /// private CA). System roots are always used as well.
+    pub tls_client_ocsp_ca: Option<PathBuf>,
     /// Reject clients that do not request TLS.
     pub require_tls: bool,
     /// Permit cleartext password authentication over a plaintext connection.
@@ -491,17 +495,19 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
             ));
         }
         if let Some(online) = &self.online {
-            match online.is_revoked(end_entity.as_ref()) {
-                Ok(true) => {
+            match online.check_status(end_entity.as_ref()) {
+                Ok(OcspStatus::Revoked(reason)) => {
+                    eprintln!("pgwire: client certificate revoked (reason: {reason:?})");
                     return Err(rustls::Error::InvalidCertificate(
                         rustls::CertificateError::Revoked,
-                    ))
+                    ));
                 }
-                Ok(false) => {}
+                Ok(OcspStatus::Good) => {}
                 Err(error) => {
+                    eprintln!("pgwire: OCSP check failed: {error}");
                     return Err(rustls::Error::General(format!(
                         "OCSP check failed: {error}"
-                    )))
+                    )));
                 }
             }
         }
@@ -532,26 +538,37 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
     }
 }
 
+/// Result of an OCSP lookup for one certificate.
+#[derive(Clone, Copy, Debug)]
+enum OcspStatus {
+    /// The responder says the certificate is valid.
+    Good,
+    /// The responder revoked it; the reason may be absent.
+    Revoked(Option<CrlReason>),
+}
+
 /// Online OCSP checker backed by a preconfigured responder URL.
 #[derive(Debug)]
 struct OcspOnline {
     url: String,
     ca_der: Vec<u8>,
-    cache: Mutex<HashMap<Vec<u8>, (bool, Instant)>>,
+    extra_root: Option<Vec<u8>>,
+    cache: Mutex<HashMap<Vec<u8>, (OcspStatus, Instant)>>,
 }
 
 impl OcspOnline {
-    fn new(url: String, ca_der: Vec<u8>) -> Self {
+    fn new(url: String, ca_der: Vec<u8>, extra_root: Option<Vec<u8>>) -> Self {
         Self {
             url,
             ca_der,
+            extra_root,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Returns true when the responder marks this certificate as revoked.
-    /// Unknown or failed checks are treated as revoked.
-    fn is_revoked(&self, cert_der: &[u8]) -> Result<bool, PgError> {
+    /// Returns the revocation reason when the responder revokes this
+    /// certificate. Unknown or failed checks are treated as revoked.
+    fn check_status(&self, cert_der: &[u8]) -> Result<OcspStatus, PgError> {
         let (_, certificate) = x509_parser::parse_x509_certificate(cert_der)
             .map_err(|error| PgError::Protocol(format!("OCSP: bad client certificate: {error}")))?;
         let serial = certificate.raw_serial().to_vec();
@@ -560,24 +577,24 @@ impl OcspOnline {
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((revoked, at)) = cache.get(&serial) {
+            if let Some((status, at)) = cache.get(&serial) {
                 if at.elapsed() < Duration::from_secs(60) {
-                    return Ok(*revoked);
+                    return Ok(*status);
                 }
             }
         }
-        let request = self.request_der(&serial)?;
-        let response = http_post(&self.url, &request)?;
-        let revoked = ocsp_revoked(&response, Some(&self.ca_der), &serial)?;
+        let (request, nonce) = self.request_der(&serial)?;
+        let response = http_post(&self.url, &request, self.extra_root.as_deref())?;
+        let status = ocsp_revoked(&response, Some(&self.ca_der), &serial, Some(&nonce))?;
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.insert(serial, (revoked, Instant::now()));
-        Ok(revoked)
+        cache.insert(serial, (status, Instant::now()));
+        Ok(status)
     }
 
-    fn request_der(&self, serial: &[u8]) -> Result<Vec<u8>, PgError> {
+    fn request_der(&self, serial: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PgError> {
         use der::{Decode, Encode};
         use sha1::{Digest, Sha1};
         let ca = x509_cert::Certificate::from_der(&self.ca_der)
@@ -606,6 +623,19 @@ impl OcspOnline {
             serial_number: x509_cert::serial_number::SerialNumber::new(serial)
                 .map_err(|error| PgError::Protocol(format!("OCSP: serial: {error}")))?,
         };
+        let nonce_bytes = random_bytes::<16>()?;
+        let nonce = x509_ocsp::ext::Nonce::new(nonce_bytes.to_vec())
+            .map_err(|error| PgError::Protocol(format!("OCSP nonce: {error}")))?;
+        let nonce_extension = x509_cert::ext::Extension {
+            extn_id: <x509_ocsp::ext::Nonce as const_oid::AssociatedOid>::OID,
+            critical: false,
+            extn_value: der::asn1::OctetString::new(
+                nonce
+                    .to_der()
+                    .map_err(|error| PgError::Protocol(format!("OCSP nonce DER: {error}")))?,
+            )
+            .map_err(|error| PgError::Protocol(format!("OCSP nonce extension: {error}")))?,
+        };
         let request = x509_ocsp::OcspRequest {
             tbs_request: x509_ocsp::TbsRequest {
                 version: Default::default(),
@@ -614,20 +644,23 @@ impl OcspOnline {
                     req_cert: cert_id,
                     single_request_extensions: None,
                 }],
-                request_extensions: None,
+                request_extensions: Some(vec![nonce_extension]),
             },
             optional_signature: None,
         };
-        request
-            .to_der()
-            .map_err(|error| PgError::Protocol(format!("OCSP request: {error}")))
+        Ok((
+            request
+                .to_der()
+                .map_err(|error| PgError::Protocol(format!("OCSP request: {error}")))?,
+            nonce_bytes.to_vec(),
+        ))
     }
 }
 
 /// Minimal HTTP/1.1 POST for `http://` OCSP responders.
-fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, PgError> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
-        PgError::Protocol("OCSP responder URL must start with http://".to_string())
+fn http_post(url: &str, body: &[u8], extra_root: Option<&[u8]>) -> Result<Vec<u8>, PgError> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        PgError::Protocol("OCSP responder URL needs an http:// or https:// scheme".to_string())
     })?;
     let (host_port, path) = match rest.find('/') {
         Some(at) => (&rest[..at], &rest[at..]),
@@ -639,20 +672,56 @@ fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, PgError> {
             port.parse::<u16>()
                 .map_err(|_| PgError::Protocol(format!("bad OCSP responder port {port}")))?,
         ),
-        None => (host_port, 80),
+        None => (host_port, if scheme == "https" { 443 } else { 80 }),
     };
-    let mut stream = TcpStream::connect((host, port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let tcp = TcpStream::connect((host, port))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/ocsp-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
     request.extend_from_slice(body);
-    stream.write_all(&request)?;
+    match scheme {
+        "http" => post_stream(tcp, &request),
+        "https" => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            if let Some(der) = extra_root {
+                roots
+                    .add(der.to_vec().into())
+                    .map_err(|error| PgError::Protocol(format!("OCSP extra root: {error}")))?;
+            }
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|error| PgError::Protocol(format!("OCSP TLS versions: {error}")))?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|error| PgError::Protocol(format!("OCSP TLS name: {error}")))?;
+            let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
+                .map_err(|error| PgError::Protocol(format!("OCSP TLS client: {error}")))?;
+            let stream = rustls::StreamOwned::new(connection, tcp);
+            post_stream(stream, &request)
+        }
+        other => Err(PgError::Protocol(format!(
+            "unsupported OCSP responder scheme {other}"
+        ))),
+    }
+}
+
+fn post_stream<S: Read + Write>(mut stream: S, request: &[u8]) -> Result<Vec<u8>, PgError> {
+    stream.write_all(request)?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    // Responders may close the connection without a TLS `close_notify`; keep
+    // whatever was already received.
+    if let Err(error) = stream.read_to_end(&mut response) {
+        if response.is_empty() {
+            return Err(PgError::Io(error));
+        }
+    }
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -668,7 +737,12 @@ fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, PgError> {
 }
 
 /// Returns whether `serial` is revoked according to an OCSP response.
-fn ocsp_revoked(bytes: &[u8], ca_der: Option<&[u8]>, serial: &[u8]) -> Result<bool, PgError> {
+fn ocsp_revoked(
+    bytes: &[u8],
+    ca_der: Option<&[u8]>,
+    serial: &[u8],
+    expected_nonce: Option<&[u8]>,
+) -> Result<OcspStatus, PgError> {
     use der::Decode;
     let response = x509_ocsp::OcspResponse::from_der(bytes)
         .map_err(|error| PgError::Protocol(format!("bad OCSP response: {error}")))?;
@@ -688,17 +762,30 @@ fn ocsp_revoked(bytes: &[u8], ca_der: Option<&[u8]>, serial: &[u8]) -> Result<bo
     let basic = x509_ocsp::BasicOcspResponse::from_der(response_bytes.response.as_bytes())
         .map_err(|error| PgError::Protocol(format!("bad OCSP basic response: {error}")))?;
     verify_ocsp_signature(&basic, ca_der)?;
-    for single in &basic.tbs_response_data.responses {
-        if single.cert_id.serial_number.as_bytes() == serial {
-            return Ok(matches!(
-                single.cert_status,
-                x509_ocsp::CertStatus::Revoked(_)
-            ));
+    if let Some(expected) = expected_nonce {
+        match basic.nonce() {
+            Some(nonce) if nonce.0.as_bytes() == expected => {}
+            Some(_) => {
+                return Err(PgError::Protocol("OCSP nonce mismatch".to_string()));
+            }
+            None => {
+                return Err(PgError::Protocol(
+                    "OCSP response is missing the nonce".to_string(),
+                ));
+            }
         }
     }
-    // The responder did not mention this certificate: reject rather than
-    // silently accepting it.
-    Ok(true)
+    for single in &basic.tbs_response_data.responses {
+        if single.cert_id.serial_number.as_bytes() == serial {
+            return Ok(match &single.cert_status {
+                x509_ocsp::CertStatus::Revoked(info) => OcspStatus::Revoked(info.revocation_reason),
+                _ => OcspStatus::Good,
+            });
+        }
+    }
+    Err(PgError::Protocol(
+        "OCSP response does not mention the client certificate".to_string(),
+    ))
 }
 
 /// Parses a pre-fetched OCSP response, verifies its signature, and returns
@@ -908,10 +995,22 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
                     .serials
                     .extend(load_ocsp(path, ca_certs.first().map(|cert| cert.as_ref()))?);
             }
-            let online = match (&options.tls_client_ocsp_url, ca_certs.first()) {
-                (Some(url), Some(ca)) => {
-                    Some(Arc::new(OcspOnline::new(url.clone(), ca.as_ref().to_vec())))
+            let extra_root = match &options.tls_client_ocsp_ca {
+                Some(path) => {
+                    let bytes = std::fs::read(path)?;
+                    let certs = rustls_pemfile::certs(&mut bytes.as_slice())
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| PgError::Protocol(format!("bad OCSP CA PEM: {error}")))?;
+                    certs.first().map(|cert| cert.as_ref().to_vec())
                 }
+                None => None,
+            };
+            let online = match (&options.tls_client_ocsp_url, ca_certs.first()) {
+                (Some(url), Some(ca)) => Some(Arc::new(OcspOnline::new(
+                    url.clone(),
+                    ca.as_ref().to_vec(),
+                    extra_root,
+                ))),
                 (Some(_), None) => {
                     return Err(PgError::Protocol(
                         "--tls-client-ocsp-url needs --tls-client-ca".to_string(),
@@ -1297,6 +1396,9 @@ struct CopyOptions {
     header: bool,
     quote: u8,
     escape: u8,
+    force_null: Vec<String>,
+    force_not_null: Vec<String>,
+    encoding: String,
 }
 
 impl CopyOptions {
@@ -1309,6 +1411,9 @@ impl CopyOptions {
                 header: false,
                 quote: b'"',
                 escape: b'"',
+                force_null: Vec::new(),
+                force_not_null: Vec::new(),
+                encoding: "UTF8".to_string(),
             },
             _ => Self {
                 format,
@@ -1317,6 +1422,9 @@ impl CopyOptions {
                 header: false,
                 quote: b'"',
                 escape: b'"',
+                force_null: Vec::new(),
+                force_not_null: Vec::new(),
+                encoding: "UTF8".to_string(),
             },
         }
     }
@@ -1326,13 +1434,22 @@ fn split_copy_options(inner: &str) -> Vec<(String, String)> {
     let mut items = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
+    let mut depth = 0usize;
     for character in inner.chars() {
         match character {
             '\'' => {
                 in_quote = !in_quote;
                 current.push(character);
             }
-            ',' if !in_quote => {
+            '(' if !in_quote => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' if !in_quote => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if !in_quote && depth == 0 => {
                 items.push(current.trim().to_string());
                 current.clear();
             }
@@ -1363,6 +1480,25 @@ fn copy_option_value(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn copy_option_columns(value: &str) -> Vec<String> {
+    let value = copy_option_value(value);
+    value
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(|column| column.trim().trim_matches('"').to_ascii_lowercase())
+        .filter(|column| !column.is_empty())
+        .collect()
+}
+
+fn copy_encoding_supported(encoding: &str) -> bool {
+    matches!(
+        encoding.to_ascii_uppercase().replace('-', "").as_str(),
+        "UTF8"
+    )
 }
 
 fn copy_option_byte(value: &str, default: u8) -> u8 {
@@ -1406,6 +1542,9 @@ fn parse_copy_options(tail: &str) -> CopyOptions {
             "NULL" => options.null = copy_option_value(&value),
             "QUOTE" => options.quote = copy_option_byte(&value, options.quote),
             "ESCAPE" => options.escape = copy_option_byte(&value, options.escape),
+            "FORCE_NULL" => options.force_null = copy_option_columns(&value),
+            "FORCE_NOT_NULL" => options.force_not_null = copy_option_columns(&value),
+            "ENCODING" => options.encoding = copy_option_value(&value),
             _ => {}
         }
     }
@@ -1542,6 +1681,12 @@ fn handle_copy(
     engine: &mut SqlEngine,
     plan: &CopyPlan,
 ) -> Result<bool, PgError> {
+    if !copy_encoding_supported(&plan.options.encoding) {
+        return copy_failed(
+            stream,
+            &format!("unsupported COPY encoding {}", plan.options.encoding),
+        );
+    }
     let Some(schema) = engine.table_schema(&plan.table) else {
         return copy_failed(stream, &format!("unknown table {}", plan.table));
     };
@@ -1579,7 +1724,7 @@ fn handle_copy(
 }
 
 /// Parses one CSV line into fields. An unquoted empty field is `NULL`.
-fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<Option<String>> {
+fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<(bool, String)> {
     let quote = options.quote as char;
     let escape = options.escape as char;
     let delimiter = options.delimiter as char;
@@ -1617,11 +1762,7 @@ fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<Option<String>> {
                 chars.next();
             }
         }
-        if !quoted && field == options.null {
-            fields.push(None);
-        } else {
-            fields.push(Some(field));
-        }
+        fields.push((quoted, field));
         if chars.next() != Some(delimiter) {
             break;
         }
@@ -1686,17 +1827,34 @@ fn copy_in_csv(
                 }
                 let line = String::from_utf8_lossy(&payload);
                 let line = line.trim_end_matches(['\r', '\n']);
-                let values = parse_csv_line(line, options);
-                if values.len() != columns.len() {
+                let parsed = parse_csv_line(line, options);
+                if parsed.len() != columns.len() {
                     return copy_failed(
                         stream,
                         &format!(
                             "COPY expected {} columns, got {}",
                             columns.len(),
-                            values.len()
+                            parsed.len()
                         ),
                     );
                 }
+                let values: Vec<Option<String>> = parsed
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (quoted, field))| {
+                        let column = columns[index].to_ascii_lowercase();
+                        let force_null = options.force_null.iter().any(|name| name == &column);
+                        let force_not_null =
+                            options.force_not_null.iter().any(|name| name == &column);
+                        if force_not_null && field.is_empty() {
+                            return Some(field);
+                        }
+                        if field == options.null && (force_null || !quoted) {
+                            return None;
+                        }
+                        Some(field)
+                    })
+                    .collect();
                 if batched == 0 {
                     batch.push_str(&format!(
                         "INSERT INTO {table} ({}) VALUES ",

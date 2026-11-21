@@ -1927,17 +1927,17 @@ fn copy_csv_options_delimiter_header() {
 }
 
 fn ocsp_responder_response(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
-    client_cert: &rcgen::Certificate,
+    ca_der: &[u8],
+    ca_key_der: &[u8],
+    client_der: &[u8],
     revoked: bool,
+    nonce: Option<Vec<u8>>,
 ) -> Vec<u8> {
     use der::asn1::{BitString, GeneralizedTime, ObjectIdentifier, OctetString};
     use der::{Any, Decode, Encode};
     use sha1::{Digest, Sha1};
 
-    let ca_der = ca_cert.der();
-    let ca = x509_cert::Certificate::from_der(ca_der.as_ref()).expect("CA certificate");
+    let ca = x509_cert::Certificate::from_der(ca_der).expect("CA certificate");
     let name_hash = Sha1::digest(ca.tbs_certificate.subject.to_der().expect("subject"));
     let key_hash = Sha1::digest(
         ca.tbs_certificate
@@ -1945,8 +1945,7 @@ fn ocsp_responder_response(
             .to_der()
             .expect("spki"),
     );
-    let client_der = client_cert.der();
-    let client = x509_cert::Certificate::from_der(client_der.as_ref()).expect("client certificate");
+    let client = x509_cert::Certificate::from_der(client_der).expect("client certificate");
     let serial = client.tbs_certificate.serial_number.as_bytes().to_vec();
     let cert_id = x509_ocsp::CertId {
         hash_algorithm: spki::AlgorithmIdentifierOwned {
@@ -1976,18 +1975,27 @@ fn ocsp_responder_response(
         next_update: None,
         single_extensions: None,
     };
+    let response_extensions = nonce.map(|bytes| {
+        let nonce = x509_ocsp::ext::Nonce::new(bytes).expect("nonce");
+        vec![x509_cert::ext::Extension {
+            extn_id: <x509_ocsp::ext::Nonce as const_oid::AssociatedOid>::OID,
+            critical: false,
+            extn_value: der::asn1::OctetString::new(nonce.to_der().expect("nonce DER"))
+                .expect("octet"),
+        }]
+    });
     let response_data = x509_ocsp::ResponseData {
         version: Default::default(),
         responder_id: x509_ocsp::ResponderId::ByName(x509_cert::name::Name::default()),
         produced_at: this_update,
         responses: vec![single],
-        response_extensions: None,
+        response_extensions,
     };
     let tbs = response_data.to_der().expect("tbs response data");
     let rng = ring::rand::SystemRandom::new();
     let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
         &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-        &ca_key.serialize_der(),
+        ca_key_der,
         &rng,
     )
     .expect("signing key");
@@ -2007,7 +2015,7 @@ fn ocsp_responder_response(
         .expect("DER")
 }
 
-fn read_http_request(stream: &mut TcpStream) {
+fn read_http_request<S: Read>(stream: &mut S) -> Vec<u8> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -2027,21 +2035,24 @@ fn read_http_request(stream: &mut TcpStream) {
                         })
                         .unwrap_or(0);
                     if buffer.len() >= end + 4 + content_length {
-                        break;
+                        let body_start = end + 4;
+                        return buffer[body_start..body_start + content_length].to_vec();
                     }
                 }
             }
             Err(_) => break,
         }
     }
+    buffer
 }
 
-fn start_ocsp_responder(response: Vec<u8>) -> String {
+fn start_ocsp_responder(build: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind responder");
     let addr = listener.local_addr().expect("responder address");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            read_http_request(&mut stream);
+            let request = read_http_request(&mut stream);
+            let response = build(&request);
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
@@ -2051,6 +2062,12 @@ fn start_ocsp_responder(response: Vec<u8>) -> String {
         }
     });
     format!("http://{addr}/ocsp")
+}
+
+fn ocsp_request_nonce(request: &[u8]) -> Option<Vec<u8>> {
+    use der::Decode;
+    let request = x509_ocsp::OcspRequest::from_der(request).ok()?;
+    request.nonce().map(|nonce| nonce.0.as_bytes().to_vec())
 }
 
 fn start_failing_ocsp_responder() -> String {
@@ -2077,6 +2094,7 @@ fn serve_mtls_with_ocsp_url(
     ca_cert: &rcgen::Certificate,
     client_cert: &rcgen::Certificate,
     client_key: &rcgen::KeyPair,
+    ocsp_ca: Option<std::path::PathBuf>,
 ) -> (TempDir, std::net::SocketAddr, rcgen::CertifiedKey) {
     let server =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
@@ -2097,6 +2115,7 @@ fn serve_mtls_with_ocsp_url(
         tls_key: Some(key_path),
         tls_client_ca: Some(ca_path),
         tls_client_ocsp_url: Some(url),
+        tls_client_ocsp_ca: ocsp_ca,
         require_tls: true,
         ..Default::default()
     });
@@ -2106,18 +2125,110 @@ fn serve_mtls_with_ocsp_url(
     (dir, addr, server)
 }
 
+fn start_https_ocsp_responder(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    build: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+) -> String {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(cert_der)],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der).into(),
+        )
+        .expect("TLS server certificate");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind https responder");
+    let addr = listener.local_addr().expect("https responder address");
+    thread::spawn(move || {
+        if let Ok((tcp, _)) = listener.accept() {
+            let connection = rustls::ServerConnection::new(std::sync::Arc::new(config))
+                .expect("TLS server connection");
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            let request = read_http_request(&mut stream);
+            let response = build(&request);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&response);
+        }
+    });
+    format!("https://127.0.0.1:{}/ocsp", addr.port())
+}
+
+#[test]
+fn ocsp_online_https_responder() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 15);
+    let ca_der = ca_cert.der().as_ref().to_vec();
+    let ca_key_der = ca_key.serialize_der();
+    let client_der = client_cert.der().as_ref().to_vec();
+
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("TLS params");
+    params.subject_alt_names = vec![rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+        std::net::Ipv4Addr::LOCALHOST,
+    ))];
+    let tls_key = rcgen::KeyPair::generate().expect("TLS key");
+    let tls_cert = params.self_signed(&tls_key).expect("TLS cert");
+
+    let url = start_https_ocsp_responder(
+        tls_cert.der().as_ref().to_vec(),
+        tls_key.serialize_der(),
+        move |request| {
+            ocsp_responder_response(
+                &ca_der,
+                &ca_key_der,
+                &client_der,
+                false,
+                ocsp_request_nonce(request),
+            )
+        },
+    );
+
+    let trust_dir = TempDir::new("pgproto-ocsp-https-ca");
+    let trust_path = trust_dir.join("ocsp-ca.pem");
+    std::fs::write(&trust_path, tls_cert.pem()).expect("write trust certificate");
+
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-https",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+        Some(trust_path),
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    tls_select_one(addr, client).expect("HTTPS OCSP good certificate must be accepted");
+}
+
 #[test]
 fn ocsp_online_rejects_revoked_client_certificate() {
     let (ca_cert, ca_key) = make_ca();
     let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 42);
-    let response = ocsp_responder_response(&ca_cert, &ca_key, &client_cert, true);
-    let url = start_ocsp_responder(response);
+    let ca_der = ca_cert.der().as_ref().to_vec();
+    let ca_key_der = ca_key.serialize_der();
+    let client_der = client_cert.der().as_ref().to_vec();
+    let url = start_ocsp_responder(move |request| {
+        ocsp_responder_response(
+            &ca_der,
+            &ca_key_der,
+            &client_der,
+            true,
+            ocsp_request_nonce(request),
+        )
+    });
     let (dir, addr, server) = serve_mtls_with_ocsp_url(
         "pgproto-ocsp-online",
         url,
         &ca_cert,
         &client_cert,
         &client_key,
+        None,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
@@ -2131,18 +2242,61 @@ fn ocsp_online_rejects_revoked_client_certificate() {
 fn ocsp_online_accepts_good_client_certificate() {
     let (ca_cert, ca_key) = make_ca();
     let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 7);
-    let response = ocsp_responder_response(&ca_cert, &ca_key, &client_cert, false);
-    let url = start_ocsp_responder(response);
+    let ca_der = ca_cert.der().as_ref().to_vec();
+    let ca_key_der = ca_key.serialize_der();
+    let client_der = client_cert.der().as_ref().to_vec();
+    let url = start_ocsp_responder(move |request| {
+        ocsp_responder_response(
+            &ca_der,
+            &ca_key_der,
+            &client_der,
+            false,
+            ocsp_request_nonce(request),
+        )
+    });
     let (dir, addr, server) = serve_mtls_with_ocsp_url(
         "pgproto-ocsp-good",
         url,
         &ca_cert,
         &client_cert,
         &client_key,
+        None,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
     tls_select_one(addr, client).expect("an OCSP-good client certificate must be accepted");
+}
+
+#[test]
+fn ocsp_online_rejects_mismatched_nonce() {
+    let (ca_cert, ca_key) = make_ca();
+    let (client_cert, client_key) = make_client_cert_with_serial(&ca_cert, &ca_key, 11);
+    let ca_der = ca_cert.der().as_ref().to_vec();
+    let ca_key_der = ca_key.serialize_der();
+    let client_der = client_cert.der().as_ref().to_vec();
+    let url = start_ocsp_responder(move |_request| {
+        ocsp_responder_response(
+            &ca_der,
+            &ca_key_der,
+            &client_der,
+            false,
+            Some(vec![0u8; 16]),
+        )
+    });
+    let (dir, addr, server) = serve_mtls_with_ocsp_url(
+        "pgproto-ocsp-nonce",
+        url,
+        &ca_cert,
+        &client_cert,
+        &client_key,
+        None,
+    );
+    let _ = dir;
+    let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
+    assert!(
+        tls_select_one(addr, client).is_err(),
+        "a mismatched OCSP nonce must reject the connection"
+    );
 }
 
 #[test]
@@ -2156,11 +2310,98 @@ fn ocsp_online_rejects_when_responder_fails() {
         &ca_cert,
         &client_cert,
         &client_key,
+        None,
     );
     let _ = dir;
     let client = tls_client_config_with_cert(&server.cert, &client_cert, &client_key);
     assert!(
         tls_select_one(addr, client).is_err(),
         "a failing OCSP responder must reject the connection"
+    );
+}
+
+#[test]
+fn copy_csv_force_null_and_force_not_null() {
+    let (_dir, mut stream) = start_server("pgproto-copy-force");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL, name TEXT);");
+    let _ = read_until_ready(&mut stream);
+
+    // FORCE_NULL makes a quoted "NULL" string mean NULL as well.
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT csv, NULL 'NULL', FORCE_NULL (name));",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    write_message(&mut stream, b'd', b"1,\"NULL\"\n");
+    write_message(&mut stream, b'd', b"2,alpha\n");
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), None],
+            vec![Some("2".into()), Some("alpha".into())],
+        ]
+    );
+
+    // FORCE_NOT_NULL turns an empty quoted field into an empty string.
+    query(&mut stream, "DELETE FROM t;");
+    let _ = read_until_ready(&mut stream);
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT csv, NULL 'NULL', FORCE_NOT_NULL (name));",
+    );
+    let (kind, _) = read_message(&mut stream).expect("CopyInResponse");
+    assert_eq!(kind, b'G');
+    write_message(&mut stream, b'd', b"3,\"\"\n");
+    write_message(&mut stream, b'd', b"4,NULL\n");
+    write_message(&mut stream, b'c', b"");
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, name FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".into()), Some(String::new())],
+            vec![Some("4".into()), None],
+        ]
+    );
+}
+
+#[test]
+fn copy_rejects_unsupported_encoding() {
+    let (_dir, mut stream) = start_server("pgproto-copy-encoding");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL);");
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "COPY t FROM STDIN (FORMAT csv, ENCODING 'LATIN1');",
+    );
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        has_error(&messages),
+        "unsupported COPY encoding must be rejected: {messages:?}"
     );
 }
