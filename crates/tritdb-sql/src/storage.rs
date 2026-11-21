@@ -1,4 +1,4 @@
-use tritdb_exec::batch::{B4Column, K3Column};
+use tritdb_exec::batch::{B4Column, K3Column, LukasiewiczColumn, NatColumn};
 use tritdb_exec::{Column, DataType, ExecError, Schema, Table, Value};
 
 use crate::error::SqlError;
@@ -10,9 +10,10 @@ pub const TABLE_KEY_PREFIX: &str = "sql/table/";
 pub const STATS_KEY_PREFIX: &str = "sql/stats/";
 
 const TABLE_MAGIC: [u8; 4] = *b"TRSQ";
-const TABLE_VERSION: u8 = 5;
+const TABLE_VERSION: u8 = 6;
 const PACKED_MAGIC: [u8; 4] = *b"K3PK";
-const PACKED_VERSION: u8 = 2;
+const PACKED_VERSION: u8 = 3;
+const PACKED_CHUNK: usize = 4096;
 const STATS_MAGIC: [u8; 4] = *b"TRSS";
 const STATS_VERSION: u8 = 0;
 const MAX_COLUMNS: usize = 1024;
@@ -123,8 +124,13 @@ fn encode_table_versioned(table: &Table, version: u8) -> Result<Vec<u8>, SqlErro
             }));
         }
         for (value, column) in row.iter().zip(&table.schema.columns) {
-            // v5: annotation columns live in the packed segment, not in rows.
-            if version >= 5 && is_packed(column.data_type) {
+            // v5 packs K3/Belnap; v6 also packs Ł/ℕ.
+            let skipped = if version >= 6 {
+                is_packed(column.data_type)
+            } else {
+                version >= 5 && matches!(column.data_type, DataType::Logic | DataType::Belnap)
+            };
+            if skipped {
                 continue;
             }
             encode_value(&mut out, value, column.data_type, &table.name, &column.name)?;
@@ -132,10 +138,28 @@ fn encode_table_versioned(table: &Table, version: u8) -> Result<Vec<u8>, SqlErro
     }
     if version >= 4 {
         out.extend_from_slice(&PACKED_MAGIC);
-        if version >= 5 {
-            // v5: the segment is the only source for annotation columns.
+        if version >= 6 {
+            // v6: chunked segments for every annotation type.
+            out.push(3);
+            let packed = packed_columns(table, version);
+            put_u32(&mut out, packed.len())?;
+            for (index, kind, bytes, nulls) in packed {
+                put_u32(&mut out, index)?;
+                out.push(kind);
+                put_u32(&mut out, table.rows.len())?;
+                let chunks: Vec<&[u8]> = bytes.chunks(PACKED_CHUNK).collect();
+                put_u32(&mut out, chunks.len())?;
+                for chunk in chunks {
+                    put_u32(&mut out, chunk.len())?;
+                    out.extend_from_slice(chunk);
+                }
+                put_u32(&mut out, nulls.len())?;
+                out.extend_from_slice(&nulls);
+            }
+        } else if version == 5 {
+            // v5: single-block segments (K3 r3 + Belnap two-trit).
             out.push(2);
-            let packed = packed_columns(table);
+            let packed = packed_columns(table, version);
             put_u32(&mut out, packed.len())?;
             for (index, kind, bytes, nulls) in packed {
                 put_u32(&mut out, index)?;
@@ -172,11 +196,14 @@ fn encode_table_versioned(table: &Table, version: u8) -> Result<Vec<u8>, SqlErro
 
 /// Annotation columns packed into the v5 segment.
 fn is_packed(data_type: DataType) -> bool {
-    matches!(data_type, DataType::Logic | DataType::Belnap)
+    matches!(
+        data_type,
+        DataType::Logic | DataType::Belnap | DataType::Lukasiewicz | DataType::Nat
+    )
 }
 
 /// Packed annotation columns for v5: `(index, kind, packed, nulls)`.
-fn packed_columns(table: &Table) -> Vec<(usize, u8, Vec<u8>, Vec<u8>)> {
+fn packed_columns(table: &Table, version: u8) -> Vec<(usize, u8, Vec<u8>, Vec<u8>)> {
     table
         .schema
         .columns
@@ -186,8 +213,21 @@ fn packed_columns(table: &Table) -> Vec<(usize, u8, Vec<u8>, Vec<u8>)> {
             DataType::Logic => table
                 .k3_column(index)
                 .map(|column| (index, 0, column.packed().bytes().to_vec(), Vec::new())),
-            DataType::Belnap => B4Column::from_rows(&table.rows, index)
-                .map(|column| (index, 1, column.packed().to_vec(), column.nulls().to_vec())),
+            DataType::Belnap => {
+                let column = B4Column::from_rows(&table.rows, index)?;
+                let (packed, nulls) = if version >= 6 {
+                    (column.packed().to_vec(), column.nulls().to_vec())
+                } else {
+                    column.to_parts_2trit()
+                };
+                Some((index, 1, packed, nulls))
+            }
+            DataType::Lukasiewicz if version >= 6 => {
+                LukasiewiczColumn::from_rows(&table.rows, index)
+                    .map(|column| (index, 2, column.packed().to_vec(), column.nulls().to_vec()))
+            }
+            DataType::Nat if version >= 6 => NatColumn::from_rows(&table.rows, index)
+                .map(|column| (index, 3, column.packed().to_vec(), column.nulls().to_vec())),
             _ => None,
         })
         .collect()
@@ -512,27 +552,62 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
                 .u32()
                 .ok_or_else(|| corrupt("missing K3 row count"))?
                 as usize;
-            let packed_len = reader
-                .u32()
-                .ok_or_else(|| corrupt("missing K3 packed length"))?
-                as usize;
-            let null_len = if segment_version >= 2 {
-                reader
+            let (segment, nulls) = if segment_version >= 3 {
+                let chunk_count = reader
                     .u32()
-                    .ok_or_else(|| corrupt("missing K3 null length"))? as usize
+                    .ok_or_else(|| corrupt("missing K3 chunk count"))?
+                    as usize;
+                let mut bytes = Vec::new();
+                for _ in 0..chunk_count {
+                    let len = reader
+                        .u32()
+                        .ok_or_else(|| corrupt("missing K3 chunk length"))?
+                        as usize;
+                    let chunk = reader
+                        .bytes
+                        .get(reader.pos..reader.pos + len)
+                        .ok_or_else(|| corrupt("truncated K3 chunk"))?;
+                    reader.pos += len;
+                    bytes.extend_from_slice(chunk);
+                }
+                let null_len = reader
+                    .u32()
+                    .ok_or_else(|| corrupt("missing K3 null length"))?
+                    as usize;
+                let nulls = reader
+                    .bytes
+                    .get(reader.pos..reader.pos + null_len)
+                    .ok_or_else(|| corrupt("truncated K3 null bitmap"))?
+                    .to_vec();
+                reader.pos += null_len;
+                (bytes, nulls)
             } else {
-                0
+                let packed_len = reader
+                    .u32()
+                    .ok_or_else(|| corrupt("missing K3 packed length"))?
+                    as usize;
+                let null_len = if segment_version >= 2 {
+                    reader
+                        .u32()
+                        .ok_or_else(|| corrupt("missing K3 null length"))?
+                        as usize
+                } else {
+                    0
+                };
+                let segment = reader
+                    .bytes
+                    .get(reader.pos..reader.pos + packed_len)
+                    .ok_or_else(|| corrupt("truncated K3 segment"))?
+                    .to_vec();
+                reader.pos += packed_len;
+                let nulls = reader
+                    .bytes
+                    .get(reader.pos..reader.pos + null_len)
+                    .ok_or_else(|| corrupt("truncated K3 null bitmap"))?
+                    .to_vec();
+                reader.pos += null_len;
+                (segment, nulls)
             };
-            let segment = reader
-                .bytes
-                .get(reader.pos..reader.pos + packed_len)
-                .ok_or_else(|| corrupt("truncated K3 segment"))?;
-            reader.pos += packed_len;
-            let nulls = reader
-                .bytes
-                .get(reader.pos..reader.pos + null_len)
-                .ok_or_else(|| corrupt("truncated K3 null bitmap"))?;
-            reader.pos += null_len;
             let column = columns
                 .get(column_index)
                 .ok_or_else(|| corrupt("K3 segment column index out of range"))?;
@@ -542,13 +617,25 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
             if segment_version >= 2 {
                 let values = match kind {
                     0 if column.data_type == DataType::Logic => {
-                        K3Column::from_parts(segment, row_count)
+                        K3Column::from_parts(&segment, row_count)
                             .ok_or_else(|| corrupt("K3 segment column"))?
                             .to_values()
                     }
-                    1 if column.data_type == DataType::Belnap => {
-                        B4Column::from_parts(segment.to_vec(), nulls.to_vec(), row_count)
-                            .ok_or_else(|| corrupt("Belnap segment column"))?
+                    1 if column.data_type == DataType::Belnap => if segment_version >= 3 {
+                        B4Column::from_parts(segment, nulls, row_count)
+                    } else {
+                        B4Column::from_parts_2trit(segment, nulls, row_count)
+                    }
+                    .ok_or_else(|| corrupt("Belnap segment column"))?
+                    .to_values(),
+                    2 if column.data_type == DataType::Lukasiewicz => {
+                        LukasiewiczColumn::from_parts(segment, nulls, row_count)
+                            .ok_or_else(|| corrupt("Lukasiewicz segment column"))?
+                            .to_values()
+                    }
+                    3 if column.data_type == DataType::Nat => {
+                        NatColumn::from_parts(segment, nulls, row_count)
+                            .ok_or_else(|| corrupt("Nat segment column"))?
                             .to_values()
                     }
                     _ => return Err(corrupt("K3 segment kind does not match the column type")),
@@ -565,7 +652,7 @@ pub fn decode_table(name: &str, bytes: &[u8]) -> Result<Table, SqlError> {
                 }
                 let expected = K3Column::from_rows(&rows, column_index)
                     .ok_or_else(|| corrupt("K3 segment column"))?;
-                if expected.packed().bytes() != segment {
+                if expected.packed().bytes() != segment.as_slice() {
                     return Err(corrupt("K3 segment does not match the row data"));
                 }
             }
@@ -653,7 +740,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_v5_round_trips_k3_packed_segments() {
+    fn table_v6_round_trips_k3_packed_segments() {
         let table = Table {
             name: "k3".to_string(),
             schema: Schema::new(vec![
@@ -689,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn table_v5_round_trips_belnap_segments() {
+    fn table_v6_round_trips_belnap_segments() {
         let table = Table {
             name: "ann".to_string(),
             schema: Schema::new(vec![
@@ -717,21 +804,94 @@ mod tests {
     }
 
     #[test]
-    fn table_v5_is_smaller_than_v4() {
+    fn table_v6_is_smaller_than_v5() {
         let rows: Vec<Vec<Value>> = (0..100)
-            .map(|index| vec![Value::Int(index), Value::Bool(index % 2 == 0)])
+            .map(|index| {
+                vec![
+                    Value::Int(index),
+                    Value::Bool(index % 2 == 0),
+                    Value::Lukasiewicz((index % 1001) as u16),
+                    Value::Nat(index as u64),
+                ]
+            })
             .collect();
         let table = Table {
             name: "sized".to_string(),
             schema: Schema::new(vec![
                 Column::new("id", DataType::Int),
                 Column::new("flag", DataType::Logic),
+                Column::new("p", DataType::Lukasiewicz),
+                Column::new("n", DataType::Nat),
             ]),
             rows,
         };
+        let v6 = encode_table_versioned(&table, 6).expect("v6");
         let v5 = encode_table_versioned(&table, 5).expect("v5");
-        let v4 = encode_table_versioned(&table, 4).expect("v4");
-        assert!(v5.len() < v4.len(), "v5={} v4={}", v5.len(), v4.len());
+        assert!(v6.len() < v5.len(), "v6={} v5={}", v6.len(), v5.len());
+    }
+
+    #[test]
+    fn table_v6_round_trips_lukasiewicz_and_nat_segments() {
+        let table = Table {
+            name: "packed".to_string(),
+            schema: Schema::new(vec![
+                Column::new("id", DataType::Int),
+                Column::new("p", DataType::Lukasiewicz),
+                Column::new("n", DataType::Nat),
+            ]),
+            rows: vec![
+                vec![Value::Int(1), Value::Lukasiewicz(0), Value::Nat(0)],
+                vec![
+                    Value::Int(2),
+                    Value::Lukasiewicz(1000),
+                    Value::Nat(u64::MAX),
+                ],
+                vec![Value::Int(3), Value::Null, Value::Null],
+            ],
+        };
+        let bytes = encode_table(&table).expect("encode");
+        let decoded = decode_table("packed", &bytes).expect("decode");
+        assert_eq!(decoded.rows, table.rows);
+    }
+
+    #[test]
+    fn table_v6_chunks_long_columns() {
+        let rows: Vec<Vec<Value>> = (0..10_000)
+            .map(|index| vec![Value::Nat(index as u64)])
+            .collect();
+        let table = Table {
+            name: "chunked".to_string(),
+            schema: Schema::new(vec![Column::new("n", DataType::Nat)]),
+            rows,
+        };
+        // 10_000 values * 8 bytes = 80_000 bytes > PACKED_CHUNK, so the
+        // segment is split into several chunks.
+        let bytes = encode_table(&table).expect("encode");
+        let decoded = decode_table("chunked", &bytes).expect("decode");
+        assert_eq!(decoded.rows, table.rows);
+    }
+
+    #[test]
+    fn table_v5_data_still_decodes() {
+        let table = Table {
+            name: "legacy".to_string(),
+            schema: Schema::new(vec![
+                Column::new("id", DataType::Int),
+                Column::new("flag", DataType::Logic),
+                Column::new("mood", DataType::Belnap),
+            ]),
+            rows: vec![
+                vec![
+                    Value::Int(1),
+                    Value::Bool(true),
+                    Value::Logic(tritdb_exec::ann::B4::Both),
+                ],
+                vec![Value::Int(2), Value::Null, Value::Null],
+            ],
+        };
+        let bytes = encode_table_versioned(&table, 5).expect("v5");
+        let decoded = decode_table("legacy", &bytes).expect("decode v5");
+        assert_eq!(decoded.rows, table.rows);
     }
 
     #[test]

@@ -9,8 +9,8 @@ use std::fmt;
 
 use crate::ann::B4;
 use crate::{Row, Value};
-pub use tritdb_tritvec::{pack, TritVec, K3};
-use tritdb_tritvec::{unpack, Radix, Trit, TritVecError};
+use tritdb_tritvec::{pack, unpack, Radix, Trit, TritVecError};
+pub use tritdb_tritvec::{TritVec, K3};
 
 /// Errors from batch evaluation and as-of joins.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,10 +211,10 @@ pub fn k3_of_value(value: &Value) -> K3 {
     }
 }
 
-/// A packed Belnap column: two trits per value plus a NULL bitmap.
+/// A packed Belnap column: two bits per value plus a NULL bitmap.
 ///
-/// `BOTH`/`NEITHER` need four states, which a single K3 trit cannot carry;
-/// two trits per value keep them lossless. The NULL bitmap is one bit per row.
+/// `BOTH`/`NEITHER` need four states; two bits per value pack four values into
+/// one byte. The NULL bitmap is one bit per row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct B4Column {
     packed: Vec<u8>,
@@ -225,7 +225,7 @@ pub struct B4Column {
 impl B4Column {
     /// Materializes column `index` from `rows`.
     pub fn from_rows(rows: &[Row], index: usize) -> Option<Self> {
-        let mut trits = Vec::with_capacity(rows.len() * 2);
+        let mut packed = vec![0u8; rows.len().div_ceil(4)];
         let mut nulls = vec![0u8; rows.len().div_ceil(8)];
         for (row_index, row) in rows.iter().enumerate() {
             let value = row.get(index)?;
@@ -239,10 +239,8 @@ impl B4Column {
                 Value::Bool(false) => B4::False.code(),
                 _ => return None,
             };
-            trits.push(Trit::from_u8(code & 1).expect("0/1 is a trit"));
-            trits.push(Trit::from_u8((code >> 1) & 1).expect("0/1 is a trit"));
+            packed[row_index / 4] |= code << (2 * (row_index % 4));
         }
-        let packed = pack(Radix::R3, &trits).ok()?;
         Some(Self {
             packed,
             nulls,
@@ -252,10 +250,42 @@ impl B4Column {
 
     /// Rebuilds a column from stored parts, validating their lengths.
     pub fn from_parts(packed: Vec<u8>, nulls: Vec<u8>, len: usize) -> Option<Self> {
-        if packed.len() != Radix::R3.packed_len(len * 2) || nulls.len() != len.div_ceil(8) {
+        if packed.len() != len.div_ceil(4) || nulls.len() != len.div_ceil(8) {
             return None;
         }
         Some(Self { packed, nulls, len })
+    }
+
+    /// Encodes this column in the v5 layout (two trits per value, `r3`).
+    pub fn to_parts_2trit(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut trits = Vec::with_capacity(self.len * 2);
+        for row in 0..self.len {
+            let code = (self.packed[row / 4] >> (2 * (row % 4))) & 0b11;
+            trits.push(Trit::from_u8(code & 1).expect("0/1"));
+            trits.push(Trit::from_u8((code >> 1) & 1).expect("0/1"));
+        }
+        let packed = pack(Radix::R3, &trits).expect("trits pack");
+        (packed, self.nulls.clone())
+    }
+
+    /// Decodes the v5 layout (two trits per value, `r3`) and re-packs as 2-bit.
+    pub fn from_parts_2trit(packed: Vec<u8>, nulls: Vec<u8>, len: usize) -> Option<Self> {
+        if packed.len() != Radix::R3.packed_len(len * 2) || nulls.len() != len.div_ceil(8) {
+            return None;
+        }
+        let trits = unpack(Radix::R3, &packed, len * 2).ok()?;
+        let mut repacked = vec![0u8; len.div_ceil(4)];
+        for row in 0..len {
+            let low = trits[row * 2].get() & 1;
+            let high = trits[row * 2 + 1].get() & 1;
+            let code = low | (high << 1);
+            repacked[row / 4] |= code << (2 * (row % 4));
+        }
+        Some(Self {
+            packed: repacked,
+            nulls,
+            len,
+        })
     }
 
     /// Number of rows.
@@ -278,13 +308,10 @@ impl B4Column {
         if row >= self.len || self.is_null(row) {
             return None;
         }
-        let trits = unpack(Radix::R3, &self.packed, self.len * 2).ok()?;
-        let low = trits[row * 2].get() & 1;
-        let high = trits[row * 2 + 1].get() & 1;
-        B4::from_code(low | (high << 1))
+        B4::from_code((self.packed[row / 4] >> (2 * (row % 4))) & 0b11)
     }
 
-    /// Packed trits (two per value).
+    /// Packed values (four per byte).
     pub fn packed(&self) -> &[u8] {
         &self.packed
     }
@@ -296,20 +323,212 @@ impl B4Column {
 
     /// Rebuilds the row values (`Value::Logic` / `Value::Null`).
     pub fn to_values(&self) -> Vec<Value> {
-        let trits = unpack(Radix::R3, &self.packed, self.len * 2).unwrap_or_default();
         (0..self.len)
             .map(|row| {
                 if self.is_null(row) {
                     return Value::Null;
                 }
-                let low = trits[row * 2].get() & 1;
-                let high = trits[row * 2 + 1].get() & 1;
-                B4::from_code(low | (high << 1))
+                B4::from_code((self.packed[row / 4] >> (2 * (row % 4))) & 0b11)
                     .map(Value::Logic)
                     .unwrap_or(Value::Null)
             })
             .collect()
     }
+}
+
+/// A packed Łukasiewicz column: 10 bits per value plus a NULL bitmap.
+///
+/// Values are thousandths (`0..=1000`), so ten bits are enough.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LukasiewiczColumn {
+    packed: Vec<u8>,
+    nulls: Vec<u8>,
+    len: usize,
+}
+
+impl LukasiewiczColumn {
+    /// Materializes column `index` from `rows`.
+    pub fn from_rows(rows: &[Row], index: usize) -> Option<Self> {
+        let mut packed = vec![0u8; (rows.len() * 10).div_ceil(8)];
+        let mut nulls = vec![0u8; rows.len().div_ceil(8)];
+        for (row_index, row) in rows.iter().enumerate() {
+            match row.get(index)? {
+                Value::Null => nulls[row_index / 8] |= 1 << (row_index % 8),
+                Value::Lukasiewicz(value) if *value <= 1000 => {
+                    write_bits(&mut packed, row_index * 10, 10, u32::from(*value));
+                }
+                _ => return None,
+            }
+        }
+        Some(Self {
+            packed,
+            nulls,
+            len: rows.len(),
+        })
+    }
+
+    /// Rebuilds a column from stored parts, validating their lengths.
+    pub fn from_parts(packed: Vec<u8>, nulls: Vec<u8>, len: usize) -> Option<Self> {
+        if packed.len() != (len * 10).div_ceil(8) || nulls.len() != len.div_ceil(8) {
+            return None;
+        }
+        Some(Self { packed, nulls, len })
+    }
+
+    /// Number of rows.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when the column holds no rows.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// True when `row` is `NULL`.
+    pub fn is_null(&self, row: usize) -> bool {
+        row < self.len && (self.nulls[row / 8] >> (row % 8)) & 1 == 1
+    }
+
+    /// One value in thousandths; `None` for `NULL` or an out-of-range row.
+    pub fn get(&self, row: usize) -> Option<u16> {
+        if row >= self.len || self.is_null(row) {
+            return None;
+        }
+        Some(read_bits(&self.packed, row * 10, 10) as u16)
+    }
+
+    /// Packed bits (ten per value).
+    pub fn packed(&self) -> &[u8] {
+        &self.packed
+    }
+
+    /// NULL bitmap (one bit per row).
+    pub fn nulls(&self) -> &[u8] {
+        &self.nulls
+    }
+
+    /// Rebuilds the row values (`Value::Lukasiewicz` / `Value::Null`).
+    pub fn to_values(&self) -> Vec<Value> {
+        (0..self.len)
+            .map(|row| {
+                if self.is_null(row) {
+                    Value::Null
+                } else {
+                    Value::Lukasiewicz(read_bits(&self.packed, row * 10, 10) as u16)
+                }
+            })
+            .collect()
+    }
+}
+
+/// A packed ℕ column: eight bytes per value plus a NULL bitmap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NatColumn {
+    packed: Vec<u8>,
+    nulls: Vec<u8>,
+    len: usize,
+}
+
+impl NatColumn {
+    /// Materializes column `index` from `rows`.
+    pub fn from_rows(rows: &[Row], index: usize) -> Option<Self> {
+        let mut packed = vec![0u8; rows.len() * 8];
+        let mut nulls = vec![0u8; rows.len().div_ceil(8)];
+        for (row_index, row) in rows.iter().enumerate() {
+            match row.get(index)? {
+                Value::Null => nulls[row_index / 8] |= 1 << (row_index % 8),
+                Value::Nat(value) => {
+                    packed[row_index * 8..row_index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                _ => return None,
+            }
+        }
+        Some(Self {
+            packed,
+            nulls,
+            len: rows.len(),
+        })
+    }
+
+    /// Rebuilds a column from stored parts, validating their lengths.
+    pub fn from_parts(packed: Vec<u8>, nulls: Vec<u8>, len: usize) -> Option<Self> {
+        if packed.len() != len * 8 || nulls.len() != len.div_ceil(8) {
+            return None;
+        }
+        Some(Self { packed, nulls, len })
+    }
+
+    /// Number of rows.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when the column holds no rows.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// True when `row` is `NULL`.
+    pub fn is_null(&self, row: usize) -> bool {
+        row < self.len && (self.nulls[row / 8] >> (row % 8)) & 1 == 1
+    }
+
+    /// One value; `None` for `NULL` or an out-of-range row.
+    pub fn get(&self, row: usize) -> Option<u64> {
+        if row >= self.len || self.is_null(row) {
+            return None;
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.packed[row * 8..row * 8 + 8]);
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    /// Packed values (eight bytes each).
+    pub fn packed(&self) -> &[u8] {
+        &self.packed
+    }
+
+    /// NULL bitmap (one bit per row).
+    pub fn nulls(&self) -> &[u8] {
+        &self.nulls
+    }
+
+    /// Rebuilds the row values (`Value::Nat` / `Value::Null`).
+    pub fn to_values(&self) -> Vec<Value> {
+        (0..self.len)
+            .map(|row| {
+                if self.is_null(row) {
+                    Value::Null
+                } else {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&self.packed[row * 8..row * 8 + 8]);
+                    Value::Nat(u64::from_le_bytes(bytes))
+                }
+            })
+            .collect()
+    }
+}
+
+/// Writes `bits` low bits of `value` at `bit_offset` (little-endian bit order).
+fn write_bits(bytes: &mut [u8], bit_offset: usize, bits: u32, value: u32) {
+    for index in 0..bits {
+        let bit = bit_offset + index as usize;
+        if (value >> index) & 1 == 1 {
+            bytes[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+}
+
+/// Reads `bits` low bits at `bit_offset` (little-endian bit order).
+fn read_bits(bytes: &[u8], bit_offset: usize, bits: u32) -> u32 {
+    let mut value = 0u32;
+    for index in 0..bits {
+        let bit = bit_offset + index as usize;
+        let bit_value = (bytes[bit / 8] >> (bit % 8)) & 1;
+        value |= u32::from(bit_value) << index;
+    }
+    value
 }
 
 /// Indices where `truth` is `TRUE`.
@@ -513,6 +732,90 @@ mod tests {
                 previous: 3,
                 current: 2
             })
+        );
+    }
+
+    #[test]
+    fn b4_column_packs_four_values_per_byte() {
+        let rows: Vec<Row> = vec![
+            vec![Value::Logic(B4::Both)],
+            vec![Value::Logic(B4::Neither)],
+            vec![Value::Null],
+            vec![Value::Logic(B4::True)],
+            vec![Value::Logic(B4::False)],
+        ];
+        let column = B4Column::from_rows(&rows, 0).expect("column");
+        assert_eq!(column.packed().len(), 2);
+        assert_eq!(column.get(0), Some(B4::Both));
+        assert_eq!(column.get(1), Some(B4::Neither));
+        assert_eq!(column.get(4), Some(B4::False));
+
+        // v5 legacy layout: two trits per value, derived from the B4 codes.
+        let legacy_trits: Vec<Trit> = [B4::Both, B4::True, B4::False, B4::Neither]
+            .into_iter()
+            .flat_map(|value| {
+                let code = value.code();
+                [
+                    Trit::from_u8(code & 1).expect("0/1"),
+                    Trit::from_u8((code >> 1) & 1).expect("0/1"),
+                ]
+            })
+            .collect();
+        let legacy_packed = pack(Radix::R3, &legacy_trits).expect("legacy");
+        let legacy = B4Column::from_parts_2trit(legacy_packed, vec![0], 4).expect("legacy column");
+        assert_eq!(legacy.get(0), Some(B4::Both));
+        assert_eq!(legacy.get(1), Some(B4::True));
+        assert_eq!(legacy.get(2), Some(B4::False));
+        assert_eq!(legacy.get(3), Some(B4::Neither));
+    }
+
+    #[test]
+    fn lukasiewicz_column_round_trips() {
+        let rows: Vec<Row> = vec![
+            vec![Value::Lukasiewicz(0)],
+            vec![Value::Lukasiewicz(500)],
+            vec![Value::Lukasiewicz(1000)],
+            vec![Value::Null],
+        ];
+        let column = LukasiewiczColumn::from_rows(&rows, 0).expect("column");
+        assert_eq!(column.len(), 4);
+        assert_eq!(column.get(0), Some(0));
+        assert_eq!(column.get(1), Some(500));
+        assert_eq!(column.get(2), Some(1000));
+        assert_eq!(column.get(3), None);
+        assert_eq!(
+            column.to_values(),
+            vec![
+                Value::Lukasiewicz(0),
+                Value::Lukasiewicz(500),
+                Value::Lukasiewicz(1000),
+                Value::Null
+            ]
+        );
+        assert_eq!(
+            LukasiewiczColumn::from_parts(column.packed().to_vec(), column.nulls().to_vec(), 4)
+                .expect("parts"),
+            column
+        );
+    }
+
+    #[test]
+    fn nat_column_round_trips() {
+        let rows: Vec<Row> = vec![
+            vec![Value::Nat(0)],
+            vec![Value::Nat(u64::MAX)],
+            vec![Value::Null],
+            vec![Value::Nat(42)],
+        ];
+        let column = NatColumn::from_rows(&rows, 0).expect("column");
+        assert_eq!(column.get(0), Some(0));
+        assert_eq!(column.get(1), Some(u64::MAX));
+        assert_eq!(column.get(2), None);
+        assert_eq!(column.get(3), Some(42));
+        assert_eq!(
+            NatColumn::from_parts(column.packed().to_vec(), column.nulls().to_vec(), 4)
+                .expect("parts"),
+            column
         );
     }
 
