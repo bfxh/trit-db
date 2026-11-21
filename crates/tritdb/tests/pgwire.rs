@@ -63,6 +63,33 @@ fn parse_fields(payload: &[u8]) -> Vec<String> {
     names
 }
 
+/// Parses `(type oid, type size)` pairs from a `RowDescription` payload.
+fn parse_type_oids(payload: &[u8]) -> Vec<(i32, i16)> {
+    let count = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let mut cursor = 2;
+    let mut types = Vec::new();
+    for _ in 0..count {
+        let end = payload[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("field terminator")
+            + cursor;
+        let mut at = end + 1;
+        at += 4; // table oid
+        at += 2; // attribute number
+        let oid = i32::from_be_bytes([
+            payload[at],
+            payload[at + 1],
+            payload[at + 2],
+            payload[at + 3],
+        ]);
+        let size = i16::from_be_bytes([payload[at + 4], payload[at + 5]]);
+        types.push((oid, size));
+        cursor = end + 1 + 18;
+    }
+    types
+}
+
 fn parse_row(payload: &[u8]) -> Vec<Option<String>> {
     let count = i16::from_be_bytes([payload[0], payload[1]]) as usize;
     let mut cursor = 2;
@@ -446,4 +473,63 @@ fn concurrent_connections_roundtrip() {
     for handle in handles {
         handle.join().expect("join");
     }
+}
+
+#[test]
+fn row_description_reports_real_type_oids() {
+    let dir = TempDir::new("pgwire-oids");
+    let db = dir.join("pg.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL, flag BOOL, name TEXT); \
+         INSERT INTO t VALUES (1, TRUE, 'a'), (2, FALSE, 'b');",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "SELECT id, flag, name FROM t ORDER BY id;");
+    let messages = read_until_ready(&mut stream);
+    let description = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'T')
+        .map(|(_, payload)| payload.clone())
+        .expect("RowDescription");
+    // int8(20) / bool(16) / text(25) with their fixed sizes.
+    assert_eq!(
+        parse_type_oids(&description),
+        vec![(20, 8), (16, 1), (25, -1)]
+    );
+
+    let rows: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        vec![Some("1".into()), Some("t".into()), Some("a".into())]
+    );
+
+    // NULL-only columns (no rows sampled) fall back to text.
+    query(&mut stream, "SELECT id FROM t WHERE FALSE;");
+    let messages = read_until_ready(&mut stream);
+    let description = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'T')
+        .map(|(_, payload)| payload.clone())
+        .expect("RowDescription");
+    assert_eq!(parse_type_oids(&description), vec![(25, -1)]);
+
+    stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
 }

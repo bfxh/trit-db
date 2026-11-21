@@ -309,7 +309,8 @@ fn execute_and_write(
             for result in results {
                 match result {
                     QueryResult::Rows { columns, rows } => {
-                        write_row_description(stream, &columns)?;
+                        let oids = column_oids(&rows, columns.len());
+                        write_row_description(stream, &columns, &oids)?;
                         for row in &rows {
                             write_data_row(stream, row)?;
                         }
@@ -473,19 +474,26 @@ fn describe_result(
     param_types: &[i32],
 ) -> Result<(), PgError> {
     match describe_columns(engine, sql, param_types) {
-        Ok(Some(columns)) => write_row_description(stream, &columns),
+        Ok(Some(meta)) => write_row_description(stream, &meta.columns, &meta.oids),
         Ok(None) => write_message(stream, b'n', &[]),
         Err(error) => write_error(stream, &error.to_string()),
     }
 }
 
-/// Prepares a query with `LIMIT 0` to learn the result column names without
-/// producing rows. Unbound parameters are substituted with `NULL`.
+/// Result column names plus the PostgreSQL type OIDs inferred from a sample
+/// row.
+struct ResultMeta {
+    columns: Vec<String>,
+    oids: Vec<i32>,
+}
+
+/// Prepares a query with `LIMIT 1` to learn the result column names and types.
+/// Unbound parameters are substituted with `NULL`.
 fn describe_columns(
     engine: &mut SqlEngine,
     sql: &str,
     param_types: &[i32],
-) -> Result<Option<Vec<String>>, PgError> {
+) -> Result<Option<ResultMeta>, PgError> {
     let placeholders = vec![None; param_types.len()];
     let sql = substitute_params(sql, param_types, &placeholders)?;
     let statements = parse_script(&sql).map_err(|error| PgError::Sql(error.to_string()))?;
@@ -493,14 +501,39 @@ fn describe_columns(
         return Ok(None);
     };
     let mut limited = select.clone();
-    limited.limit = Some(0);
+    limited.limit = Some(1);
     match engine
         .execute_statement(&Statement::Select(limited))
         .map_err(|error| PgError::Sql(error.to_string()))?
     {
-        QueryResult::Rows { columns, .. } => Ok(Some(columns)),
+        QueryResult::Rows { columns, rows } => {
+            let oids = column_oids(&rows, columns.len());
+            Ok(Some(ResultMeta { columns, oids }))
+        }
         QueryResult::Message(_) => Ok(None),
     }
+}
+
+/// Infers PostgreSQL type OIDs from the result rows: `INT` → `int8`(20),
+/// `BOOL` → `bool`(16), everything else (including `NULL`-only columns) →
+/// `text`(25).
+fn column_oids(rows: &[Vec<Value>], column_count: usize) -> Vec<i32> {
+    let mut oids = vec![25; column_count];
+    let mut known = vec![false; column_count];
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if known[index] || value.is_null() {
+                continue;
+            }
+            oids[index] = match value {
+                Value::Int(_) => 20,
+                Value::Bool(_) => 16,
+                _ => 25,
+            };
+            known[index] = true;
+        }
+    }
+    oids
 }
 
 fn execute_portal(
@@ -631,16 +664,26 @@ fn param_literal(value: &Option<String>, oid: i32) -> String {
     }
 }
 
-fn write_row_description(stream: &mut TcpStream, columns: &[String]) -> Result<(), PgError> {
+fn write_row_description(
+    stream: &mut TcpStream,
+    columns: &[String],
+    oids: &[i32],
+) -> Result<(), PgError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
-    for name in columns {
+    for (index, name) in columns.iter().enumerate() {
+        let oid = oids.get(index).copied().unwrap_or(25);
+        let size: i16 = match oid {
+            20 => 8, // int8
+            16 => 1, // bool
+            _ => -1, // text
+        };
         payload.extend_from_slice(name.as_bytes());
         payload.push(0);
         payload.extend_from_slice(&0i32.to_be_bytes()); // table oid
         payload.extend_from_slice(&0i16.to_be_bytes()); // attribute number
-        payload.extend_from_slice(&25i32.to_be_bytes()); // TEXT oid
-        payload.extend_from_slice(&(-1i16).to_be_bytes()); // type size
+        payload.extend_from_slice(&oid.to_be_bytes());
+        payload.extend_from_slice(&size.to_be_bytes());
         payload.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
         payload.extend_from_slice(&0i16.to_be_bytes()); // text format
     }
