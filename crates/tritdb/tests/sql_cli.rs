@@ -1475,3 +1475,60 @@ fn alter_table_drop_and_rename_column() {
     assert!(!output.status.success(), "last column must not be dropped");
     assert!(stderr(&output).contains("cannot drop the last column"));
 }
+
+#[test]
+fn rename_table_and_alter_column_type() {
+    let dir = TempDir::new("sql-alter-type");
+    let db = dir.join("alter.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (a INT NOT NULL, b TEXT); INSERT INTO t VALUES (1,'x');",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "ALTER TABLE t ALTER COLUMN a TYPE TEXT; SELECT a, b FROM t;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("altered column a to type TEXT"),
+        "out: {text}"
+    );
+    assert!(text.contains("1\tx"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "ALTER TABLE t RENAME TO u; SELECT a, b FROM u;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("renamed table t to u"), "out: {text}");
+    assert!(text.contains("1\tx"), "out: {text}");
+
+    // Reopen: the renamed table and altered type are persisted.
+    let output = run(["sql", "--db", db, "--sql", "SELECT a, b FROM u;"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("1\tx"));
+
+    // Renaming onto an existing table is rejected.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE v (id INT); ALTER TABLE u RENAME TO v;",
+    ]);
+    assert!(!output.status.success(), "duplicate table name must fail");
+}
