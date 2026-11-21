@@ -66,6 +66,9 @@ const MAX_RECURSIVE_ROWS: usize = 100_000;
 /// Hard cap on rows materialized by one join, so a cartesian product cannot
 /// exhaust memory.
 const MAX_JOIN_ROWS: usize = 1 << 20;
+/// Hard cap on outer rows a correlated subquery may run for; each row executes
+/// the subquery again, so this is a CPU budget rather than a size limit.
+const MAX_CORRELATED_ROWS: usize = 10_000;
 
 fn tuple_in_expr(exprs: Vec<Expr>, rows: Vec<Vec<Value>>, negated: bool) -> Expr {
     if rows.is_empty() {
@@ -1933,6 +1936,13 @@ impl SqlEngine {
         let pushdown = plan_filter_pushdown(folded);
         let projection = self.plan_scan_projection(folded)?;
         let mut table = self.build_from(folded, &pushdown, &projection)?;
+        if table.rows.len() > MAX_CORRELATED_ROWS {
+            return Err(SqlError::Unsupported(format!(
+                "correlated subquery would run for {} rows (limit {MAX_CORRELATED_ROWS}); \
+                 rewrite it as a JOIN",
+                table.rows.len()
+            )));
+        }
 
         let mut planned = folded.clone();
         if let Some(filter) = &folded.filter {
@@ -5849,6 +5859,80 @@ fn eval_aggregate(
 mod tests {
     use super::*;
     use crate::parser::parse_script;
+
+    #[test]
+    fn correlated_subquery_row_cap() {
+        let dir = tritdb_testkit::TempDir::new("engine-corr-cap");
+        let db = dir.join("corr.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        engine
+            .execute_script("CREATE TABLE t (x INT NOT NULL); CREATE TABLE s (x INT NOT NULL);")
+            .expect("create");
+        let values: String = (0..MAX_CORRELATED_ROWS + 1)
+            .map(|value| format!("({value}),"))
+            .collect::<String>();
+        engine
+            .execute_script(&format!(
+                "INSERT INTO t VALUES {};",
+                values.trim_end_matches(',')
+            ))
+            .expect("seed t");
+        engine
+            .execute_script("INSERT INTO s VALUES (0);")
+            .expect("seed s");
+
+        let error = match engine
+            .execute_script("SELECT COUNT(*) FROM t WHERE x = (SELECT x FROM s WHERE s.x = t.x);")
+        {
+            Ok(_) => panic!("a correlated subquery over the row cap must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SqlError::Unsupported(ref message) if message.contains("correlated subquery")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn constant_in_list_keeps_null_semantics() {
+        let dir = tritdb_testkit::TempDir::new("engine-in-set");
+        let db = dir.join("in.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        engine
+            .execute_script("CREATE TABLE t (x INT NOT NULL);")
+            .expect("create");
+        let values: String = (0..20)
+            .map(|value| format!("({value}),"))
+            .collect::<String>();
+        engine
+            .execute_script(&format!(
+                "INSERT INTO t VALUES {};",
+                values.trim_end_matches(',')
+            ))
+            .expect("seed");
+
+        // A large constant list takes the pre-indexed path; it must still
+        // match, and NULL in the list must keep `NOT IN` three-valued.
+        let mut list: Vec<String> = (100..10_020).map(|value| value.to_string()).collect();
+        list.push("7".to_string());
+        list.push("NULL".to_string());
+        let sql = format!("SELECT x FROM t WHERE x IN ({});", list.join(","));
+        let rows = match &engine.execute_script(&sql).expect("in list")[0] {
+            QueryResult::Rows { rows, .. } => rows.clone(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(rows, vec![vec![Value::Int(7)]]);
+
+        let sql = format!("SELECT x FROM t WHERE x NOT IN ({});", list.join(","));
+        let rows = match &engine.execute_script(&sql).expect("not in list")[0] {
+            QueryResult::Rows { rows, .. } => rows.clone(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(
+            rows.is_empty(),
+            "NOT IN with a NULL candidate must not return rows: {rows:?}"
+        );
+    }
 
     #[test]
     fn cross_join_stops_at_the_row_cap() {

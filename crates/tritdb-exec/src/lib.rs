@@ -394,6 +394,17 @@ pub enum Expr {
         /// `true` for `NOT IN`.
         negated: bool,
     },
+    /// `expr [NOT] IN (<constant set>)`, pre-indexed so each row is O(1).
+    InSet {
+        /// Probe expression.
+        expr: Box<Expr>,
+        /// Constant candidates; includes [`Value::Null`] when the list had one.
+        values: std::collections::HashSet<Value>,
+        /// Type shared by every non-NULL candidate.
+        type_name: &'static str,
+        /// `true` for `NOT IN`.
+        negated: bool,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// Probe expression.
@@ -873,6 +884,29 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
                     None => unknown = true,
                 }
             }
+            let truth = if matched {
+                TruthValue::True
+            } else if unknown {
+                TruthValue::Unknown
+            } else {
+                TruthValue::False
+            };
+            Ok(if *negated {
+                truth.not().to_value()
+            } else {
+                truth.to_value()
+            })
+        }
+        Expr::InSet {
+            expr,
+            values,
+            type_name,
+            negated,
+        } => {
+            let probe = eval(expr, schema, row)?;
+            let same_type = !probe.is_null() && probe.type_name() == *type_name;
+            let matched = same_type && values.contains(&probe);
+            let unknown = probe.is_null() || !same_type || values.contains(&Value::Null);
             let truth = if matched {
                 TruthValue::True
             } else if unknown {

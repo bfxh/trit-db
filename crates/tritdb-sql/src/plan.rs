@@ -563,6 +563,19 @@ impl PlanExpr {
                     .collect::<Result<Vec<_>, _>>()?,
                 negated: *negated,
             }),
+            ExecExpr::InSet {
+                expr,
+                values,
+                negated,
+                ..
+            } => Ok(Self::InList {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                values: values
+                    .iter()
+                    .map(|value| Self::Literal(value.clone()))
+                    .collect::<Vec<_>>(),
+                negated: *negated,
+            }),
             ExecExpr::Between {
                 expr,
                 low,

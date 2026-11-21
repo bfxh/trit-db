@@ -2089,11 +2089,12 @@ fn handle_copy(
 }
 
 /// Parses one CSV line into fields. An unquoted empty field is `NULL`.
-fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<(bool, String)> {
+fn parse_csv_line(line: &str, options: &CopyOptions) -> (Vec<(bool, String)>, bool) {
     let quote = options.quote as char;
     let escape = options.escape as char;
     let delimiter = options.delimiter as char;
     let mut fields = Vec::new();
+    let mut unterminated = false;
     let mut chars = line.chars().peekable();
     loop {
         let mut field = String::new();
@@ -2101,19 +2102,26 @@ fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<(bool, String)> {
         if chars.peek() == Some(&quote) {
             quoted = true;
             chars.next();
+            let mut closed = false;
             while let Some(character) = chars.next() {
                 if character == escape && escape == quote {
                     if chars.peek() == Some(&quote) {
                         chars.next();
                         field.push(quote);
                     } else {
+                        // A lone quote closes the field; `""` above escapes one.
+                        closed = true;
                         break;
                     }
                 } else if character == quote {
+                    closed = true;
                     break;
                 } else {
                     field.push(character);
                 }
+            }
+            if !closed {
+                unterminated = true;
             }
             while matches!(chars.peek(), Some(' ') | Some('\t')) {
                 chars.next();
@@ -2132,7 +2140,7 @@ fn parse_csv_line(line: &str, options: &CopyOptions) -> Vec<(bool, String)> {
             break;
         }
     }
-    fields
+    (fields, unterminated)
 }
 
 fn csv_field(value: Option<&str>, options: &CopyOptions) -> String {
@@ -2192,7 +2200,10 @@ fn copy_in_csv(
                 }
                 let line = decode_copy_line(&payload, &options.encoding);
                 let line = line.trim_end_matches(['\r', '\n']);
-                let parsed = parse_csv_line(line, options);
+                let (parsed, unterminated) = parse_csv_line(line, options);
+                if unterminated {
+                    return copy_failed(stream, "COPY CSV has an unterminated quoted field");
+                }
                 if parsed.len() != columns.len() {
                     return copy_failed(
                         stream,
@@ -3658,6 +3669,17 @@ fn command_tag(message: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn unterminated_csv_quotes_are_rejected() {
+        let options = CopyOptions::defaults(CopyFormat::Csv);
+        let (fields, unterminated) = parse_csv_line("\"abc", &options);
+        assert!(unterminated, "a quote that never closes must be reported");
+        assert_eq!(fields.len(), 1);
+        let (fields, unterminated) = parse_csv_line("\"abc\",def", &options);
+        assert!(!unterminated);
+        assert_eq!(fields.len(), 2);
+    }
 
     struct Sink(Vec<u8>);
 

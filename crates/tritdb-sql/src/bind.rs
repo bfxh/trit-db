@@ -5,6 +5,34 @@ use tritdb_exec::{eval, BinaryOp, Expr as ExecExpr, Schema, Table, TruthValue, V
 use crate::ast::{AggregateKind, Expr, Select, SelectItem};
 use crate::error::{closest_names, NameKind, SqlError};
 
+/// Builds a hash set for an all-constant `IN` list, or `None` when the list
+/// holds non-literals, mixed types, or is small enough that the row-wise scan
+/// is cheaper than building a set.
+fn constant_set(values: &[ExecExpr]) -> Option<(std::collections::HashSet<Value>, &'static str)> {
+    if values.len() <= 8 {
+        return None;
+    }
+    let mut set = std::collections::HashSet::with_capacity(values.len());
+    let mut type_name: Option<&'static str> = None;
+    for value in values {
+        let ExecExpr::Literal(value) = value else {
+            return None;
+        };
+        if value.is_null() {
+            set.insert(Value::Null);
+            continue;
+        }
+        let name = value.type_name();
+        match type_name {
+            None => type_name = Some(name),
+            Some(expected) if expected == name => {}
+            Some(_) => return None,
+        }
+        set.insert(value.clone());
+    }
+    type_name.map(|type_name| (set, type_name))
+}
+
 /// A bound expression that may contain aggregate calls.
 #[derive(Clone, Debug)]
 pub(crate) enum GroupExpr {
@@ -299,14 +327,26 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             expr,
             values,
             negated,
-        } => Ok(ExecExpr::InList {
-            expr: Box::new(bind_expr(expr, schema)?),
-            values: values
+        } => {
+            let probe = Box::new(bind_expr(expr, schema)?);
+            let bound = values
                 .iter()
                 .map(|value| bind_expr(value, schema))
-                .collect::<Result<_, _>>()?,
-            negated: *negated,
-        }),
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some((set, type_name)) = constant_set(&bound) {
+                return Ok(ExecExpr::InSet {
+                    expr: probe,
+                    values: set,
+                    type_name,
+                    negated: *negated,
+                });
+            }
+            Ok(ExecExpr::InList {
+                expr: probe,
+                values: bound,
+                negated: *negated,
+            })
+        }
         Expr::Between {
             expr,
             low,

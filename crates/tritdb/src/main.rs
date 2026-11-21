@@ -1474,6 +1474,13 @@ fn graph_knn(args: &[String]) -> Result<(), String> {
             .collect()
     };
     let query = parse_vector(&required_arg(args, "--query")?)?;
+    if points.len() > tritdb_exec::graph::MAX_POINTS {
+        return Err(format!(
+            "too many points: {} (max {})",
+            points.len(),
+            tritdb_exec::graph::MAX_POINTS
+        ));
+    }
     let k = arg_usize(args, "--k", 3);
     let answer =
         tritdb_exec::graph::annotated_knn(&points, &query, k).map_err(|error| error.to_string())?;

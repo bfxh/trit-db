@@ -5,7 +5,7 @@
 
 use tritdb_exec::ann::B4;
 use tritdb_exec::{Column, DataType, Schema, Table, Value};
-use tritdb_testkit::Rng;
+use tritdb_testkit::{Rng, TempDir};
 
 fn random_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
     (0..len).map(|_| rng.next_u64() as u8).collect()
@@ -88,5 +88,54 @@ fn mutated_cas_and_format_payloads_never_panic() {
             bytes[4] = 1;
             let _ = tritdb_format::Block::decode(&bytes);
         }
+    }
+}
+
+#[test]
+fn page_view_parse_never_panics() {
+    let mut rng = Rng::new(0xF022_0004);
+    let mut block = [0u8; tritdb_page::PAGE_SIZE];
+    for _ in 0..2000 {
+        for byte in block.iter_mut() {
+            *byte = rng.next_u64() as u8;
+        }
+        let _ = tritdb_page::Page::parse(&block);
+        let len = rng.below(tritdb_page::PAGE_SIZE as u32 + 16) as usize;
+        let _ = tritdb_page::Page::parse_slice(&block[..len.min(block.len())]);
+    }
+}
+
+#[test]
+fn random_txn_snapshot_never_panics() {
+    let dir = TempDir::new("fuzz-txn-snapshot");
+    let mut rng = Rng::new(0xF022_0005);
+    for round in 0..200 {
+        let wal = dir.join(&format!("fuzz-{round}.wal"));
+        let snapshot = dir.join(&format!("fuzz-{round}.wal.snap"));
+        let len = (rng.below(2048) + 8) as usize;
+        let mut bytes = random_bytes(&mut rng, len);
+        // Force the magic+version so the fuzz reaches the entry parser instead
+        // of stopping at the header check.
+        bytes[0..4].copy_from_slice(&tritdb_txn::SNAPSHOT_MAGIC);
+        bytes[4] = tritdb_txn::SNAPSHOT_VERSION;
+        bytes[5..8].fill(0);
+        std::fs::write(&snapshot, &bytes).expect("write snapshot");
+        let _ = tritdb_txn::TxnStore::open(&wal);
+    }
+}
+
+#[test]
+fn random_page_store_files_never_panic() {
+    let dir = TempDir::new("fuzz-pstore");
+    let mut rng = Rng::new(0xF022_0006);
+    for round in 0..200 {
+        let data = dir.join(&format!("data-{round}.pages"));
+        let wal = dir.join(&format!("data-{round}.wal"));
+        let pages = rng.below(3) as usize;
+        let data_len = pages * tritdb_page::PAGE_SIZE;
+        std::fs::write(&data, random_bytes(&mut rng, data_len.max(1))).expect("write data");
+        let wal_len = (rng.below(2048) + 1) as usize;
+        std::fs::write(&wal, random_bytes(&mut rng, wal_len)).expect("write wal");
+        let _ = tritdb_store::PageStore::open(&data, &wal);
     }
 }
