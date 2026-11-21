@@ -95,6 +95,134 @@ impl SqlError {
             position,
         }
     }
+
+    /// Stable PostgreSQL SQLSTATE for this error.
+    ///
+    /// Models have seen a lot of PostgreSQL errors, so the five-character
+    /// SQLSTATE is a shared vocabulary: a client can branch on it without
+    /// parsing prose, and a retry loop can tell "fixable" (`42703` unknown
+    /// column) from "fatal" (`XX001` corrupt data).
+    pub fn code(&self) -> &'static str {
+        match self {
+            SqlError::Parse { .. } => "42601",           // syntax_error
+            SqlError::UnknownTable(_) => "42P01",        // undefined_table
+            SqlError::TableExists(_) => "42P07",         // duplicate_table
+            SqlError::UnknownColumn(_) => "42703",       // undefined_column
+            SqlError::AmbiguousColumn(_) => "42702",     // ambiguous_column
+            SqlError::DuplicateTableAlias(_) => "42712", // duplicate_alias
+            SqlError::DuplicateColumn(_) => "42701",     // duplicate_column
+            SqlError::ColumnCount { .. } => "42601",     // syntax_error
+            SqlError::NotNull { .. } => "23502",         // not_null_violation
+            SqlError::CheckViolation { .. } => "23514",  // check_violation
+            SqlError::DuplicateKey { .. } => "23505",    // unique_violation
+            SqlError::NestedAggregate => "42803",        // grouping_error
+            SqlError::ColumnOutsideAggregate(_) => "42803",
+            SqlError::ColumnOutsideGroup(_) => "42803",
+            SqlError::Unsupported(_) => "0A000", // feature_not_supported
+            SqlError::CorruptTable { .. } => "XX001", // data_corrupted
+            SqlError::CorruptStats { .. } => "XX000", // internal_error
+            SqlError::Exec(error) => match error {
+                ExecError::TypeMismatch { .. } | ExecError::NonBooleanPredicate { .. } => "42804", // datatype_mismatch
+                ExecError::DivisionByZero => "22012", // division_by_zero
+                ExecError::IntegerOverflow => "22003", // numeric_value_out_of_range
+                ExecError::RowShape { .. } | ExecError::ColumnIndex { .. } => "XX000",
+            },
+            SqlError::Txn(_) => "40000", // transaction_rollback
+            SqlError::Io(_) => "58030",  // io_error
+        }
+    }
+
+    /// Machine-actionable repair hint, when one is safe to give.
+    ///
+    /// This is the "what to do next" half of the error: the code says which
+    /// class of problem it is, the hint says which edit usually fixes it.
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            SqlError::Parse { .. } => None,
+            SqlError::UnknownTable(name) => Some(format!(
+                "check the table name `{name}`; create it first if it is missing"
+            )),
+            SqlError::TableExists(name) => Some(format!(
+                "table `{name}` already exists; drop it first or pick another name"
+            )),
+            SqlError::UnknownColumn(name) => Some(format!(
+                "check the column name `{name}`; qualify it as `table.{name}` when several tables share it"
+            )),
+            SqlError::AmbiguousColumn(name) => {
+                Some(format!("qualify `{name}` as `table.{name}`"))
+            }
+            SqlError::DuplicateTableAlias(name) => Some(format!(
+                "`{name}` is used twice in FROM; give each item a distinct alias"
+            )),
+            SqlError::DuplicateColumn(name) => Some(format!(
+                "column `{name}` is declared twice; rename one of them"
+            )),
+            SqlError::ColumnCount {
+                table,
+                expected,
+                actual,
+            } => Some(format!(
+                "INSERT INTO {table} needs {expected} values but got {actual}; list the target columns if the row is partial"
+            )),
+            SqlError::NotNull { table, column } => Some(format!(
+                "supply a value for `{table}.{column}` or make the column nullable"
+            )),
+            SqlError::CheckViolation { table, expression } => Some(format!(
+                "the row violates `CHECK ({expression})` on `{table}`; adjust the values"
+            )),
+            SqlError::DuplicateKey {
+                table,
+                column,
+                value,
+            } => Some(format!(
+                "`{table}.{column}` is UNIQUE; `{value}` already exists, pick another value"
+            )),
+            SqlError::NestedAggregate => {
+                Some("compute the inner aggregate in a subquery first".to_string())
+            }
+            SqlError::ColumnOutsideAggregate(name) => Some(format!(
+                "wrap `{name}` in an aggregate (SUM/COUNT/MIN/MAX/AVG) or add it to GROUP BY"
+            )),
+            SqlError::ColumnOutsideGroup(name) => Some(format!(
+                "add `{name}` to GROUP BY or wrap it in an aggregate"
+            )),
+            SqlError::Unsupported(_) => Some(
+                "this build does not implement it; see docs/specs/SQL.md for the supported subset"
+                    .to_string(),
+            ),
+            SqlError::CorruptTable { .. } | SqlError::CorruptStats { .. } => Some(
+                "restore from a snapshot or checkpoint, then verify the table".to_string(),
+            ),
+            SqlError::Exec(ExecError::TypeMismatch { expected, .. }) => Some(format!(
+                "cast explicitly: `CAST(expr AS {expected})`"
+            )),
+            SqlError::Exec(ExecError::DivisionByZero) => Some(
+                "guard the divisor, e.g. `CASE WHEN d = 0 THEN NULL ELSE n / d END`".to_string(),
+            ),
+            SqlError::Exec(ExecError::IntegerOverflow) => {
+                Some("split the expression or use a narrower range".to_string())
+            }
+            SqlError::Exec(ExecError::NonBooleanPredicate { .. }) => Some(
+                "use `truth(expr)` / `certainty(expr)` for annotated columns, or compare explicitly"
+                    .to_string(),
+            ),
+            SqlError::Exec(ExecError::RowShape { .. }) | SqlError::Exec(ExecError::ColumnIndex { .. }) => {
+                Some("internal row/schema shape mismatch; retry once and report the query".to_string())
+            }
+            SqlError::Txn(_) => Some("retry the statement or ROLLBACK the transaction".to_string()),
+            SqlError::Io(_) => None,
+        }
+    }
+
+    /// One-line-plus-hint rendering used by the CLI: keeps the human message,
+    /// appends the SQLSTATE, and adds the repair hint on its own line.
+    pub fn format_structured(&self) -> String {
+        let mut out = format!("{self} [SQLSTATE {}]", self.code());
+        if let Some(hint) = self.hint() {
+            out.push_str(&format!("\nhint: {hint}"));
+        }
+        out
+    }
 }
 
 impl fmt::Display for SqlError {
@@ -177,5 +305,77 @@ impl From<TxnError> for SqlError {
 impl From<std::io::Error> for SqlError {
     fn from(error: std::io::Error) -> Self {
         SqlError::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_are_stable_sqlstates() {
+        assert_eq!(SqlError::UnknownTable("t".into()).code(), "42P01");
+        assert_eq!(SqlError::TableExists("t".into()).code(), "42P07");
+        assert_eq!(SqlError::UnknownColumn("c".into()).code(), "42703");
+        assert_eq!(SqlError::AmbiguousColumn("c".into()).code(), "42702");
+        assert_eq!(SqlError::ColumnOutsideGroup("c".into()).code(), "42803");
+        assert_eq!(SqlError::ColumnOutsideAggregate("c".into()).code(), "42803");
+        assert_eq!(
+            SqlError::NotNull {
+                table: "t".into(),
+                column: "c".into()
+            }
+            .code(),
+            "23502"
+        );
+        assert_eq!(
+            SqlError::DuplicateKey {
+                table: "t".into(),
+                column: "c".into(),
+                value: "1".into()
+            }
+            .code(),
+            "23505"
+        );
+        assert_eq!(
+            SqlError::CheckViolation {
+                table: "t".into(),
+                expression: "x > 0".into()
+            }
+            .code(),
+            "23514"
+        );
+        assert_eq!(SqlError::Unsupported("x".into()).code(), "0A000");
+        assert_eq!(SqlError::Exec(ExecError::DivisionByZero).code(), "22012");
+        assert_eq!(SqlError::Exec(ExecError::IntegerOverflow).code(), "22003");
+        assert_eq!(
+            SqlError::Exec(ExecError::TypeMismatch {
+                expected: "INT",
+                actual: "TEXT"
+            })
+            .code(),
+            "42804"
+        );
+        assert_eq!(SqlError::parse("bad", 3).code(), "42601");
+    }
+
+    #[test]
+    fn hints_are_actionable() {
+        let hint = SqlError::UnknownColumn("stat".into()).hint().unwrap();
+        assert!(hint.contains("stat") && hint.contains("table.stat"));
+        let hint = SqlError::ColumnOutsideGroup("v".into()).hint().unwrap();
+        assert!(hint.contains("GROUP BY"));
+        let hint = SqlError::Exec(ExecError::DivisionByZero).hint().unwrap();
+        assert!(hint.contains("divisor"));
+        assert!(SqlError::parse("bad", 3).hint().is_none());
+        assert!(SqlError::Io(std::io::Error::other("x")).hint().is_none());
+    }
+
+    #[test]
+    fn structured_format_carries_code_and_hint() {
+        let formatted = SqlError::UnknownTable("nope".into()).format_structured();
+        assert!(formatted.contains("[SQLSTATE 42P01]"), "{formatted}");
+        assert!(formatted.contains("hint: "), "{formatted}");
+        assert!(formatted.contains("nope"), "{formatted}");
     }
 }

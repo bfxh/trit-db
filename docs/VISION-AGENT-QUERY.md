@@ -132,7 +132,7 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 
 | 层 | 方向 | 模型侧 | trit-db 侧 | 状态 |
 |---|---|---|---|---|
-| 语言层 | 模型 → 数据库 | 生成查询、读错误、重试 | 结构化错误（码 + 期望/实际 + 修复建议）、`certainty()` 答案等级 | M9 已落地 |
+| 语言层 | 模型 → 数据库 | 生成查询、读错误、重试 | 结构化错误（PostgreSQL SQLSTATE + hint）、`certainty()` 答案等级 | M9 已落地（两项都完成） |
 | 语义层 | 数据库 → 模型 | 置信度 / 冲突 / 缺失 / 计数 | Ł 注解（千分位）、Belnap `BOTH`、K3 `UNKNOWN`、ℕ 计数 | 已存在（`LOGIC` 列 + `ann`） |
 | 表示层 | 模型 ↔ 数据库 | 三值权重、嵌入、投票 | `r3` 打包（1.6 bit/weight）、平衡三进制、`tritvec` 动词 | M8 已落地 |
 
@@ -167,6 +167,11 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 - `certainty(expr [, threshold])`（SQL）：把注解列投影为 `CERTAIN` / `CONTINGENT` /
   `IMPOSSIBLE`，与 `UNDER REPAIR` 共用 `Certainty` 枚举；Ł 阈值按千分位、ℕ 按计数，
   越界与非注解值显式报错。详见 `docs/results/M9-CERTAINTY.md`。
+- 结构化错误：`SqlError::code()` 返回 PostgreSQL SQLSTATE（`42P01` / `42703` / `42803` / `23502`
+  / `23505` / `22012` …），`hint()` 给出可执行的修复建议；CLI 输出
+  `... [SQLSTATE 42P01]` + `hint: ...`，pgwire 的 `ErrorResponse` 带 `C`（SQLSTATE）与
+  `H`（hint）字段。模型可以按码分支、按 hint 改查询，不必解析散文。
+  详见 `docs/results/M9-STRUCTURED-ERRORS.md`。
 
 - `TernaryVec::quantize(weights, alpha)` / `dequantize(alpha)`：BitNet 风格三值量化，
   半跨度误差界 + 饱和语义；

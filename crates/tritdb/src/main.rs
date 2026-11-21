@@ -1890,7 +1890,7 @@ fn run_sql(args: &[String]) -> Result<(), String> {
         SqlEngine::open(Path::new(&db)).map_err(|error| format!("open {db}: {error}"))?;
     let results = engine
         .execute_script(&script)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.format_structured())?;
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
             println!();

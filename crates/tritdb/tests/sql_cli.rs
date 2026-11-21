@@ -245,6 +245,48 @@ fn truth_projects_lukasiewicz_and_nat_with_thresholds() {
 }
 
 #[test]
+fn sql_errors_carry_sqlstate_and_hint() {
+    let dir = TempDir::new("sql-error-codes");
+    let db = dir.join("errors.db");
+    let db = db.to_str().expect("path");
+
+    // Unknown table: 42P01 undefined_table, with a repair hint.
+    let output = run(["sql", "--db", db, "--sql", "SELECT * FROM nope;"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("[SQLSTATE 42P01]"), "stderr: {text}");
+    assert!(text.contains("hint: "), "stderr: {text}");
+    assert!(text.contains("nope"), "stderr: {text}");
+
+    // Unknown column: 42703 undefined_column.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); SELECT stat FROM t;",
+    ]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("[SQLSTATE 42703]"), "stderr: {text}");
+    assert!(text.contains("hint: "), "stderr: {text}");
+
+    // GROUP BY violation: 42803 grouping_error.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE g (k INT NOT NULL, v INT); INSERT INTO g VALUES (1, 2); \
+         SELECT k, v FROM g GROUP BY k;",
+    ]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("[SQLSTATE 42803]"), "stderr: {text}");
+    assert!(text.contains("GROUP BY"), "stderr: {text}");
+}
+
+#[test]
 fn certainty_reports_verdicts_per_domain() {
     let dir = TempDir::new("sql-certainty");
     let db = dir.join("certainty.db");

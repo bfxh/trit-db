@@ -118,6 +118,46 @@ fn has_error(messages: &[(u8, Vec<u8>)]) -> bool {
     messages.iter().any(|(kind, _)| *kind == b'E')
 }
 
+/// Parses the fields of an ErrorResponse payload (`C` SQLSTATE, `H` hint, ...).
+fn error_fields(payload: &[u8]) -> Vec<(u8, String)> {
+    let mut fields = Vec::new();
+    let mut index = 0;
+    while index < payload.len() && payload[index] != 0 {
+        let kind = payload[index];
+        index += 1;
+        let start = index;
+        while index < payload.len() && payload[index] != 0 {
+            index += 1;
+        }
+        fields.push((
+            kind,
+            String::from_utf8_lossy(&payload[start..index]).to_string(),
+        ));
+        index += 1;
+    }
+    fields
+}
+
+fn error_field(messages: &[(u8, Vec<u8>)], kind: u8) -> Option<String> {
+    messages
+        .iter()
+        .find(|(message_kind, _)| *message_kind == b'E')
+        .and_then(|(_, payload)| {
+            error_fields(payload)
+                .into_iter()
+                .find(|(field_kind, _)| *field_kind == kind)
+                .map(|(_, value)| value)
+        })
+}
+
+fn error_code(messages: &[(u8, Vec<u8>)]) -> Option<String> {
+    error_field(messages, b'C')
+}
+
+fn error_hint(messages: &[(u8, Vec<u8>)]) -> Option<String> {
+    error_field(messages, b'H')
+}
+
 /// Returns true when the server has closed the connection.
 fn connection_closed<S: Read>(stream: &mut S) -> bool {
     let mut buffer = [0u8; 16];
@@ -2715,5 +2755,46 @@ fn copy_to_stdout_rejects_unrepresentable_character() {
     assert!(
         has_error(&messages),
         "LATIN1 cannot represent 中: {messages:?}"
+    );
+}
+
+#[test]
+fn sql_errors_report_sqlstate_and_hint() {
+    let (_dir, mut stream) = start_server("pgproto-sqlstate");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    // Unknown table: 42P01 undefined_table, with a repair hint.
+    query(&mut stream, "SELECT * FROM nope;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(
+        error_code(&messages).as_deref(),
+        Some("42P01"),
+        "{messages:?}"
+    );
+    let hint = error_hint(&messages).expect("unknown table hint");
+    assert!(hint.contains("nope"), "{hint}");
+
+    // Unknown column: 42703 undefined_column.
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL); SELECT stat FROM t;",
+    );
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(
+        error_code(&messages).as_deref(),
+        Some("42703"),
+        "{messages:?}"
+    );
+    let hint = error_hint(&messages).expect("unknown column hint");
+    assert!(hint.contains("stat"), "{hint}");
+
+    // NOT NULL violation: 23502.
+    query(&mut stream, "INSERT INTO t VALUES (NULL);");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(
+        error_code(&messages).as_deref(),
+        Some("23502"),
+        "{messages:?}"
     );
 }

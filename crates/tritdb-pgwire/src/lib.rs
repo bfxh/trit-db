@@ -23,7 +23,7 @@ use base64::Engine as _;
 use md5::{Digest as _, Md5};
 
 use tritdb_exec::{DataType, Value};
-use tritdb_sql::{parse_script, QueryResult, SqlEngine, Statement};
+use tritdb_sql::{parse_script, QueryResult, SqlEngine, SqlError, Statement};
 use x509_cert::ext::pkix::CrlReason;
 
 const PROTOCOL_V3: i32 = 196_608;
@@ -1906,6 +1906,12 @@ fn copy_failed(stream: &mut dyn ReadWrite, message: &str) -> Result<bool, PgErro
     Ok(false)
 }
 
+/// COPY failure carrying the SQLSTATE and hint of the SQL error.
+fn copy_failed_sql(stream: &mut dyn ReadWrite, error: &SqlError) -> Result<bool, PgError> {
+    write_sql_error(stream, error)?;
+    Ok(false)
+}
+
 fn handle_copy(
     stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
@@ -2110,7 +2116,7 @@ fn copy_in_csv(
                 if batched >= 1024 {
                     batch.push(';');
                     if let Err(error) = engine.execute_script(&batch) {
-                        return copy_failed(stream, &error.to_string());
+                        return copy_failed_sql(stream, &error);
                     }
                     inserted += batched;
                     batch.clear();
@@ -2135,7 +2141,7 @@ fn copy_in_csv(
     if batched > 0 {
         batch.push(';');
         if let Err(error) = engine.execute_script(&batch) {
-            return copy_failed(stream, &error.to_string());
+            return copy_failed_sql(stream, &error);
         }
         inserted += batched;
     }
@@ -2154,7 +2160,7 @@ fn copy_out_csv(
     let sql = format!("SELECT {} FROM {table};", columns.join(", "));
     let results = match engine.execute_script(&sql) {
         Ok(results) => results,
-        Err(error) => return copy_failed(stream, &error.to_string()),
+        Err(error) => return copy_failed_sql(stream, &error),
     };
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(0);
@@ -2405,7 +2411,7 @@ fn copy_in_binary(
             if batched >= 1024 {
                 batch.push(';');
                 if let Err(error) = engine.execute_script(&batch) {
-                    return copy_failed(stream, &error.to_string());
+                    return copy_failed_sql(stream, &error);
                 }
                 inserted += batched;
                 batch.clear();
@@ -2419,7 +2425,7 @@ fn copy_in_binary(
     if batched > 0 {
         batch.push(';');
         if let Err(error) = engine.execute_script(&batch) {
-            return copy_failed(stream, &error.to_string());
+            return copy_failed_sql(stream, &error);
         }
         inserted += batched;
     }
@@ -2438,7 +2444,7 @@ fn copy_out_binary(
     let sql = format!("SELECT {} FROM {table};", columns.join(", "));
     let results = match engine.execute_script(&sql) {
         Ok(results) => results,
-        Err(error) => return copy_failed(stream, &error.to_string()),
+        Err(error) => return copy_failed_sql(stream, &error),
     };
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(1);
@@ -2550,7 +2556,7 @@ fn copy_in(
                 if batched >= 1024 {
                     batch.push(';');
                     if let Err(error) = engine.execute_script(&batch) {
-                        return copy_failed(stream, &error.to_string());
+                        return copy_failed_sql(stream, &error);
                     }
                     inserted += batched;
                     batch.clear();
@@ -2575,7 +2581,7 @@ fn copy_in(
     if batched > 0 {
         batch.push(';');
         if let Err(error) = engine.execute_script(&batch) {
-            return copy_failed(stream, &error.to_string());
+            return copy_failed_sql(stream, &error);
         }
         inserted += batched;
     }
@@ -2594,7 +2600,7 @@ fn copy_out(
     let sql = format!("SELECT {} FROM {table};", columns.join(", "));
     let results = match engine.execute_script(&sql) {
         Ok(results) => results,
-        Err(error) => return copy_failed(stream, &error.to_string()),
+        Err(error) => return copy_failed_sql(stream, &error),
     };
     let mut payload = Vec::with_capacity(3 + columns.len() * 2);
     payload.push(0);
@@ -2737,7 +2743,7 @@ fn execute_and_write(
             Ok(true)
         }
         Err(error) => {
-            write_error(stream, &error.to_string())?;
+            write_sql_error(stream, &error)?;
             Ok(false)
         }
     }
@@ -2922,6 +2928,7 @@ fn describe_result(
     match describe_columns(engine, sql, param_types) {
         Ok(Some(meta)) => write_row_description(stream, &meta.columns, &meta.oids, result_formats),
         Ok(None) => write_message(stream, b'n', &[]),
+        // `describe_columns` already returns `PgError`; keep its message.
         Err(error) => write_error(stream, &error.to_string()),
     }
 }
@@ -3394,16 +3401,48 @@ fn value_text(value: &Value) -> String {
 }
 
 fn write_error(stream: &mut dyn ReadWrite, message: &str) -> Result<(), PgError> {
+    write_error_fields(stream, "XX000", message, None)
+}
+
+/// ErrorResponse with an explicit SQLSTATE and optional hint.
+///
+/// The `C` (SQLSTATE) and `H` (hint) fields are what a client or an agent can
+/// branch on without parsing prose: `42703` means "fix the column name",
+/// `42P01` means "fix the table name", `23505` means "pick another value".
+fn write_error_fields(
+    stream: &mut dyn ReadWrite,
+    code: &str,
+    message: &str,
+    hint: Option<&str>,
+) -> Result<(), PgError> {
     let mut payload = Vec::new();
     payload.push(b'S');
     payload.extend_from_slice(b"ERROR\0");
+    payload.push(b'V');
+    payload.extend_from_slice(b"ERROR\0");
     payload.push(b'C');
-    payload.extend_from_slice(b"XX000\0");
+    payload.extend_from_slice(code.as_bytes());
+    payload.push(0);
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
+    if let Some(hint) = hint {
+        payload.push(b'H');
+        payload.extend_from_slice(hint.as_bytes());
+        payload.push(0);
+    }
     payload.push(0);
     write_message(stream, b'E', &payload)
+}
+
+/// Writes a SQL error with its SQLSTATE and repair hint.
+fn write_sql_error(stream: &mut dyn ReadWrite, error: &SqlError) -> Result<(), PgError> {
+    write_error_fields(
+        stream,
+        error.code(),
+        &error.to_string(),
+        error.hint().as_deref(),
+    )
 }
 
 /// Maps an engine acknowledgement to a PostgreSQL command tag.
