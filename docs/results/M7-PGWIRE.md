@@ -11,7 +11,7 @@ crates/tritdb-pgwire/Cargo.toml
 crates/tritdb-pgwire/src/lib.rs   serve / 协议编解码 / 类型文本化
                                   Parse/Bind/Describe/Execute/Close / $n 参数替换
 crates/tritdb/src/main.rs         serve --db ... [--listen ...]
-crates/tritdb/tests/pgwire.rs     2 个端到端测试
+crates/tritdb/tests/pgwire.rs     5 个端到端测试
 docs/ADR/045-pgwire.md
 ```
 
@@ -42,16 +42,15 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 ## 5. 验收
 
 ```bash
-cargo test -p tritdb --test pgwire   # 4 passed
+cargo test -p tritdb --test pgwire   # 5 passed
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')；`Describe('S')` 返回 `ParameterDescription` + `RowDescription(id, name)`，非 SELECT 返回 `NoData`。
+端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')；`Describe('S')` 返回 `ParameterDescription` + `RowDescription(id, name)`，非 SELECT 返回 `NoData`；4 个并发连接同时查询。
 
 ## 6. 还没做
 
 - **TLS**：`SSLRequest` 直接拒绝；
 - **认证**：无密码，任何能连上端口的客户端都可读写；
-- **并发连接**：串行 accept，每连接独立引擎。

@@ -404,3 +404,46 @@ fn describe_non_select_returns_no_data() {
 
     stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
 }
+
+#[test]
+fn concurrent_connections_roundtrip() {
+    let dir = TempDir::new("pgwire-concurrent");
+    let db = dir.join("pg.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let mut setup = TcpStream::connect(addr).expect("connect");
+    startup(&mut setup);
+    let _ = read_until_ready(&mut setup);
+    query(
+        &mut setup,
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2);",
+    );
+    let _ = read_until_ready(&mut setup);
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        handles.push(thread::spawn(move || {
+            startup(&mut stream);
+            let _ = read_until_ready(&mut stream);
+            query(&mut stream, "SELECT id FROM t ORDER BY id;");
+            let messages = read_until_ready(&mut stream);
+            let rows: Vec<Vec<Option<String>>> = messages
+                .iter()
+                .filter(|(kind, _)| *kind == b'D')
+                .map(|(_, payload)| parse_row(payload))
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], vec![Some("1".to_string())]);
+            assert_eq!(rows[1], vec![Some("2".to_string())]);
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("join");
+    }
+}
