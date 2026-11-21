@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -642,6 +642,14 @@ impl OcspOnline {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Bound the cache: a CA with many clients must not grow it forever.
+        if cache.len() >= 4096 {
+            let ttl = Duration::from_secs(60);
+            cache.retain(|_, (_, at)| at.elapsed() < ttl);
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+        }
         cache.insert(serial, (status, Instant::now()));
         Ok(status)
     }
@@ -726,7 +734,16 @@ fn http_post(url: &str, body: &[u8], extra_root: Option<&[u8]>) -> Result<Vec<u8
         ),
         None => (host_port, if scheme == "https" { 443 } else { 80 }),
     };
-    let tcp = TcpStream::connect((host, port))?;
+    // A plain `connect` can hang for the OS SYN-retry budget; a hostile or
+    // unreachable responder must not block the TLS handshake that long.
+    let address = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| PgError::Protocol(format!("OCSP responder address: {error}")))?
+        .next()
+        .ok_or_else(|| {
+            PgError::Protocol("OCSP responder address resolved to nothing".to_string())
+        })?;
+    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut request = format!(

@@ -1317,6 +1317,31 @@ mod tests {
     }
 
     #[test]
+    fn crash_during_reset_leaves_a_recoverable_wal() {
+        let dir = TempDir::new();
+        let path = dir.wal();
+
+        // (1) `set_len(0)` completed and the process died: empty file.
+        fs::write(&path, b"").expect("empty file");
+        let (writer, scan) = WalWriter::open(&path).expect("repair empty file");
+        assert!(scan.records.is_empty());
+        drop(writer);
+
+        // (2) Only the segment magic landed before the crash.
+        fs::write(&path, b"TRWS").expect("partial header");
+        let (writer, scan) = WalWriter::open(&path).expect("repair partial header");
+        assert!(scan.records.is_empty());
+        drop(writer);
+
+        // (3) The repaired WAL accepts new records.
+        let (mut writer, scan) = WalWriter::open(&path).expect("open repaired wal");
+        assert!(scan.records.is_empty());
+        writer
+            .append(RecordKind::Begin, 1, &[], false)
+            .expect("append after repair");
+    }
+
+    #[test]
     fn creates_empty_segment_and_roundtrips_records() {
         let dir = TempDir::new();
         let path = dir.wal();

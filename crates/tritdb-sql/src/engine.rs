@@ -5976,6 +5976,37 @@ mod tests {
     }
 
     #[test]
+    fn explain_high_cardinality_join_only_estimates() {
+        let dir = tritdb_testkit::TempDir::new("engine-explain-card");
+        let db = dir.join("explain.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        for table in ["a", "b", "c", "d"] {
+            engine
+                .execute_script(&format!("CREATE TABLE {table} (x INT NOT NULL);"))
+                .expect("create");
+            let values: String = (0..1000)
+                .map(|value| format!("({value}),"))
+                .collect::<String>();
+            engine
+                .execute_script(&format!(
+                    "INSERT INTO {table} VALUES {};",
+                    values.trim_end_matches(',')
+                ))
+                .expect("seed");
+            engine
+                .execute_script(&format!("ANALYZE {table};"))
+                .expect("analyze");
+        }
+
+        // Four 1000-row tables multiply out to 10^12 estimated rows. EXPLAIN
+        // must only plan the join (and saturate the estimate), never run it.
+        let results = engine
+            .execute_script("EXPLAIN SELECT * FROM a, b, c, d WHERE a.x = b.x;")
+            .expect("EXPLAIN must plan the join, not execute it");
+        assert!(!results.is_empty());
+    }
+
+    #[test]
     fn cross_join_stops_at_the_row_cap() {
         let dir = tritdb_testkit::TempDir::new("engine-join-cap");
         let db = dir.join("join.db");

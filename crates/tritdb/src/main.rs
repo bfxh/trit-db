@@ -24,6 +24,17 @@ use tritdb_store::{PageId, PageStore};
 use tritdb_txn::TxnStore;
 use tritdb_wal::{TailState, WalReader};
 
+/// Writes one line to stdout. A failed write (full disk, closed pipe) exits
+/// with status 1 instead of panicking the way `println!` does.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if writeln!(std::io::stdout().lock(), $($arg)*).is_err() {
+            std::process::exit(1);
+        }
+    }};
+}
+
 fn main() {
     // Windows gives the main thread a 1 MiB stack. Deeply nested SQL
     // expressions recurse through the parser before the depth limit trips, so
@@ -73,65 +84,65 @@ fn run() -> Result<(), String> {
 }
 
 fn print_help() {
-    println!("tritdb M0");
-    println!("  radix --radix r3|r4|r16 --trits 1000000");
-    println!("  block make --out block.trbl --radix r3 --trits 1000000");
-    println!("  block check --in block.trbl");
-    println!("  page make --out page.bin --kind data|index|manifest --text \"hello\"");
-    println!("  page check --in page.bin");
-    println!("  wal inspect --in test.wal");
-    println!("  txn put --wal test.wal --key k --value v");
-    println!("  txn get --wal test.wal --key k");
-    println!("  txn dump --wal test.wal");
-    println!("  txn checkpoint --wal test.wal [--archive] [--keep N]");
-    println!("  txn history --wal test.wal [--prune --keep N]");
-    println!("  txn recover --wal test.wal --to-lsn 42 | --to-time-ms 1700000000000");
-    println!("  txn writer --wal test.wal --txns 1000 --keys-per-txn 4 --sleep-ms 1");
-    println!("  pstore alloc --data pstore.pages --wal pstore.wal --kind data --text \"hello\"");
-    println!("  pstore put --data pstore.pages --wal pstore.wal --id 0 --text \"hello\"");
-    println!("  pstore get --data pstore.pages --wal pstore.wal --id 0");
-    println!("  pstore dump --data pstore.pages --wal pstore.wal");
-    println!("  pstore checkpoint --data pstore.pages --wal pstore.wal");
-    println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
-    println!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
-    println!("      [--error-format text|json]");
-    println!("  serve --db sql.db [--listen 127.0.0.1:5432]");
-    println!(
+    outln!("tritdb M0");
+    outln!("  radix --radix r3|r4|r16 --trits 1000000");
+    outln!("  block make --out block.trbl --radix r3 --trits 1000000");
+    outln!("  block check --in block.trbl");
+    outln!("  page make --out page.bin --kind data|index|manifest --text \"hello\"");
+    outln!("  page check --in page.bin");
+    outln!("  wal inspect --in test.wal");
+    outln!("  txn put --wal test.wal --key k --value v");
+    outln!("  txn get --wal test.wal --key k");
+    outln!("  txn dump --wal test.wal");
+    outln!("  txn checkpoint --wal test.wal [--archive] [--keep N]");
+    outln!("  txn history --wal test.wal [--prune --keep N]");
+    outln!("  txn recover --wal test.wal --to-lsn 42 | --to-time-ms 1700000000000");
+    outln!("  txn writer --wal test.wal --txns 1000 --keys-per-txn 4 --sleep-ms 1");
+    outln!("  pstore alloc --data pstore.pages --wal pstore.wal --kind data --text \"hello\"");
+    outln!("  pstore put --data pstore.pages --wal pstore.wal --id 0 --text \"hello\"");
+    outln!("  pstore get --data pstore.pages --wal pstore.wal --id 0");
+    outln!("  pstore dump --data pstore.pages --wal pstore.wal");
+    outln!("  pstore checkpoint --data pstore.pages --wal pstore.wal");
+    outln!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
+    outln!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
+    outln!("      [--error-format text|json]");
+    outln!("  serve --db sql.db [--listen 127.0.0.1:5432]");
+    outln!(
         "        [--auth trust|password|md5|scram-sha-256 --password <pwd>|--password-file <file>]"
     );
-    println!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
-    println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http(s)://...>] [--tls-client-ocsp-ca <pem>] [--tls-client-ocsp-allow-hold]]");
-    println!("        [--allow-plaintext-password]");
-    println!("        [--max-connections 64] [--lock-timeout-ms 30000]");
-    println!("        [--scram-verifier-file <file>]");
-    println!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
-    println!("  sql --db sql.db --file script.sql");
-    println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
-    println!("  repair --facts 2 --denial 0,1 --query 0");
-    println!("  graph build --wal graph.wal --name g [--nodes N] --edges 0-1,1-2 [--label 1-2=U]");
-    println!("  graph load --wal graph.wal --name g");
-    println!(
+    outln!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
+    outln!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http(s)://...>] [--tls-client-ocsp-ca <pem>] [--tls-client-ocsp-allow-hold]]");
+    outln!("        [--allow-plaintext-password]");
+    outln!("        [--max-connections 64] [--lock-timeout-ms 30000]");
+    outln!("        [--scram-verifier-file <file>]");
+    outln!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
+    outln!("  sql --db sql.db --file script.sql");
+    outln!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
+    outln!("  repair --facts 2 --denial 0,1 --query 0");
+    outln!("  graph build --wal graph.wal --name g [--nodes N] --edges 0-1,1-2 [--label 1-2=U]");
+    outln!("  graph load --wal graph.wal --name g");
+    outln!(
         "  graph reach [--wal graph.wal --name g | --nodes N --edges ...] --from 0 --to 2 [--max-hops 4]"
     );
-    println!(
+    outln!(
         "  graph neighbors [--wal graph.wal --name g | --nodes N --edges ...] --node 0 [--hops 1]"
     );
-    println!("  graph put-points --wal graph.wal --name p --points \"1,2;3,4\" [--labels T,U]");
-    println!("  graph knn [--wal graph.wal --name p | --points \"1,2;3,4\"] [--labels T,U] --query \"1,2\" [--k 3]");
-    println!("  cas put --store dir --file blob");
-    println!("  cas get --store dir --hash <hex> --out blob");
-    println!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
-    println!("  cas gc --store dir --root <hex>");
-    println!("  manifest verify --store dir --head <hex>");
-    println!("  manifest snapshot --store dir --db sql.db [--parent <hex>]");
-    println!("  manifest restore --store dir --head <hex> --db restored.db");
-    println!("  manifest snapshot-pages --store dir --data file.pages [--parent <hex>]");
-    println!("  manifest restore-pages --store dir --head <hex> --out file.pages");
-    println!("  manifest replicate --from src --to dst --head <hex> [--entry name]");
-    println!("  manifest show --store dir --hash <hex>");
-    println!("  anchor write --out anchor.bin --head <hex> [--key-file secret]");
-    println!("  anchor verify --file anchor.bin [--store dir] [--head <hex>] [--key-file secret]");
-    println!("  crosscheck  (binary framed stdin/stdout transport for Python)");
+    outln!("  graph put-points --wal graph.wal --name p --points \"1,2;3,4\" [--labels T,U]");
+    outln!("  graph knn [--wal graph.wal --name p | --points \"1,2;3,4\"] [--labels T,U] --query \"1,2\" [--k 3]");
+    outln!("  cas put --store dir --file blob");
+    outln!("  cas get --store dir --hash <hex> --out blob");
+    outln!("  manifest commit --store dir [--parent <hex>] --entry name=<hex>");
+    outln!("  cas gc --store dir --root <hex>");
+    outln!("  manifest verify --store dir --head <hex>");
+    outln!("  manifest snapshot --store dir --db sql.db [--parent <hex>]");
+    outln!("  manifest restore --store dir --head <hex> --db restored.db");
+    outln!("  manifest snapshot-pages --store dir --data file.pages [--parent <hex>]");
+    outln!("  manifest restore-pages --store dir --head <hex> --out file.pages");
+    outln!("  manifest replicate --from src --to dst --head <hex> [--entry name]");
+    outln!("  manifest show --store dir --hash <hex>");
+    outln!("  anchor write --out anchor.bin --head <hex> [--key-file secret]");
+    outln!("  anchor verify --file anchor.bin [--store dir] [--head <hex>] [--key-file secret]");
+    outln!("  crosscheck  (binary framed stdin/stdout transport for Python)");
 }
 
 fn run_radix(args: &[String]) -> Result<(), String> {
@@ -156,7 +167,7 @@ fn run_radix(args: &[String]) -> Result<(), String> {
         if decoded != input {
             return Err(format!("roundtrip failed for {}", radix.name()));
         }
-        println!(
+        outln!(
             "radix={} trits={} bytes={} bits_per_trit={:.3} roundtrip=ok",
             radix.name(),
             trits_count,
@@ -192,7 +203,7 @@ fn block_make(args: &[String]) -> Result<(), String> {
     let input: Vec<Trit> = (0..trits_count).map(|_| rng.trit()).collect();
     let block = Block::encode(radix, &input).map_err(|error| error.to_string())?;
     std::fs::write(&out, block.as_bytes()).map_err(|error| format!("write {out}: {error}"))?;
-    println!(
+    outln!(
         "wrote {} ({} bytes, radix={}, trits={})",
         out,
         block.len(),
@@ -207,7 +218,7 @@ fn block_check(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(&input).map_err(|error| format!("read {input}: {error}"))?;
     let view = Block::decode(&bytes).map_err(|error| error.to_string())?;
 
-    println!(
+    outln!(
         "radix={} trits={} payload_len={} block_len={} crc=ok",
         view.radix().name(),
         view.trit_count(),
@@ -221,10 +232,10 @@ fn block_check(args: &[String]) -> Result<(), String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    println!("payload_hex={}", hex.join(""));
+    outln!("payload_hex={}", hex.join(""));
 
     let trits = view.trits().map_err(|error| error.to_string())?;
-    println!("trits_roundtrip=ok ({} trits)", trits.len());
+    outln!("trits_roundtrip=ok ({} trits)", trits.len());
     Ok(())
 }
 
@@ -253,7 +264,7 @@ fn page_make(args: &[String]) -> Result<(), String> {
 
     let page = Page::new(kind, text.as_bytes()).map_err(|error| error.to_string())?;
     std::fs::write(&out, &page.as_bytes()[..]).map_err(|error| format!("write {out}: {error}"))?;
-    println!(
+    outln!(
         "wrote {} ({} bytes, payload={} bytes, kind={})",
         out,
         PAGE_SIZE,
@@ -268,7 +279,7 @@ fn page_check(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(&input).map_err(|error| format!("read {input}: {error}"))?;
     let view = Page::parse_slice(&bytes).map_err(|error| error.to_string())?;
 
-    println!(
+    outln!(
         "kind={} payload_len={} checksum=ok",
         view.kind().name(),
         view.payload_len()
@@ -276,14 +287,14 @@ fn page_check(args: &[String]) -> Result<(), String> {
 
     let payload = view.payload();
     match std::str::from_utf8(payload) {
-        Ok(text) if !text.is_empty() => println!("payload_utf8={text:?}"),
+        Ok(text) if !text.is_empty() => outln!("payload_utf8={text:?}"),
         _ => {
             let preview_len = payload.len().min(32);
             let hex: Vec<String> = payload[..preview_len]
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
-            println!("payload_hex={}", hex.join(""));
+            outln!("payload_hex={}", hex.join(""));
         }
     }
 
@@ -304,7 +315,7 @@ fn wal_inspect(args: &[String]) -> Result<(), String> {
     let scan =
         WalReader::open(Path::new(&input)).map_err(|error| format!("read wal {input}: {error}"))?;
 
-    println!(
+    outln!(
         "first_lsn={} records={} valid_end={} file_len={}",
         scan.first_lsn,
         scan.records.len(),
@@ -312,14 +323,14 @@ fn wal_inspect(args: &[String]) -> Result<(), String> {
         scan.file_len
     );
     match scan.tail {
-        TailState::Clean => println!("tail=clean"),
+        TailState::Clean => outln!("tail=clean"),
         TailState::Torn { offset, bytes } => {
-            println!("tail=torn offset={offset} bytes={bytes}")
+            outln!("tail=torn offset={offset} bytes={bytes}")
         }
     }
 
     for record in scan.records.iter().take(limit) {
-        println!(
+        outln!(
             "lsn={} txn={} kind={} payload_len={}",
             record.lsn,
             record.txn_id,
@@ -328,7 +339,7 @@ fn wal_inspect(args: &[String]) -> Result<(), String> {
         );
     }
     if scan.records.len() > limit {
-        println!("... {} more records", scan.records.len() - limit);
+        outln!("... {} more records", scan.records.len() - limit);
     }
     Ok(())
 }
@@ -365,9 +376,11 @@ fn txn_put(args: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let info = txn.commit().map_err(|error| error.to_string())?;
 
-    println!(
+    outln!(
         "committed txn={} lsn={} ops={}",
-        info.txn_id, info.commit_lsn, info.op_count
+        info.txn_id,
+        info.commit_lsn,
+        info.op_count
     );
     Ok(())
 }
@@ -381,13 +394,13 @@ fn txn_get(args: &[String]) -> Result<(), String> {
         .get(key.as_bytes())
         .map_err(|error| error.to_string())?
     {
-        Some(value) => println!(
+        Some(value) => outln!(
             "key={:?} value={} bytes={}",
             key,
             preview_bytes(&value),
             value.len()
         ),
-        None => println!("key={key:?} not_found"),
+        None => outln!("key={key:?} not_found"),
     }
     Ok(())
 }
@@ -398,7 +411,7 @@ fn txn_dump(args: &[String]) -> Result<(), String> {
     let store = open_store(&wal)?;
     let recovery = store.recovery();
 
-    println!(
+    outln!(
         "records={} records_skipped={} checkpoint_lsn={} committed_txns={} aborted_txns={} discarded_txns={} torn_tail_bytes={} last_lsn={}",
         recovery.records,
         recovery.records_skipped,
@@ -411,12 +424,12 @@ fn txn_dump(args: &[String]) -> Result<(), String> {
     );
 
     let entries = store.iter().map_err(|error| error.to_string())?;
-    println!("keys={}", entries.len());
+    outln!("keys={}", entries.len());
     for (key, value) in entries.iter().take(limit) {
-        println!("key={} value={}", preview_bytes(key), preview_bytes(value));
+        outln!("key={} value={}", preview_bytes(key), preview_bytes(value));
     }
     if entries.len() > limit {
-        println!("... {} more keys", entries.len() - limit);
+        outln!("... {} more keys", entries.len() - limit);
     }
     Ok(())
 }
@@ -432,7 +445,7 @@ fn txn_checkpoint(args: &[String]) -> Result<(), String> {
         store.checkpoint()
     }
     .map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "checkpoint_lsn={} entries={} wal_bytes_before={} wal_bytes_after={} snapshot={} snapshot_bytes={} archived_wal={} archived_snapshot={} pruned_archives={}",
         info.checkpoint_lsn,
         info.entries,
@@ -458,7 +471,7 @@ fn txn_history(args: &[String]) -> Result<(), String> {
         let keep = arg_usize(args, "--keep", 1);
         let info = TxnStore::prune_history(Path::new(&wal), keep)
             .map_err(|error| format!("prune {wal}: {error}"))?;
-        println!(
+        outln!(
             "pruned={} kept={}",
             join_lsns(&info.removed),
             join_lsns(&info.kept)
@@ -467,7 +480,7 @@ fn txn_history(args: &[String]) -> Result<(), String> {
     }
 
     if !dir.is_dir() {
-        println!("history={} entries=0", dir.display());
+        outln!("history={} entries=0", dir.display());
         return Ok(());
     }
     let mut items: Vec<_> = std::fs::read_dir(&dir)
@@ -477,7 +490,7 @@ fn txn_history(args: &[String]) -> Result<(), String> {
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wal"))
         .collect();
     items.sort();
-    println!("history={} entries={}", dir.display(), items.len());
+    outln!("history={} entries={}", dir.display(), items.len());
     for path in items {
         let lsn = path
             .file_stem()
@@ -485,7 +498,7 @@ fn txn_history(args: &[String]) -> Result<(), String> {
             .unwrap_or("?");
         let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         let has_snapshot = path.with_extension("snap").is_file();
-        println!("lsn={lsn} wal_bytes={bytes} snapshot={has_snapshot}");
+        outln!("lsn={lsn} wal_bytes={bytes} snapshot={has_snapshot}");
     }
     Ok(())
 }
@@ -514,7 +527,7 @@ fn txn_recover(args: &[String]) -> Result<(), String> {
         TxnStore::recover_at(Path::new(&wal), target_lsn)
             .map_err(|error| format!("recover {wal} to lsn {target_lsn}: {error}"))?
     };
-    println!(
+    outln!(
         "target_lsn={} checkpoint_lsn={} applied_lsn={} committed_txns={} discarded_txns={} keys={}",
         view.target_lsn,
         view.checkpoint_lsn,
@@ -524,10 +537,10 @@ fn txn_recover(args: &[String]) -> Result<(), String> {
         view.entries.len()
     );
     for (key, value) in view.entries.iter().take(limit) {
-        println!("key={} value={}", preview_bytes(key), preview_bytes(value));
+        outln!("key={} value={}", preview_bytes(key), preview_bytes(value));
     }
     if view.entries.len() > limit {
-        println!("... {} more keys", view.entries.len() - limit);
+        outln!("... {} more keys", view.entries.len() - limit);
     }
     Ok(())
 }
@@ -554,7 +567,7 @@ fn txn_writer(args: &[String]) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
         }
         let info = txn.commit().map_err(|error| error.to_string())?;
-        println!(
+        outln!(
             "committed={} txn={} lsn={} ops={}",
             txn_index + 1,
             info.txn_id,
@@ -610,9 +623,11 @@ fn pstore_put(args: &[String]) -> Result<(), String> {
     txn.write_page(PageId::new(id), &page)
         .map_err(|error| error.to_string())?;
     let info = txn.commit().map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "committed txn={} lsn={} pages={} page={id}",
-        info.txn_id, info.commit_lsn, info.pages
+        info.txn_id,
+        info.commit_lsn,
+        info.pages
     );
     Ok(())
 }
@@ -629,7 +644,7 @@ fn pstore_alloc(args: &[String]) -> Result<(), String> {
         .allocate(kind, text.as_bytes())
         .map_err(|error| error.to_string())?;
     let info = txn.commit().map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "committed txn={} lsn={} pages={} page={}",
         info.txn_id,
         info.commit_lsn,
@@ -651,14 +666,14 @@ fn pstore_get(args: &[String]) -> Result<(), String> {
     {
         Some(page) => {
             let view = Page::parse(page.as_bytes()).map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "page={id} kind={} payload_len={} payload={}",
                 view.kind().name(),
                 view.payload_len(),
                 preview_bytes(view.payload())
             );
         }
-        None => println!("page={id} not_found"),
+        None => outln!("page={id} not_found"),
     }
     Ok(())
 }
@@ -668,7 +683,7 @@ fn pstore_checkpoint(args: &[String]) -> Result<(), String> {
     let wal = required_arg(args, "--wal")?;
     let store = open_pstore(&data, &wal)?;
     let info = store.checkpoint().map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "checkpoint_lsn={} page_count={} wal_bytes_before={} wal_bytes_after={} checkpoint={}",
         info.checkpoint_lsn,
         info.page_count,
@@ -686,7 +701,7 @@ fn pstore_dump(args: &[String]) -> Result<(), String> {
     let store = open_pstore(&data, &wal)?;
     let recovery = store.recovery();
 
-    println!(
+    outln!(
         "records={} records_skipped={} checkpoint_lsn={} committed_txns={} aborted_txns={} discarded_txns={} pages_replayed={} torn_tail_bytes={} data_tail_bytes={} data_pages={} last_lsn={}",
         recovery.records,
         recovery.records_skipped,
@@ -700,7 +715,7 @@ fn pstore_dump(args: &[String]) -> Result<(), String> {
         recovery.data_pages,
         recovery.last_lsn
     );
-    println!(
+    outln!(
         "page_count={} cached={}",
         store.page_count(),
         store.cache_len().map_err(|error| error.to_string())?
@@ -715,7 +730,7 @@ fn pstore_dump(args: &[String]) -> Result<(), String> {
             continue;
         };
         let view = Page::parse(page.as_bytes()).map_err(|error| error.to_string())?;
-        println!(
+        outln!(
             "page={id} kind={} payload_len={} payload={}",
             view.kind().name(),
             view.payload_len(),
@@ -723,7 +738,7 @@ fn pstore_dump(args: &[String]) -> Result<(), String> {
         );
     }
     if store.page_count() > count {
-        println!("... {} more pages", store.page_count() - count);
+        outln!("... {} more pages", store.page_count() - count);
     }
     Ok(())
 }
@@ -745,7 +760,7 @@ fn pstore_writer(args: &[String]) -> Result<(), String> {
             .allocate(PageKind::Data, payload.as_bytes())
             .map_err(|error| error.to_string())?;
         let info = txn.commit().map_err(|error| error.to_string())?;
-        println!(
+        outln!(
             "committed={} txn={} lsn={} pages={} page={}",
             txn_index + 1,
             info.txn_id,
@@ -785,7 +800,7 @@ fn run_cas(args: &[String]) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             let bytes = std::fs::read(&file).map_err(|error| format!("read {file}: {error}"))?;
             let hash = store.put(&bytes).map_err(|error| error.to_string())?;
-            println!("hash={hash} bytes={}", bytes.len());
+            outln!("hash={hash} bytes={}", bytes.len());
             Ok(())
         }
         Some("get") => {
@@ -797,7 +812,7 @@ fn run_cas(args: &[String]) -> Result<(), String> {
             let hash = tritdb_cas::Hash::from_hex(&hash).map_err(|error| error.to_string())?;
             let bytes = store.get(&hash).map_err(|error| error.to_string())?;
             std::fs::write(&out, &bytes).map_err(|error| format!("write {out}: {error}"))?;
-            println!("hash={hash} bytes={}", bytes.len());
+            outln!("hash={hash} bytes={}", bytes.len());
             Ok(())
         }
         Some("has") => {
@@ -806,7 +821,7 @@ fn run_cas(args: &[String]) -> Result<(), String> {
             let store = tritdb_cas::ChunkStore::open(std::path::Path::new(&root))
                 .map_err(|error| error.to_string())?;
             let hash = tritdb_cas::Hash::from_hex(&hash).map_err(|error| error.to_string())?;
-            println!("hash={hash} present={}", store.has(&hash));
+            outln!("hash={hash} present={}", store.has(&hash));
             Ok(())
         }
         Some("gc") => {
@@ -823,9 +838,11 @@ fn run_cas(args: &[String]) -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
             let report = store.gc(&roots).map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "reachable={} removed={} bytes_removed={}",
-                report.reachable, report.removed, report.bytes_removed
+                report.reachable,
+                report.removed,
+                report.bytes_removed
             );
             Ok(())
         }
@@ -854,7 +871,7 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             let manifest = tritdb_cas::Manifest::new(parent, entries);
             let hash = manifest.store(&store).map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "manifest={hash} parent={} entries={}",
                 parent.map_or("-".to_string(), |hash| hash.to_hex()),
                 manifest.entries.len()
@@ -869,9 +886,11 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             let head = tritdb_cas::Hash::from_hex(&head).map_err(|error| error.to_string())?;
             let info =
                 tritdb_cas::verify_chain(&store, &head).map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "head={} root={} length={}",
-                info.head, info.root, info.length
+                info.head,
+                info.root,
+                info.length
             );
             Ok(())
         }
@@ -883,7 +902,7 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             let hash = tritdb_cas::Hash::from_hex(&hash).map_err(|error| error.to_string())?;
             let manifest =
                 tritdb_cas::Manifest::load(&store, &hash).map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "manifest={hash} version={} parent={} created_ms={} entries={}",
                 manifest.version,
                 manifest
@@ -893,7 +912,7 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
                 manifest.entries.len()
             );
             for (name, hash) in &manifest.entries {
-                println!("entry={name} hash={hash}");
+                outln!("entry={name} hash={hash}");
             }
             Ok(())
         }
@@ -913,9 +932,12 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
                 tritdb_cas::replicate_subset(&source, &target, &head, &names)
             }
             .map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "head={} manifests={} chunks={} bytes={}",
-                info.head, info.manifests, info.chunks, info.bytes
+                info.head,
+                info.manifests,
+                info.chunks,
+                info.bytes
             );
             Ok(())
         }
@@ -943,7 +965,7 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
             drop(txn);
             let manifest = tritdb_cas::Manifest::new(parent, manifest_entries);
             let hash = manifest.store(&store).map_err(|error| error.to_string())?;
-            println!(
+            outln!(
                 "manifest={hash} parent={} entries={}",
                 parent.map_or("-".to_string(), |hash| hash.to_hex()),
                 manifest.entries.len()
@@ -968,7 +990,7 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
             }
             txn.commit().map_err(|error| error.to_string())?;
-            println!("restored={} db={db}", manifest.entries.len());
+            outln!("restored={} db={db}", manifest.entries.len());
             Ok(())
         }
         Some(other) => Err(format!("unknown manifest subcommand: {other}")),
@@ -1027,7 +1049,7 @@ fn manifest_snapshot_pages(args: &[String]) -> Result<(), String> {
 
     let manifest = tritdb_cas::Manifest::new(parent, entries);
     let hash = manifest.store(&store).map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "manifest={hash} parent={} pages={page_count} bytes={}",
         parent.map_or("-".to_string(), |hash| hash.to_hex()),
         bytes.len()
@@ -1103,7 +1125,7 @@ fn manifest_restore_pages(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("sync {tmp}: {error}"))?;
     drop(file);
     std::fs::rename(&tmp, &out).map_err(|error| format!("rename {tmp} -> {out}: {error}"))?;
-    println!("pages={page_count} bytes={written} out={out}");
+    outln!("pages={page_count} bytes={written} out={out}");
     Ok(())
 }
 
@@ -1121,7 +1143,7 @@ fn run_anchor(args: &[String]) -> Result<(), String> {
             }
             let bytes = anchor.encode();
             std::fs::write(&out, &bytes).map_err(|error| format!("write {out}: {error}"))?;
-            println!(
+            outln!(
                 "anchor={out} head={} signed={}",
                 anchor.head,
                 anchor.hmac.is_some()
@@ -1157,7 +1179,7 @@ fn run_anchor(args: &[String]) -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
                 chain_length = Some(info.length);
             }
-            println!(
+            outln!(
                 "anchor={file} head={} signed={} chain_length={}",
                 anchor.head,
                 anchor.hmac.is_some(),
@@ -1323,7 +1345,7 @@ fn graph_build(args: &[String]) -> Result<(), String> {
     txn.put(&graph_key(&name), &bytes)
         .map_err(|error| error.to_string())?;
     let info = txn.commit().map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "name={name} nodes={} edges={} bytes={} txn={} lsn={}",
         graph.node_count(),
         graph.edge_count(),
@@ -1338,7 +1360,7 @@ fn graph_load(args: &[String]) -> Result<(), String> {
     let wal = required_arg(args, "--wal")?;
     let name = required_arg(args, "--name")?;
     let graph = build_graph(args)?;
-    println!(
+    outln!(
         "name={name} wal={wal} nodes={} edges={}",
         graph.node_count(),
         graph.edge_count()
@@ -1374,7 +1396,7 @@ fn graph_reach(args: &[String]) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",")
     };
-    println!(
+    outln!(
         "nodes={} edges={} from={from} to={to} max_hops={max_hops} answer={answer} hops={hops} path={path}",
         graph.node_count(),
         graph.edge_count()
@@ -1400,7 +1422,7 @@ fn graph_neighbors(args: &[String]) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",")
     };
-    println!(
+    outln!(
         "node={node} hops={hops} count={} nodes={list}",
         reached.len()
     );
@@ -1435,7 +1457,7 @@ fn graph_put_points(args: &[String]) -> Result<(), String> {
     txn.put(format!("points/{name}").as_bytes(), &bytes)
         .map_err(|error| error.to_string())?;
     let info = txn.commit().map_err(|error| error.to_string())?;
-    println!(
+    outln!(
         "name={name} points={} bytes={} txn={} lsn={}",
         points.len(),
         bytes.len(),
@@ -1492,13 +1514,14 @@ fn graph_knn(args: &[String]) -> Result<(), String> {
         ("FALSE", &answer.excluded),
     ] {
         for (rank, neighbor) in bucket.iter().enumerate() {
-            println!(
+            outln!(
                 "label={name} rank={rank} id={} distance={}",
-                neighbor.id, neighbor.distance
+                neighbor.id,
+                neighbor.distance
             );
         }
     }
-    println!(
+    outln!(
         "certain={} uncertain={} excluded={}",
         answer.certain.len(),
         answer.uncertain.len(),
@@ -1512,7 +1535,7 @@ fn run_models(args: &[String]) -> Result<(), String> {
     let expr_text = required_arg(args, "--expr")?;
     let expr = parse_bool_expr(&expr_text, vars)?;
     let models = tritdb_exec::ann::count_models(&expr, vars).map_err(|error| error.to_string())?;
-    println!("vars={vars} models={models}");
+    outln!("vars={vars} models={models}");
     Ok(())
 }
 
@@ -1527,7 +1550,7 @@ fn run_repair(args: &[String]) -> Result<(), String> {
         tritdb_exec::ann::RepairAnswer::Impossible => "impossible",
         tritdb_exec::ann::RepairAnswer::Contingent => "contingent",
     };
-    println!(
+    outln!(
         "facts={} denials={} query={} answer={answer}",
         facts,
         denials.len(),
@@ -1877,7 +1900,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let listener =
         std::net::TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     let local = listener.local_addr().map_err(|error| error.to_string())?;
-    println!("listening={local} db={db}");
+    outln!("listening={local} db={db}");
     tritdb_pgwire::serve_with_options(
         std::path::PathBuf::from(db),
         listener,
@@ -1902,7 +1925,7 @@ fn run_scram_verifier(args: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     std::fs::write(&out, format!("{}\n", verifier.encode()))
         .map_err(|error| format!("write {out}: {error}"))?;
-    println!("wrote={out} iterations={iterations}");
+    outln!("wrote={out} iterations={iterations}");
     Ok(())
 }
 
@@ -1951,7 +1974,7 @@ fn run_sql(args: &[String]) -> Result<(), String> {
     };
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
-            println!();
+            outln!();
         }
         print_query_result(result);
     }
@@ -1994,13 +2017,13 @@ fn json_escape(text: &str) -> String {
 fn print_query_result(result: &QueryResult) {
     match result {
         QueryResult::Rows { columns, rows } => {
-            println!("{}", columns.join("\t"));
+            outln!("{}", columns.join("\t"));
             for row in rows {
                 let values: Vec<String> = row.iter().map(|value| value.display()).collect();
-                println!("{}", values.join("\t"));
+                outln!("{}", values.join("\t"));
             }
         }
-        QueryResult::Message(message) => println!("{message}"),
+        QueryResult::Message(message) => outln!("{message}"),
     }
 }
 

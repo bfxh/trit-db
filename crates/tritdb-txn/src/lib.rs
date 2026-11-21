@@ -1884,6 +1884,61 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_races_begin_without_losing_commits() {
+        let dir = TempDir::new();
+        let path = dir.wal();
+        let store = Arc::new(TxnStore::open(&path).expect("open"));
+        let mut handles = Vec::new();
+        for worker in 0..4u64 {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for index in 0..50u64 {
+                    let key = format!("w{worker}-{index}");
+                    let mut txn = store.begin().expect("begin");
+                    txn.put(key.as_bytes(), b"v").expect("put");
+                    txn.commit().expect("commit");
+                }
+            }));
+        }
+        let mut checkpoints = 0;
+        let mut attempts = 0;
+        while checkpoints < 20 {
+            attempts += 1;
+            assert!(attempts < 100_000, "checkpoint never made progress");
+            match store.checkpoint() {
+                Ok(_) => checkpoints += 1,
+                Err(TxnError::ActiveTxns { .. }) => std::thread::yield_now(),
+                Err(error) => panic!("checkpoint failed: {error}"),
+            }
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        for worker in 0..4u64 {
+            for index in 0..50u64 {
+                let key = format!("w{worker}-{index}");
+                assert_eq!(
+                    store.get(key.as_bytes()).expect("get"),
+                    Some(b"v".to_vec()),
+                    "committed key {key} was lost"
+                );
+            }
+        }
+        drop(store);
+        let reopened = TxnStore::open(&path).expect("reopen");
+        for worker in 0..4u64 {
+            for index in 0..50u64 {
+                let key = format!("w{worker}-{index}");
+                assert_eq!(
+                    reopened.get(key.as_bytes()).expect("get"),
+                    Some(b"v".to_vec()),
+                    "committed key {key} did not survive reopen"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn commit_group_applies_disjoint_keys() {
         let dir = TempDir::new();
         let path = dir.wal();
