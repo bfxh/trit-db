@@ -58,13 +58,14 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
 - Belnap 的 `BOTH`/`NEITHER` 与 `NULL` 一律映射为 `UNKNOWN`（不通过 `WHERE`，与 `truth_of` 一致）；
 - debug 构建每次命中都会再用行式 `passes_filter` 算一遍并 `debug_assert_eq!` 对拍；
 - 集成测试 `batch_where_matches_row_path_on_annotation_columns` 覆盖 K3/Belnap 的 AND/OR/NOT
-  组合与混合谓词回退。
+  组合与混合谓词回退；
+- `DELETE` 与 `UPDATE` 的 `WHERE` 复用同一 `batch_filter_indices`（同一 debug 对拍），
+  集成测试 `batch_where_drives_update_and_delete` 覆盖更新/删除与混合谓词回退。
 
 ### 5.1 还没做
 
 - **ASOF JOIN 语法**：还没有 `ASOF JOIN` 关键字与 binder（`asof_join` 目前是库 API）；
 - **三值列存块**：`TritVec` 还没作为表的物理列格式（目前是内存向量）；
-- **UPDATE/DELETE 的 WHERE**：目前只接了 SELECT（DELETE 的过滤可复用同一函数）。
 
 ## 6. 验收
 

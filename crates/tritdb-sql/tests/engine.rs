@@ -3332,6 +3332,63 @@ fn batch_where_matches_row_path_on_annotation_columns() {
 }
 
 #[test]
+fn batch_where_drives_update_and_delete() {
+    let dir = TempDir::new("sql-batch-dml");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, flag LOGIC K3);              INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE);",
+        )
+        .expect("seed");
+
+    let ids = |engine: &mut SqlEngine| -> Vec<i64> {
+        let results = engine
+            .execute_script("SELECT id FROM t ORDER BY id;")
+            .expect("query");
+        as_rows(&results[0])
+            .1
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int(id) => id,
+                ref other => panic!("expected int id, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // UPDATE only touches rows where the K3 predicate is TRUE.
+    engine
+        .execute_script("UPDATE t SET id = id + 100 WHERE flag;")
+        .expect("update");
+    assert_eq!(ids(&mut engine), vec![2, 3, 101, 104]);
+
+    // DELETE drops exactly those rows (NULL is UNKNOWN, kept).
+    engine
+        .execute_script("DELETE FROM t WHERE flag;")
+        .expect("delete");
+    assert_eq!(ids(&mut engine), vec![2, 3]);
+
+    // A mixed predicate falls back to the row-wise path.
+    engine
+        .execute_script(
+            "CREATE TABLE u (id INT NOT NULL, flag LOGIC K3);              INSERT INTO u VALUES (1, TRUE), (2, TRUE), (3, FALSE);              DELETE FROM u WHERE flag AND id > 1;",
+        )
+        .expect("mixed predicate delete");
+    let remaining = engine
+        .execute_script("SELECT id FROM u ORDER BY id;")
+        .expect("query");
+    let values: Vec<i64> = as_rows(&remaining[0])
+        .1
+        .iter()
+        .map(|row| match row[0] {
+            Value::Int(id) => id,
+            ref other => panic!("expected int id, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec![1, 3]);
+}
+
+#[test]
 fn join_projection_prunes_unused_source_columns() {
     let dir = TempDir::new("sql-projection");
     let db = dir.join("sql.db");

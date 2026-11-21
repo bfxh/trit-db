@@ -1126,17 +1126,42 @@ impl SqlEngine {
         let filter = filter
             .map(|expr| bind_expr(expr, &table.schema))
             .transpose()?;
+        let batch_passing = filter
+            .as_ref()
+            .and_then(|expr| batch_filter_indices(expr, &table.schema, &table.rows));
+        #[cfg(debug_assertions)]
+        if let Some(indices) = &batch_passing {
+            let scalar = scalar_filter_indices(&filter, &table.schema, &table.rows)?;
+            debug_assert_eq!(indices, &scalar, "batch WHERE diverged from the row path");
+        }
         let mut kept = Vec::with_capacity(table.rows.len());
         let mut deleted = 0usize;
-        for row in table.rows.drain(..) {
-            let keep = match &filter {
-                Some(expr) => truth_of(&eval(expr, &table.schema, &row)?)? != TruthValue::True,
-                None => false,
-            };
-            if keep {
-                kept.push(row);
-            } else {
-                deleted += 1;
+        match &batch_passing {
+            Some(passing) => {
+                let passing: std::collections::BTreeSet<usize> = passing.iter().copied().collect();
+                let mut rows = std::mem::take(&mut table.rows);
+                for (index, row) in rows.drain(..).enumerate() {
+                    if passing.contains(&index) {
+                        deleted += 1;
+                    } else {
+                        kept.push(row);
+                    }
+                }
+            }
+            None => {
+                for row in table.rows.drain(..) {
+                    let keep = match &filter {
+                        Some(expr) => {
+                            truth_of(&eval(expr, &table.schema, &row)?)? != TruthValue::True
+                        }
+                        None => false,
+                    };
+                    if keep {
+                        kept.push(row);
+                    } else {
+                        deleted += 1;
+                    }
+                }
             }
         }
         table.rows = kept;
@@ -1172,10 +1197,22 @@ impl SqlEngine {
             targets.push((index, bind_expr(&assignment.value, schema)?));
         }
         let filter = filter.map(|expr| bind_expr(expr, schema)).transpose()?;
+        let batch_passing = filter
+            .as_ref()
+            .and_then(|expr| batch_filter_indices(expr, schema, &table.rows));
+        #[cfg(debug_assertions)]
+        if let Some(indices) = &batch_passing {
+            let scalar = scalar_filter_indices(&filter, schema, &table.rows)?;
+            debug_assert_eq!(indices, &scalar, "batch WHERE diverged from the row path");
+        }
 
         let mut updated = 0usize;
-        for row in &mut table.rows {
-            if !passes_filter(filter.as_ref(), schema, row)? {
+        for (row_index, row) in table.rows.iter_mut().enumerate() {
+            let passes = match &batch_passing {
+                Some(indices) => indices.binary_search(&row_index).is_ok(),
+                None => passes_filter(filter.as_ref(), schema, row)?,
+            };
+            if !passes {
                 continue;
             }
             let old = row.clone();
@@ -4920,6 +4957,24 @@ fn build_tri_predicate(
 ///
 /// Returns the surviving row indices, or `None` when the predicate needs the
 /// row-at-a-time path.
+/// Row indices the row-at-a-time path keeps (the batch oracle).
+fn scalar_filter_indices(
+    filter: &Option<ExecExpr>,
+    schema: &Schema,
+    rows: &[Row],
+) -> Result<Vec<usize>, SqlError> {
+    rows.iter()
+        .enumerate()
+        .filter_map(
+            |(index, row)| match passes_filter(filter.as_ref(), schema, row) {
+                Ok(true) => Some(Ok(index)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
 fn batch_filter_indices(filter: &ExecExpr, schema: &Schema, rows: &[Row]) -> Option<Vec<usize>> {
     let mut atoms = Vec::new();
     let predicate = build_tri_predicate(filter, schema, &mut atoms)?;
