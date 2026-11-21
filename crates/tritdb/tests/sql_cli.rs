@@ -1105,3 +1105,99 @@ fn correlated_subquery_in_projection() {
     assert!(!output.status.success(), "aggregate + correlated must fail");
     assert!(stderr(&output).contains("aggregates are not supported"));
 }
+
+#[test]
+fn tuple_in_and_correlated_having() {
+    let dir = TempDir::new("sql-tuple-having");
+    let db = dir.join("tuple.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL); \
+         INSERT INTO t VALUES (1,2),(2,3),(4,5); \
+         CREATE TABLE u (x INT NOT NULL, y INT NOT NULL); \
+         INSERT INTO u VALUES (1,2),(2,9);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT a, b FROM t WHERE (a, b) IN (SELECT x, y FROM u) ORDER BY a;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t2"), "out: {text}");
+    assert!(!text.contains("2\t3"), "out: {text}");
+    assert!(!text.contains("4\t5"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT a, b FROM t WHERE (a, b) NOT IN (SELECT x, y FROM u) ORDER BY a;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("2\t3"), "out: {text}");
+    assert!(text.contains("4\t5"), "out: {text}");
+    assert!(!text.contains("1\t2"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT a, b FROM t WHERE (a, b) IN (SELECT x, y FROM u WHERE u.x = t.a) ORDER BY a;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t2"), "out: {text}");
+    assert!(!text.contains("2\t3"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE g (dept TEXT NOT NULL, id INT NOT NULL); \
+         INSERT INTO g VALUES ('a',1),('a',2),('b',3); \
+         CREATE TABLE h (dept TEXT NOT NULL, x INT NOT NULL); \
+         INSERT INTO h VALUES ('a',1),('b',0);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT dept, COUNT(*) AS n FROM g GROUP BY dept \
+         HAVING COUNT(*) > (SELECT MAX(h.x) FROM h WHERE h.dept = g.dept) ORDER BY dept;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("a\t2"), "out: {text}");
+    assert!(text.contains("b\t1"), "out: {text}");
+
+    // A non-scalar correlated subquery in HAVING is outside the supported subset.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT dept, COUNT(*) AS n FROM g GROUP BY dept \
+         HAVING COUNT(*) IN (SELECT h.x FROM h WHERE h.dept = g.dept);",
+    ]);
+    assert!(
+        !output.status.success(),
+        "correlated IN in HAVING must fail"
+    );
+    assert!(stderr(&output).contains("only scalar correlated subqueries"));
+}

@@ -21,6 +21,7 @@
 2. **非相关：执行前物化**
    - `execute_statement` / `execute_query` 在执行前遍历表达式，把：
      - `InSubquery { expr, query, negated }` → `InList { expr, values: [Literal(v), ...], negated }`；
+     - `InSubqueryTuple { exprs, query, negated }` → 每行生成 `exprs[0] = row[0] AND ...` 的 `AND` 链，再按行 `OR` 合并；空集 `IN` → `FALSE`、`NOT IN` → `TRUE`；
      - `ScalarSubquery { query }` → `Literal(value)`；
      - `Exists { query }` → `Literal(Bool(rows > 0))`；
      - `Quantified { expr, op, kind, query }` → 对每个结果值生成 `expr op value`，按 `ANY`→`OR` / `ALL`→`AND` 串起来（空集：`ANY`→`FALSE`、`ALL`→`TRUE`）。
@@ -41,7 +42,8 @@
    - `EXISTS`：子查询有行 → `TRUE`，否则 `FALSE`；`NOT EXISTS` 由 `Not` 包裹。
    - `ANY` / `ALL`：逐值比较后按三值 `OR` / `AND` 合并；空集 `ANY` → `FALSE`、`ALL` → `TRUE`。
    - 标量：0 行 → `NULL`；多行 → `Unsupported`；多列 → `Unsupported`。
-   - 相关子查询只支持 `WHERE` 与投影；外层列必须限定。
+   - 相关子查询支持 `WHERE`、投影与 `HAVING`；外层列必须限定。
+   - `HAVING` 中的相关标量子查询按 `GROUP BY` 键生成 `CASE WHEN group_key = value THEN <subquery value> ... ELSE NULL END`，要求 `GROUP BY` 非空；非标量相关子查询仍报 `Unsupported`。
 
 ## 理由
 
@@ -51,10 +53,10 @@
 
 ## 后果 / 限制
 
-- **相关子查询只在 `WHERE` 与投影**：`HAVING` / `ORDER BY` 中的相关子查询、以及带 `GROUP BY`/聚合/`HAVING` 的相关投影报 `Unsupported`；外层列必须限定。
+- **相关子查询只在 `WHERE`、投影与 `HAVING`**：`ORDER BY` 中的相关子查询、带 `GROUP BY`/聚合的相关投影、`HAVING` 中的非标量相关子查询报 `Unsupported`；外层列必须限定。
 - **逐行执行**：相关子查询是 nested-loop 求值（外层行数 × 子查询成本），不是为大数据集设计的。
 - **物化内存**：`IN` 子查询把结果全部转成字面量，超大结果集会占用内存。
-- **多列 `IN`**：不支持（`(a, b) IN (SELECT ...)`）。
+- **多列 `IN`**：已支持；左侧元组必须和子查询列数一致，右侧不支持值列表形式。
 - 子查询的 `NULL` 语义依赖既有 `IN` 三值实现，`NOT IN` 遇到 `NULL` 会得到 `UNKNOWN` 而不是 `TRUE`。
 
 ## 验收
@@ -70,4 +72,5 @@ cargo fmt --all -- --check
 - `WITH c AS (...) UPDATE ... WHERE id IN (SELECT id FROM c)` 与 `DELETE`；
 - 标量多行、`IN` 多列报错；
 - 相关 `IN` / 相关标量（`WHERE`）、非相关路径回归、投影相关子查询与普通 filter 组合、聚合场景被拒绝；
+- 多列 `(a, b) IN` / `NOT IN` / 相关多列 `IN`、`HAVING` 标量相关子查询；
 - `EXISTS` / `NOT EXISTS` / `> ANY` / `> ALL` / `<> ALL`、空集 `ANY` → 空、空集 `ALL` → 全保留。
