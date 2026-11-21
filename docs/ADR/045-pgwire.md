@@ -35,7 +35,7 @@
 
 ## 后果 / 限制
 
-- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端；`--tls-client-ca` 用 `WebPkiClientVerifier` 要求客户端证书（mTLS）；`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，用 CA 公钥验签后按序列号吊销）或 SHA-256 指纹列表；`--tls-client-ocsp` 读取预取的 DER OCSP 响应，验签后按 `CertStatus::Revoked` 吊销；`--tls-client-ocsp-url` 走在线查询（手写 HTTP/1.1 POST，支持 `http://` 与 `https://`，后者用系统根证书加 `--tls-client-ocsp-ca` 的额外根；SHA-1 `CertID`、16 字节 nonce 并校验回显、60 秒结果缓存；查询失败、nonce 不匹配或证书未出现在响应里即拒绝，吊销原因写入日志）。证书/私钥/CA 文件按内容哈希检测，变化后新连接自动重载（重载失败保留旧证书）。
+- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端；`--tls-client-ca` 用 `WebPkiClientVerifier` 要求客户端证书（mTLS）；`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，用 CA 公钥验签后按序列号吊销）或 SHA-256 指纹列表；`--tls-client-ocsp` 读取预取的 DER OCSP 响应，验签后按 `CertStatus::Revoked` 吊销；`--tls-client-ocsp-url` 走在线查询（手写 HTTP/1.1 POST，支持 `http://` 与 `https://`，后者用系统根证书加 `--tls-client-ocsp-ca` 的额外根；SHA-1 `CertID`、16 字节 nonce 并校验回显、响应者证书链/有效期与 `thisUpdate`/`nextUpdate` 新鲜度校验、60 秒结果缓存；查询失败、nonce 不匹配、证书未出现在响应里或响应过期即拒绝，吊销原因写入日志）。证书/私钥/CA 文件按内容哈希检测，变化后新连接自动重载（重载失败保留旧证书）。
 - **扩展查询只覆盖最小子集**：`Describe` 对 SELECT 返回列名与取样推断的类型，非 SELECT 返回 `NoData`；`Execute` 忽略 row limit，参数只按文本格式处理。
 - **认证有 trust / cleartext / MD5 / SCRAM-SHA-256**：`--auth password|md5|scram-sha-256`；SCRAM 用 4096 轮 PBKDF2-HMAC-SHA256（复用 `tritdb-cas` 的 SHA-256/HMAC），salt 每个进程随机；`--scram-verifier-file` 可加载持久化的 `SCRAM-SHA-256$...` verifier（PG 格式），`tritdb scram-verifier` 生成；明文连接下 cleartext 密码默认拒绝启动，需要 `--allow-plaintext-password`。
 - **执行串行化**：连接并发，但语句在共享引擎锁上排队；不是多写者并发。

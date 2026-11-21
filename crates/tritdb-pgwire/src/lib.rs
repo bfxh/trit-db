@@ -775,13 +775,30 @@ fn ocsp_revoked(
             }
         }
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
     for single in &basic.tbs_response_data.responses {
-        if single.cert_id.serial_number.as_bytes() == serial {
-            return Ok(match &single.cert_status {
-                x509_ocsp::CertStatus::Revoked(info) => OcspStatus::Revoked(info.revocation_reason),
-                _ => OcspStatus::Good,
-            });
+        if single.cert_id.serial_number.as_bytes() != serial {
+            continue;
         }
+        let updated = single.this_update.0.to_unix_duration();
+        if updated.as_secs() > now + 300 {
+            return Err(PgError::Protocol(
+                "OCSP thisUpdate is in the future".to_string(),
+            ));
+        }
+        if let Some(next) = &single.next_update {
+            let expiry = next.0.to_unix_duration();
+            if expiry.as_secs() < now {
+                return Err(PgError::Protocol("OCSP response has expired".to_string()));
+            }
+        }
+        return Ok(match &single.cert_status {
+            x509_ocsp::CertStatus::Revoked(info) => OcspStatus::Revoked(info.revocation_reason),
+            _ => OcspStatus::Good,
+        });
     }
     Err(PgError::Protocol(
         "OCSP response does not mention the client certificate".to_string(),
@@ -842,6 +859,30 @@ fn verify_ocsp_signature(
     };
     let (_, signer) = x509_parser::parse_x509_certificate(&signer_der)
         .map_err(|error| PgError::Protocol(format!("bad OCSP signer: {error}")))?;
+    let now = x509_parser::time::ASN1Time::now();
+    if !signer.validity().is_valid_at(now) {
+        return Err(PgError::Protocol(
+            "OCSP signer certificate is not valid now".to_string(),
+        ));
+    }
+    if let Some(ca) = ca_der {
+        let (_, ca_cert) = x509_parser::parse_x509_certificate(ca)
+            .map_err(|error| PgError::Protocol(format!("bad client CA: {error}")))?;
+        if !ca_cert.validity().is_valid_at(now) {
+            return Err(PgError::Protocol(
+                "client CA certificate is not valid now".to_string(),
+            ));
+        }
+        if signer_der != ca {
+            signer
+                .verify_signature(Some(ca_cert.public_key()))
+                .map_err(|error| {
+                    PgError::Protocol(format!(
+                        "OCSP signer is not issued by the client CA: {error}"
+                    ))
+                })?;
+        }
+    }
     let signature_oid = basic.signature_algorithm.oid.to_string();
     let algorithm_oid = <x509_parser::asn1_rs::Oid as std::str::FromStr>::from_str(&signature_oid)
         .map_err(|error| PgError::Protocol(format!("bad OCSP signature OID: {error}")))?;
@@ -1484,10 +1525,11 @@ fn copy_option_value(value: &str) -> String {
 
 fn copy_option_columns(value: &str) -> Vec<String> {
     let value = copy_option_value(value);
+    let value = value.trim().trim_start_matches('(').trim_end_matches(')');
+    if value == "*" {
+        return vec!["*".to_string()];
+    }
     value
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
         .split(',')
         .map(|column| column.trim().trim_matches('"').to_ascii_lowercase())
         .filter(|column| !column.is_empty())
@@ -1496,9 +1538,31 @@ fn copy_option_columns(value: &str) -> Vec<String> {
 
 fn copy_encoding_supported(encoding: &str) -> bool {
     matches!(
-        encoding.to_ascii_uppercase().replace('-', "").as_str(),
-        "UTF8"
+        encoding
+            .to_ascii_uppercase()
+            .replace(['-', '_'], "")
+            .as_str(),
+        "UTF8" | "LATIN1" | "ISO88591"
     )
+}
+
+fn copy_is_latin1(encoding: &str) -> bool {
+    matches!(
+        encoding
+            .to_ascii_uppercase()
+            .replace(['-', '_'], "")
+            .as_str(),
+        "LATIN1" | "ISO88591"
+    )
+}
+
+/// Decodes one COPY line using the declared encoding.
+fn decode_copy_line(bytes: &[u8], encoding: &str) -> String {
+    if copy_is_latin1(encoding) {
+        bytes.iter().map(|byte| *byte as char).collect()
+    } else {
+        String::from_utf8_lossy(bytes).to_string()
+    }
 }
 
 fn copy_option_byte(value: &str, default: u8) -> u8 {
@@ -1825,7 +1889,7 @@ fn copy_in_csv(
                     header_pending = false;
                     continue;
                 }
-                let line = String::from_utf8_lossy(&payload);
+                let line = decode_copy_line(&payload, &options.encoding);
                 let line = line.trim_end_matches(['\r', '\n']);
                 let parsed = parse_csv_line(line, options);
                 if parsed.len() != columns.len() {
@@ -1843,9 +1907,14 @@ fn copy_in_csv(
                     .enumerate()
                     .map(|(index, (quoted, field))| {
                         let column = columns[index].to_ascii_lowercase();
-                        let force_null = options.force_null.iter().any(|name| name == &column);
-                        let force_not_null =
-                            options.force_not_null.iter().any(|name| name == &column);
+                        let force_null = options
+                            .force_null
+                            .iter()
+                            .any(|name| name == "*" || name == &column);
+                        let force_not_null = options
+                            .force_not_null
+                            .iter()
+                            .any(|name| name == "*" || name == &column);
                         if force_not_null && field.is_empty() {
                             return Some(field);
                         }
@@ -2270,7 +2339,7 @@ fn copy_in(
                     header_pending = false;
                     continue;
                 }
-                let line = String::from_utf8_lossy(&payload);
+                let line = decode_copy_line(&payload, &options.encoding);
                 let line = line.trim_end_matches(['\r', '\n']);
                 let values: Vec<&str> = line.split(options.delimiter as char).collect();
                 if values.len() != columns.len() {
