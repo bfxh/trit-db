@@ -1,0 +1,31 @@
+name: bench-dashboard
+
+on:
+  pull_request:
+    paths:
+      - "docs/results/**"
+      - "tools/bench/**"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-dashboard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  consistent:
+    name: dashboard is reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Regenerate every table/chart/badge from the committed baseline and run
+      # history. If the result differs from what is checked in, the PR forgot
+      # to run `python tools/bench/dashboard.py`.
+      - run: python tools/bench/dashboard.py
+      - run: git diff --exit-code -- docs/results README.md

@@ -1,0 +1,117 @@
+{
+  "format": 1,
+  "suite": "ci",
+  "platform": "windows-x86_64",
+  "cases": [
+    {
+      "bench_id": "sql_scan",
+      "args": "sql-scan --rows 512 --rounds 3",
+      "min_ms": 0.079,
+      "median_ms": 0.092,
+      "max_ms": 0.114
+    },
+    {
+      "bench_id": "sql_point",
+      "args": "sql-point --rows 512 --lookups 64",
+      "min_ms": 0.094,
+      "median_ms": 0.101,
+      "max_ms": 0.17
+    },
+    {
+      "bench_id": "sql_group",
+      "args": "sql-group --rows 512 --groups 16 --rounds 3",
+      "min_ms": 0.118,
+      "median_ms": 0.128,
+      "max_ms": 0.14
+    },
+    {
+      "bench_id": "sql_sort",
+      "args": "sql-sort --rows 512 --limit 16 --rounds 3",
+      "min_ms": 0.202,
+      "median_ms": 0.226,
+      "max_ms": 0.23
+    },
+    {
+      "bench_id": "sql_insert",
+      "args": "sql-insert --rows 128 --rounds 2",
+      "min_ms": 3.642,
+      "median_ms": 3.677,
+      "max_ms": 3.712
+    },
+    {
+      "bench_id": "sql_update",
+      "args": "sql-update --rows 512 --cutoff 64 --rounds 2",
+      "min_ms": 2.721,
+      "median_ms": 4.645,
+      "max_ms": 6.569
+    },
+    {
+      "bench_id": "sql_delete",
+      "args": "sql-delete --rows 512 --cutoff 64 --rounds 2",
+      "min_ms": 0.877,
+      "median_ms": 1.778,
+      "max_ms": 2.679
+    },
+    {
+      "bench_id": "sql_subquery",
+      "args": "sql-subquery --rows 256 --rounds 2 --query in",
+      "min_ms": 0.313,
+      "median_ms": 0.328,
+      "max_ms": 0.343
+    },
+    {
+      "bench_id": "sql_window",
+      "args": "sql-window --rows 512 --rounds 2 --query rank",
+      "min_ms": 0.271,
+      "median_ms": 0.288,
+      "max_ms": 0.305
+    },
+    {
+      "bench_id": "sql_join",
+      "args": "sql-join --rows 512 --rounds 2 --strategy auto",
+      "min_ms": 0.367,
+      "median_ms": 0.423,
+      "max_ms": 0.479
+    },
+    {
+      "bench_id": "pstore_scan",
+      "args": "pstore-scan --pages 64 --payload 1024 --rounds 3",
+      "min_ms": 1.091,
+      "median_ms": 1.144,
+      "max_ms": 1.156
+    },
+    {
+      "bench_id": "txn_put",
+      "args": "txn-put --txns 64 --keys-per-txn 4 --rounds 1",
+      "min_ms": 175.072,
+      "median_ms": 175.072,
+      "max_ms": 175.072
+    },
+    {
+      "bench_id": "pgwire_roundtrip",
+      "args": "pgwire --rows 128 --queries 32 --rounds 2",
+      "min_ms": 0.1244,
+      "median_ms": 0.1287,
+      "max_ms": 0.133
+    },
+    {
+      "bench_id": "ann_knn",
+      "args": "ann-knn --points 1024 --dims 8 --k 10 --rounds 3",
+      "min_ms": 0.045,
+      "median_ms": 0.046,
+      "max_ms": 0.052
+    },
+    {
+      "bench_id": "graph_reach",
+      "args": "graph-reach --nodes 256 --fanout 4 --hops 6 --rounds 3",
+      "min_ms": 0.001,
+      "median_ms": 0.001,
+      "max_ms": 0.001
+    }
+  ],
+  "generated_at": "2026-11-22T04:51:00+08:00",
+  "commit": "3e90ba0",
+  "commit_full": "3e90ba0",
+  "runner": "local",
+  "label": "baseline"
+}

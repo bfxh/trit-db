@@ -20,6 +20,52 @@
 
 **还没有做**：子查询、窗口函数、全局优化器、MVCC、Parquet/Iceberg、主从复制、增量同步、带默认值的非空列迁移、schema 迁移版本历史、OCSP 在线查询与 COPY 自定义选项。不要把这个骨架当成数据库。
 
+<!-- BENCH-SUMMARY:BEGIN -->
+## 性能涨跌看板
+
+<a href="docs/results/BENCH-DASHBOARD.md"><img alt="bench summary" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbfxh%2Ftrit-db%2Fmain%2Fdocs%2Fresults%2Fbench-badge.json"></a> <a href="docs/results/BENCH-DASHBOARD.md"><img alt="bench median delta" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbfxh%2Ftrit-db%2Fmain%2Fdocs%2Fresults%2Fbench-delta-badge.json"></a>
+
+> 基线 2026-11-21 → 最新 2026-11-22（同平台 `windows-x86_64`，15 项 `ci` 套件基准，最近 5 次同 commit 的中位数；median 延迟越低越好）。
+
+![bench trend](docs/results/bench-trend.svg)
+
+**4 项更快 / 6 项持平 / 4 项更慢；各项 Δ% 的中位数 -0.9%。**
+
+> 读路径 10 项（另 1 项低于 0.01 ms）平均 -8.1%，写路径 4 项平均 +14.6%。
+
+| 一眼看 | 数值 |
+|---|---|
+| 最大提升 | `sql_subquery` -52.5%（快 2.10×） |
+| 最大退化 | `txn_put` +18.4%（慢 1.18×） |
+| 提升 / 持平 / 退化 | 4 / 6 / 4 |
+| 各项 Δ% 中位数 | -0.9% |
+
+<details>
+<summary>逐项涨跌明细（15 项，点开看每一项涨了多少 / 跌了多少）</summary>
+
+| 基准项 | 场景 | 基线 (ms) | 最新 (ms) | Δ% | 判定 |
+|---|---|---|---|---|---|
+| `sql_subquery` | IN 子查询 | 0.3220 | 0.1530 | -52.5% | 大幅提升 |
+| `sql_scan` | 全表扫描 | 0.0920 | 0.0790 | -14.1% | 提升 |
+| `sql_group` | 分组聚合 | 0.1650 | 0.1520 | -7.9% | 提升 |
+| `sql_join` | Auto hash join | 0.4310 | 0.4220 | -2.1% | 持平 |
+| `sql_sort` | 排序 + LIMIT | 0.2260 | 0.2220 | -1.8% | 持平 |
+| `sql_window` | 窗口函数 RANK | 0.2910 | 0.2980 | +2.4% | 持平 |
+| `sql_point` | 主键点查 | 0.1010 | 0.1040 | +3.0% | 持平 |
+| `sql_delete` | 条件删除 | 3.278 | 3.655 | +11.5% | 退化 |
+| `sql_update` | 条件更新 | 4.034 | 4.574 | +13.4% | 退化 |
+| `sql_insert` | 批量插入 | 2.694 | 3.107 | +15.3% | 退化 |
+| `pstore_scan` | 页存储扫描 | 1.134 | 1.063 | -6.3% | 提升 |
+| `txn_put` | 事务写入 | 195.8 | 231.7 | +18.4% | 退化 |
+| `pgwire_roundtrip` | PG 协议往返 | 0.1310 | 0.1310 | 0.0% | 持平 |
+| `ann_knn` | 三值 k-NN | 0.0490 | 0.0480 | -2.0% | 持平 |
+| `graph_reach` | 图可达 | 0.0010 | 0.0010 | — | 分辨率不足 |
+
+</details>
+
+分层汇总、每次运行的历史、逐项趋势与口径见 [`docs/results/BENCH-DASHBOARD.md`](docs/results/BENCH-DASHBOARD.md)；原始数据在 [`docs/results/bench-runs/`](docs/results/bench-runs/)。
+<!-- BENCH-SUMMARY:END -->
+
 ## 发布
 
 M0 首个版本 **v0.0.1**：<https://github.com/bfxh/trit-db/releases/tag/v0.0.1>。提供 Linux x86_64、Windows x86_64、macOS arm64 三个平台的 `tritdb` / `tritdb-bench` 压缩包；由 `v*` tag 触发的 GitHub Actions release 工作流构建和发布。
@@ -113,6 +159,7 @@ cargo run -p tritdb-bench --release -- sql-exec --rows 1024 --rounds 5
 - `ci.yml`：`fmt` / `clippy` / 三平台 `test` / Ubuntu+Windows MSRV 1.88 / `sql-plan`+`sql-join`+`sql-exec` bench smoke / 三平台 Python 交叉校验（向量 + CLI + SQLite SQL 对拍）/ coverage / docs。
 - `stress.yml`：每天 04:00 UTC 跑 release 模式压力测试与 crash matrix。
 - `release.yml`：`v*` tag 构建 Linux x86_64、Windows x86_64、macOS arm64 的 `tritdb`/`tritdb-bench`，创建 GitHub Release。
+- `bench.yml`：PR 上重新生成性能看板，校验 README 摘要、`docs/results/BENCH-DASHBOARD.md`、SVG 与徽章同数据一致（不跑微基准，避免共享 runner 的绝对延迟混入本机基线）。
 
 公开仓：[`bfxh/trit-db`](https://github.com/bfxh/trit-db)
 
