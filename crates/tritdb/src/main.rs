@@ -2167,7 +2167,7 @@ fn crosscheck_respond(name: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
 
 fn crosscheck_txn(payload: &[u8]) -> Result<Vec<u8>, String> {
     let entries = decode_kv_pairs(payload)?;
-    let dir = crosscheck_dir("txn");
+    let dir = crosscheck_dir("txn")?;
     let wal = dir.join("store.wal");
     let result = (|| -> Result<Vec<u8>, String> {
         let store = TxnStore::open(&wal).map_err(|error| error.to_string())?;
@@ -2193,7 +2193,7 @@ fn crosscheck_txn(payload: &[u8]) -> Result<Vec<u8>, String> {
 
 fn crosscheck_pstore(payload: &[u8]) -> Result<Vec<u8>, String> {
     let request = Page::parse_slice(payload).map_err(|error| error.to_string())?;
-    let dir = crosscheck_dir("pstore");
+    let dir = crosscheck_dir("pstore")?;
     let data = dir.join("pages.dat");
     let wal = dir.join("pages.wal");
     let result = (|| -> Result<Vec<u8>, String> {
@@ -2218,6 +2218,15 @@ fn crosscheck_pstore(payload: &[u8]) -> Result<Vec<u8>, String> {
 fn decode_kv_pairs(payload: &[u8]) -> Result<Vec<KvPair>, String> {
     let mut offset = 0;
     let count = read_u32(payload, &mut offset)? as usize;
+    // Every entry carries two 4-byte lengths, so a count that cannot fit in
+    // the payload must be rejected before reserving anything (4 bytes used to
+    // be able to request a 32 GiB Vec).
+    if count > payload.len() / 8 {
+        return Err(format!(
+            "crosscheck: {count} kv entries do not fit {} payload bytes",
+            payload.len()
+        ));
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let key_len = read_u32(payload, &mut offset)? as usize;
@@ -2267,7 +2276,7 @@ fn read_bytes(bytes: &[u8], offset: &mut usize, len: usize) -> Result<Vec<u8>, S
     Ok(value)
 }
 
-fn crosscheck_dir(prefix: &str) -> PathBuf {
+fn crosscheck_dir(prefix: &str) -> Result<PathBuf, String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -2275,6 +2284,31 @@ fn crosscheck_dir(prefix: &str) -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create crosscheck temp dir");
-    dir
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("crosscheck: create {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_requests_reject_impossible_entry_counts() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+        let error = decode_kv_pairs(&payload).expect_err("huge count");
+        assert!(error.contains("do not fit"), "{error}");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(b'k');
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(b'v');
+        assert_eq!(
+            decode_kv_pairs(&payload).expect("one entry"),
+            vec![(b"k".to_vec(), b"v".to_vec())]
+        );
+    }
 }

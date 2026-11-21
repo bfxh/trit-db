@@ -139,3 +139,68 @@ fn random_page_store_files_never_panic() {
         let _ = tritdb_store::PageStore::open(&data, &wal);
     }
 }
+
+#[test]
+fn random_graph_payloads_never_panic() {
+    let mut rng = Rng::new(0xF022_0007);
+    for _ in 0..2000 {
+        let len = (rng.below(300) + 1) as usize;
+        let mut bytes = random_bytes(&mut rng, len);
+        let _ = tritdb_exec::graph::AnnotatedGraph::decode(&bytes);
+        let _ = tritdb_exec::graph::decode_points(&bytes);
+        if bytes.len() >= 5 {
+            // Force each magic so the body parsers are reached too.
+            bytes[0..4].copy_from_slice(b"TRGR");
+            let _ = tritdb_exec::graph::AnnotatedGraph::decode(&bytes);
+            bytes[0..4].copy_from_slice(b"TRPN");
+            let _ = tritdb_exec::graph::decode_points(&bytes);
+        }
+    }
+}
+
+#[test]
+fn random_sql_text_never_panics() {
+    let fragments = [
+        "SELECT ",
+        " FROM ",
+        " WHERE ",
+        " GROUP BY ",
+        " HAVING ",
+        " ORDER BY ",
+        " LIMIT ",
+        "(",
+        ")",
+        ",",
+        "1",
+        "'x'",
+        "IN",
+        "LIKE",
+        "%",
+        " ASOF JOIN ",
+        " ON ",
+        " WITH ",
+        "UNION",
+        "UPDATE",
+        "SET",
+        "INSERT",
+        "VALUES",
+        "CREATE TABLE",
+        "CHECK",
+        "COUNT(*)",
+        "$1",
+        "--",
+        "/*",
+        "*/",
+        "\"q\"",
+        "0x10",
+        "1e999",
+    ];
+    let mut rng = Rng::new(0xF022_0008);
+    for _ in 0..2000 {
+        let mut sql = String::new();
+        for _ in 0..=(rng.below(24)) {
+            sql.push_str(fragments[rng.below(fragments.len() as u32) as usize]);
+        }
+        let _ = tritdb_sql::parse_script(&sql);
+    }
+}

@@ -3723,6 +3723,32 @@ mod security_tests {
     use super::*;
 
     #[test]
+    fn random_csv_lines_never_panic() {
+        let options = CopyOptions::defaults(CopyFormat::Csv);
+        let mut state = 0x1234_5678u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let len = (next() % 200) as usize;
+            let line: String = (0..len)
+                .map(|_| match next() % 6 {
+                    0 => '"',
+                    1 => ',',
+                    2 => '\\',
+                    3 => '\n',
+                    4 => 'x',
+                    _ => '中',
+                })
+                .collect();
+            let _ = parse_csv_line(&line, &options);
+        }
+    }
+
+    #[test]
     fn copy_decoding_rejects_incomplete_sequences() {
         assert!(decode_copy_line(&[0x41, 0x00, 0x42], "UTF16LE").is_err());
         assert!(decode_copy_line(&[0x00, 0xD8], "UTF16LE").is_err());
