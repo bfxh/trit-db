@@ -50,12 +50,21 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
 性能说明：批量路径复用 `r3` 打包（≈1.6 bit/trit）；这一刀不做严格的计时断言（避免 CI flaky），
 规模测试保证算法是 O(n log m) 而不是 O(n·m)。
 
-## 5. 还没做
+## 5. 接进 SQL（已完成 SELECT WHERE）
 
-- **接进 SQL**：`WHERE` 仍走行式 `eval`；下一步在 `tritdb-sql` 里按「注解列 + 无聚合」的
-  WHERE 分支切换到 `eval_predicate` + `filter_indices`；
-- **SQL 语法**：还没有 `ASOF JOIN` 关键字与 binder（`asof_join` 目前是库 API）；
-- **三值列存块**：`TritVec` 还没作为表的物理列格式（目前是内存向量）。
+`execute_select_inner` 现在先尝试 `batch_filter_indices`：
+
+- 只接受 `AND`/`OR`/`NOT` 与 `LOGIC K3` / `LOGIC BELNAP` 列；比较、算术、聚合、子查询回退行式；
+- Belnap 的 `BOTH`/`NEITHER` 与 `NULL` 一律映射为 `UNKNOWN`（不通过 `WHERE`，与 `truth_of` 一致）；
+- debug 构建每次命中都会再用行式 `passes_filter` 算一遍并 `debug_assert_eq!` 对拍；
+- 集成测试 `batch_where_matches_row_path_on_annotation_columns` 覆盖 K3/Belnap 的 AND/OR/NOT
+  组合与混合谓词回退。
+
+### 5.1 还没做
+
+- **ASOF JOIN 语法**：还没有 `ASOF JOIN` 关键字与 binder（`asof_join` 目前是库 API）；
+- **三值列存块**：`TritVec` 还没作为表的物理列格式（目前是内存向量）；
+- **UPDATE/DELETE 的 WHERE**：目前只接了 SELECT（DELETE 的过滤可复用同一函数）。
 
 ## 6. 验收
 

@@ -3289,6 +3289,49 @@ fn cross_join_handles_empty_inputs_and_validation() {
 }
 
 #[test]
+fn batch_where_matches_row_path_on_annotation_columns() {
+    let dir = TempDir::new("sql-batch-where");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE t (id INT NOT NULL, a LOGIC K3, b LOGIC BELNAP);              INSERT INTO t VALUES              (1, TRUE, TRUE),              (2, FALSE, FALSE),              (3, NULL, BOTH),              (4, TRUE, NEITHER),              (5, TRUE, FALSE);",
+        )
+        .expect("seed");
+
+    let ids = |engine: &mut SqlEngine, sql: &str| -> Vec<i64> {
+        let results = engine.execute_script(sql).expect("query");
+        as_rows(&results[0])
+            .1
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int(id) => id,
+                ref other => panic!("expected int id, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // Pure K3 column: only TRUE survives (NULL is UNKNOWN).
+    assert_eq!(ids(&mut engine, "SELECT id FROM t WHERE a;"), vec![1, 4, 5]);
+    assert_eq!(ids(&mut engine, "SELECT id FROM t WHERE NOT a;"), vec![2]);
+    // Belnap BOTH/NEITHER are UNKNOWN in WHERE.
+    assert_eq!(ids(&mut engine, "SELECT id FROM t WHERE a AND b;"), vec![1]);
+    assert_eq!(
+        ids(&mut engine, "SELECT id FROM t WHERE a OR b;"),
+        vec![1, 4, 5]
+    );
+    assert_eq!(
+        ids(&mut engine, "SELECT id FROM t WHERE a AND (NOT b OR a);"),
+        vec![1, 4, 5]
+    );
+    // A non-annotation comparison keeps the row-wise path.
+    assert_eq!(
+        ids(&mut engine, "SELECT id FROM t WHERE a AND id > 1;"),
+        vec![4, 5]
+    );
+}
+
+#[test]
 fn join_projection_prunes_unused_source_columns() {
     let dir = TempDir::new("sql-projection");
     let db = dir.join("sql.db");

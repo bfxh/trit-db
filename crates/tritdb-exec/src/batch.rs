@@ -7,7 +7,8 @@
 
 use std::fmt;
 
-use tritdb_tritvec::{TritVec, TritVecError, K3};
+use tritdb_tritvec::TritVecError;
+pub use tritdb_tritvec::{TritVec, K3};
 
 /// Errors from batch evaluation and as-of joins.
 #[derive(Clone, Debug, PartialEq, Eq)]

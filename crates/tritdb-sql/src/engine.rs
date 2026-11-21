@@ -5,8 +5,10 @@ use std::str;
 use std::time::Instant;
 
 use tritdb_exec::{
-    ann::B4, certainty_of_value, compare_values, eval, truth_of, truth_projection, truth_text,
-    BinaryOp, Column, DataType, ExecError, Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
+    ann::B4,
+    batch::{eval_predicate, filter_indices, TriPredicate, TritVec, K3},
+    certainty_of_value, compare_values, eval, truth_of, truth_projection, truth_text, BinaryOp,
+    Column, DataType, ExecError, Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
 };
 use tritdb_txn::TxnStore;
 
@@ -4854,6 +4856,87 @@ fn passes_filter(filter: Option<&ExecExpr>, schema: &Schema, row: &Row) -> Resul
     Ok(truth_of(&eval(filter, schema, row)?)? == TruthValue::True)
 }
 
+/// Maps an annotation value to K3 for the batch path.
+///
+/// `BOTH`/`NEITHER` and `NULL` are `UNKNOWN`: they do not pass `WHERE`.
+fn k3_of_value(value: &Value) -> K3 {
+    match value {
+        Value::Bool(true) | Value::Logic(B4::True) => K3::True,
+        Value::Bool(false) | Value::Logic(B4::False) => K3::False,
+        _ => K3::Unknown,
+    }
+}
+
+/// Builds a batch predicate for `expr`, or `None` when it must stay row-wise.
+///
+/// Only `AND`/`OR`/`NOT` over `LOGIC K3` / `LOGIC BELNAP` columns qualify;
+/// comparisons, arithmetic, aggregates and subqueries do not.
+fn build_tri_predicate(
+    expr: &ExecExpr,
+    schema: &Schema,
+    atoms: &mut Vec<usize>,
+) -> Option<TriPredicate> {
+    match expr {
+        ExecExpr::Column(index) => {
+            let column = schema.columns.get(*index)?;
+            if !matches!(column.data_type, DataType::Logic | DataType::Belnap) {
+                return None;
+            }
+            let position = match atoms.iter().position(|atom| atom == index) {
+                Some(position) => position,
+                None => {
+                    atoms.push(*index);
+                    atoms.len() - 1
+                }
+            };
+            Some(TriPredicate::Atom(position))
+        }
+        ExecExpr::Not(inner) => Some(TriPredicate::Not(Box::new(build_tri_predicate(
+            inner, schema, atoms,
+        )?))),
+        ExecExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let left = build_tri_predicate(left, schema, atoms)?;
+            let right = build_tri_predicate(right, schema, atoms)?;
+            Some(TriPredicate::And(vec![left, right]))
+        }
+        ExecExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let left = build_tri_predicate(left, schema, atoms)?;
+            let right = build_tri_predicate(right, schema, atoms)?;
+            Some(TriPredicate::Or(vec![left, right]))
+        }
+        _ => None,
+    }
+}
+
+/// Vectorized `WHERE` for pure three-valued predicates over annotation columns.
+///
+/// Returns the surviving row indices, or `None` when the predicate needs the
+/// row-at-a-time path.
+fn batch_filter_indices(filter: &ExecExpr, schema: &Schema, rows: &[Row]) -> Option<Vec<usize>> {
+    let mut atoms = Vec::new();
+    let predicate = build_tri_predicate(filter, schema, &mut atoms)?;
+    if atoms.is_empty() {
+        return None;
+    }
+    let columns: Vec<TritVec> = atoms
+        .iter()
+        .map(|index| {
+            let values: Vec<K3> = rows.iter().map(|row| k3_of_value(&row[*index])).collect();
+            TritVec::new(&values)
+        })
+        .collect();
+    let truth = eval_predicate(&predicate, &columns).ok()?;
+    Some(filter_indices(&truth))
+}
+
 fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlError> {
     execute_select_inner(table, plan, None)
 }
@@ -4864,17 +4947,45 @@ fn execute_select_inner(
     mut stats: Option<&mut ExecutionStats>,
 ) -> Result<QueryResult, SqlError> {
     let filter_start = stats.is_some().then(Instant::now);
-    let filtered: Vec<Row> = table
-        .rows
-        .iter()
-        .filter_map(
-            |row| match passes_filter(plan.filter.as_ref(), &table.schema, row) {
-                Ok(true) => Some(Ok(row.clone())),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
+    let batch_indices = plan
+        .filter
+        .as_ref()
+        .and_then(|filter| batch_filter_indices(filter, &table.schema, &table.rows));
+    let filtered: Vec<Row> = match &batch_indices {
+        Some(indices) => indices
+            .iter()
+            .map(|index| table.rows[*index].clone())
+            .collect(),
+        None => table
+            .rows
+            .iter()
+            .filter_map(
+                |row| match passes_filter(plan.filter.as_ref(), &table.schema, row) {
+                    Ok(true) => Some(Ok(row.clone())),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    // The batch path is opt-in; in debug builds it is checked against the
+    // row-at-a-time implementation on every query that takes it.
+    #[cfg(debug_assertions)]
+    if let Some(indices) = &batch_indices {
+        let scalar = table
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                match passes_filter(plan.filter.as_ref(), &table.schema, row) {
+                    Ok(true) => Some(Ok(index)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        debug_assert_eq!(indices, &scalar, "batch WHERE diverged from the row path");
+    }
     if let (Some(stats), Some(start)) = (stats.as_deref_mut(), filter_start) {
         stats.filter_rows = filtered.len();
         stats.filter_ms = start.elapsed().as_secs_f64() * 1000.0;
