@@ -1273,3 +1273,75 @@ fn window_functions_row_number_rank_dense_rank() {
     assert!(!output.status.success(), "window + GROUP BY must fail");
     assert!(stderr(&output).contains("window functions with GROUP BY"));
 }
+
+#[test]
+fn aggregate_window_functions() {
+    let dir = TempDir::new("sql-window-agg");
+    let db = dir.join("agg.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, dept TEXT NOT NULL, score INT NOT NULL); \
+         INSERT INTO t VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',15);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, SUM(score) OVER (PARTITION BY dept) AS total FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\t30", "2\t30", "3\t20", "4\t20"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, COUNT(*) OVER (PARTITION BY dept) AS n FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\t2", "2\t2", "3\t2", "4\t2"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, SUM(score) OVER (PARTITION BY dept ORDER BY id) AS running \
+         FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\t10", "2\t30", "3\t5", "4\t20"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, AVG(score) OVER (PARTITION BY dept) AS a, \
+         MIN(score) OVER (PARTITION BY dept) AS mn, \
+         MAX(score) OVER (PARTITION BY dept) AS mx FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t15\t10\t20"), "out: {text}");
+    assert!(text.contains("2\t15\t10\t20"), "out: {text}");
+    assert!(text.contains("3\t10\t5\t15"), "out: {text}");
+    assert!(text.contains("4\t10\t5\t15"), "out: {text}");
+}
