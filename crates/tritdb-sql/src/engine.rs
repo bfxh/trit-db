@@ -60,6 +60,141 @@ const MAX_RECURSIVE_ITERATIONS: usize = 1000;
 /// Hard cap on the materialized size of one recursive CTE.
 const MAX_RECURSIVE_ROWS: usize = 100_000;
 
+fn expr_has_outer_subquery(expr: &Expr, outer: &str) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Column { .. } => false,
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+            expr_has_outer_subquery(expr, outer)
+        }
+        Expr::InList { expr, values, .. } => {
+            expr_has_outer_subquery(expr, outer)
+                || values
+                    .iter()
+                    .any(|value| expr_has_outer_subquery(value, outer))
+        }
+        Expr::InSubquery { expr, query, .. } => {
+            expr_has_outer_subquery(expr, outer) || query_has_outer_ref(query, outer)
+        }
+        Expr::ScalarSubquery { query } => query_has_outer_ref(query, outer),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_outer_subquery(expr, outer)
+                || expr_has_outer_subquery(low, outer)
+                || expr_has_outer_subquery(high, outer)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_outer_subquery(expr, outer) || expr_has_outer_subquery(pattern, outer)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_has_outer_subquery(expr, outer))
+                || branches.iter().any(|(when, then)| {
+                    expr_has_outer_subquery(when, outer) || expr_has_outer_subquery(then, outer)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| expr_has_outer_subquery(expr, outer))
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_has_outer_subquery(left, outer) || expr_has_outer_subquery(right, outer)
+        }
+        Expr::Aggregate { input, .. } => input
+            .as_deref()
+            .is_some_and(|expr| expr_has_outer_subquery(expr, outer)),
+    }
+}
+
+fn query_has_outer_ref(query: &Query, outer: &str) -> bool {
+    match query {
+        Query::Select(select) => select_has_outer_ref(select, outer),
+        Query::With(_) => false,
+    }
+}
+
+fn select_has_outer_ref(select: &Select, outer: &str) -> bool {
+    select.items.iter().any(|item| match item {
+        SelectItem::Wildcard => false,
+        SelectItem::Expr { expr, .. } => expr_mentions_outer(expr, outer),
+    }) || select
+        .filter
+        .as_ref()
+        .is_some_and(|expr| expr_mentions_outer(expr, outer))
+        || select.joins.iter().any(|join| match &join.condition {
+            JoinCondition::On(expr) => expr_mentions_outer(expr, outer),
+            _ => false,
+        })
+        || select
+            .group_by
+            .iter()
+            .any(|expr| expr_mentions_outer(expr, outer))
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|expr| expr_mentions_outer(expr, outer))
+        || select
+            .order_by
+            .iter()
+            .any(|order| expr_mentions_outer(&order.expr, outer))
+}
+
+fn expr_mentions_outer(expr: &Expr, outer: &str) -> bool {
+    match expr {
+        Expr::Column {
+            table: Some(qualifier),
+            ..
+        } => qualifier == outer,
+        Expr::Column { table: None, .. } | Expr::Literal(_) => false,
+        Expr::InSubquery { expr, query, .. } => {
+            expr_mentions_outer(expr, outer) || query_has_outer_ref(query, outer)
+        }
+        Expr::ScalarSubquery { query } => query_has_outer_ref(query, outer),
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+            expr_mentions_outer(expr, outer)
+        }
+        Expr::InList { expr, values, .. } => {
+            expr_mentions_outer(expr, outer)
+                || values.iter().any(|value| expr_mentions_outer(value, outer))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_mentions_outer(expr, outer)
+                || expr_mentions_outer(low, outer)
+                || expr_mentions_outer(high, outer)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_mentions_outer(expr, outer) || expr_mentions_outer(pattern, outer)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_mentions_outer(expr, outer))
+                || branches.iter().any(|(when, then)| {
+                    expr_mentions_outer(when, outer) || expr_mentions_outer(then, outer)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| expr_mentions_outer(expr, outer))
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_mentions_outer(left, outer) || expr_mentions_outer(right, outer)
+        }
+        Expr::Aggregate { input, .. } => input
+            .as_deref()
+            .is_some_and(|expr| expr_mentions_outer(expr, outer)),
+    }
+}
+
 fn rows_of(result: QueryResult) -> Result<(Vec<String>, Vec<Row>), SqlError> {
     match result {
         QueryResult::Rows { columns, rows } => Ok((columns, rows)),
@@ -301,7 +436,7 @@ impl SqlEngine {
                 let mut rows = rows.clone();
                 for row in &mut rows {
                     for value in row {
-                        self.materialize_expr(value)?;
+                        self.materialize_expr(value, "")?;
                     }
                 }
                 self.insert(table, columns.as_deref(), &rows, select.as_deref())
@@ -337,7 +472,7 @@ impl SqlEngine {
             Statement::Delete { table, filter } => {
                 let mut filter = filter.clone();
                 if let Some(filter) = &mut filter {
-                    self.materialize_expr(filter)?;
+                    self.materialize_expr(filter, table)?;
                 }
                 self.delete(table, filter.as_ref())
             }
@@ -348,11 +483,11 @@ impl SqlEngine {
             } => {
                 let mut assignments = assignments.clone();
                 for assignment in &mut assignments {
-                    self.materialize_expr(&mut assignment.value)?;
+                    self.materialize_expr(&mut assignment.value, table)?;
                 }
                 let mut filter = filter.clone();
                 if let Some(filter) = &mut filter {
-                    self.materialize_expr(filter)?;
+                    self.materialize_expr(filter, table)?;
                 }
                 self.update(table, &assignments, filter.as_ref())
             }
@@ -725,45 +860,53 @@ impl SqlEngine {
     /// Only uncorrelated subqueries are supported: a subquery that references
     /// an outer column fails to resolve and reports `UnknownColumn`.
     fn materialize_subqueries(&mut self, select: &mut Select) -> Result<(), SqlError> {
+        let outer = select
+            .table_alias
+            .as_deref()
+            .unwrap_or(&select.table)
+            .to_string();
         for item in &mut select.items {
             if let SelectItem::Expr { expr, .. } = item {
-                self.materialize_expr(expr)?;
+                self.materialize_expr(expr, &outer)?;
             }
         }
         for join in &mut select.joins {
             if let JoinCondition::On(expr) = &mut join.condition {
-                self.materialize_expr(expr)?;
+                self.materialize_expr(expr, &outer)?;
             }
         }
         if let Some(filter) = &mut select.filter {
-            self.materialize_expr(filter)?;
+            self.materialize_expr(filter, &outer)?;
         }
         for expr in &mut select.group_by {
-            self.materialize_expr(expr)?;
+            self.materialize_expr(expr, &outer)?;
         }
         if let Some(having) = &mut select.having {
-            self.materialize_expr(having)?;
+            self.materialize_expr(having, &outer)?;
         }
         for order in &mut select.order_by {
-            self.materialize_expr(&mut order.expr)?;
+            self.materialize_expr(&mut order.expr, &outer)?;
         }
         Ok(())
     }
 
-    fn materialize_expr(&mut self, expr: &mut Expr) -> Result<(), SqlError> {
+    fn materialize_expr(&mut self, expr: &mut Expr, outer: &str) -> Result<(), SqlError> {
         match expr {
             Expr::Literal(_) | Expr::Column { .. } => Ok(()),
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
-                self.materialize_expr(expr)
+                self.materialize_expr(expr, outer)
             }
             Expr::InList { expr, values, .. } => {
-                self.materialize_expr(expr)?;
+                self.materialize_expr(expr, outer)?;
                 for value in values {
-                    self.materialize_expr(value)?;
+                    self.materialize_expr(value, outer)?;
                 }
                 Ok(())
             }
             Expr::InSubquery { query, negated, .. } => {
+                if query_has_outer_ref(query, outer) {
+                    return Ok(());
+                }
                 let values = self.evaluate_subquery_column(query)?;
                 let negated = *negated;
                 let probe = match std::mem::replace(expr, Expr::Literal(Value::Null)) {
@@ -771,7 +914,7 @@ impl SqlEngine {
                     _ => unreachable!("replaced expression was not IN subquery"),
                 };
                 let mut probe = *probe;
-                self.materialize_expr(&mut probe)?;
+                self.materialize_expr(&mut probe, outer)?;
                 *expr = Expr::InList {
                     expr: Box::new(probe),
                     values,
@@ -780,6 +923,9 @@ impl SqlEngine {
                 Ok(())
             }
             Expr::ScalarSubquery { query } => {
+                if query_has_outer_ref(query, outer) {
+                    return Ok(());
+                }
                 let value = self.evaluate_scalar_subquery(query)?;
                 *expr = Expr::Literal(value);
                 Ok(())
@@ -787,13 +933,13 @@ impl SqlEngine {
             Expr::Between {
                 expr, low, high, ..
             } => {
-                self.materialize_expr(expr)?;
-                self.materialize_expr(low)?;
-                self.materialize_expr(high)
+                self.materialize_expr(expr, outer)?;
+                self.materialize_expr(low, outer)?;
+                self.materialize_expr(high, outer)
             }
             Expr::Like { expr, pattern, .. } => {
-                self.materialize_expr(expr)?;
-                self.materialize_expr(pattern)
+                self.materialize_expr(expr, outer)?;
+                self.materialize_expr(pattern, outer)
             }
             Expr::Case {
                 operand,
@@ -801,24 +947,24 @@ impl SqlEngine {
                 else_expr,
             } => {
                 if let Some(operand) = operand {
-                    self.materialize_expr(operand)?;
+                    self.materialize_expr(operand, outer)?;
                 }
                 for (when, then) in branches {
-                    self.materialize_expr(when)?;
-                    self.materialize_expr(then)?;
+                    self.materialize_expr(when, outer)?;
+                    self.materialize_expr(then, outer)?;
                 }
                 if let Some(else_expr) = else_expr {
-                    self.materialize_expr(else_expr)?;
+                    self.materialize_expr(else_expr, outer)?;
                 }
                 Ok(())
             }
             Expr::Binary { left, right, .. } => {
-                self.materialize_expr(left)?;
-                self.materialize_expr(right)
+                self.materialize_expr(left, outer)?;
+                self.materialize_expr(right, outer)
             }
             Expr::Aggregate { input, .. } => {
                 if let Some(input) = input {
-                    self.materialize_expr(input)?;
+                    self.materialize_expr(input, outer)?;
                 }
                 Ok(())
             }
@@ -1014,8 +1160,18 @@ impl SqlEngine {
         Ok(table)
     }
 
-    fn select(&self, select: &Select) -> Result<QueryResult, SqlError> {
+    fn select(&mut self, select: &Select) -> Result<QueryResult, SqlError> {
         let folded = fold_select(select);
+        if let Some(filter) = &folded.filter {
+            let outer = folded
+                .table_alias
+                .as_deref()
+                .unwrap_or(&folded.table)
+                .to_string();
+            if expr_has_outer_subquery(filter, &outer) {
+                return self.select_with_correlated_filter(select, &folded, &outer);
+            }
+        }
         let pushdown = plan_filter_pushdown(&folded);
         let projection = self.plan_scan_projection(&folded)?;
         let table = self.build_from(&folded, &pushdown, &projection)?;
@@ -1025,6 +1181,257 @@ impl SqlEngine {
         match &select.under_repair {
             Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
+        }
+    }
+
+    /// Evaluates a `WHERE` filter that contains correlated subqueries.
+    ///
+    /// Every outer row is substituted into the subquery's outer-column
+    /// references, the subquery runs once for that row, and the resulting
+    /// filter is evaluated. The surviving rows then go through the ordinary
+    /// projection/group/sort path.
+    fn select_with_correlated_filter(
+        &mut self,
+        original: &Select,
+        folded: &Select,
+        outer: &str,
+    ) -> Result<QueryResult, SqlError> {
+        let pushdown = plan_filter_pushdown(folded);
+        let projection = self.plan_scan_projection(folded)?;
+        let mut table = self.build_from(folded, &pushdown, &projection)?;
+        let filter = folded
+            .filter
+            .clone()
+            .expect("correlated path requires a filter");
+        let mut kept = Vec::with_capacity(table.rows.len());
+        for row in table.rows.drain(..) {
+            let mut row_filter = filter.clone();
+            self.bind_correlated_expr(&mut row_filter, &table.schema, &row, outer)?;
+            let bound = bind_expr(&row_filter, &table.schema)?;
+            if truth_of(&eval(&bound, &table.schema, &row)?)? == TruthValue::True {
+                kept.push(row);
+            }
+        }
+        table.rows = kept;
+        let filtered_select = select_with_filter(folded, None);
+        let plan = bind_select(&filtered_select, &table)?;
+        let result = execute_select(&table, &plan)?;
+        match &original.under_repair {
+            Some(keys) => filter_under_repair(result, keys),
+            None => Ok(result),
+        }
+    }
+
+    /// Replaces correlated subqueries in one row's filter with their values.
+    fn bind_correlated_expr(
+        &mut self,
+        expr: &mut Expr,
+        outer_schema: &Schema,
+        outer_row: &Row,
+        outer: &str,
+    ) -> Result<(), SqlError> {
+        match expr {
+            Expr::Literal(_) | Expr::Column { .. } => Ok(()),
+            Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+                self.bind_correlated_expr(expr, outer_schema, outer_row, outer)
+            }
+            Expr::InList { expr, values, .. } => {
+                self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
+                for value in values {
+                    self.bind_correlated_expr(value, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+            Expr::InSubquery { query, negated, .. } => {
+                let mut query = query.as_ref().clone();
+                self.substitute_outer(&mut query, outer_schema, outer_row, outer)?;
+                let values = self.evaluate_subquery_column(&query)?;
+                let negated = *negated;
+                let probe = match std::mem::replace(expr, Expr::Literal(Value::Null)) {
+                    Expr::InSubquery { expr: probe, .. } => probe,
+                    _ => unreachable!("replaced expression was not IN subquery"),
+                };
+                let mut probe = *probe;
+                self.bind_correlated_expr(&mut probe, outer_schema, outer_row, outer)?;
+                *expr = Expr::InList {
+                    expr: Box::new(probe),
+                    values,
+                    negated,
+                };
+                Ok(())
+            }
+            Expr::ScalarSubquery { query } => {
+                let mut query = query.as_ref().clone();
+                self.substitute_outer(&mut query, outer_schema, outer_row, outer)?;
+                let value = self.evaluate_scalar_subquery(&query)?;
+                *expr = Expr::Literal(value);
+                Ok(())
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
+                self.bind_correlated_expr(low, outer_schema, outer_row, outer)?;
+                self.bind_correlated_expr(high, outer_schema, outer_row, outer)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
+                self.bind_correlated_expr(pattern, outer_schema, outer_row, outer)
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    self.bind_correlated_expr(operand, outer_schema, outer_row, outer)?;
+                }
+                for (when, then) in branches {
+                    self.bind_correlated_expr(when, outer_schema, outer_row, outer)?;
+                    self.bind_correlated_expr(then, outer_schema, outer_row, outer)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.bind_correlated_expr(else_expr, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+            Expr::Binary { left, right, .. } => {
+                self.bind_correlated_expr(left, outer_schema, outer_row, outer)?;
+                self.bind_correlated_expr(right, outer_schema, outer_row, outer)
+            }
+            Expr::Aggregate { input, .. } => {
+                if let Some(input) = input {
+                    self.bind_correlated_expr(input, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn substitute_outer(
+        &mut self,
+        query: &mut Query,
+        outer_schema: &Schema,
+        outer_row: &Row,
+        outer: &str,
+    ) -> Result<(), SqlError> {
+        match query {
+            Query::Select(select) => {
+                self.substitute_outer_select(select, outer_schema, outer_row, outer)
+            }
+            Query::With(_) => Err(SqlError::Unsupported(
+                "correlated subquery with a nested WITH is not supported".to_string(),
+            )),
+        }
+    }
+
+    fn substitute_outer_select(
+        &mut self,
+        select: &mut Select,
+        outer_schema: &Schema,
+        outer_row: &Row,
+        outer: &str,
+    ) -> Result<(), SqlError> {
+        for item in &mut select.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+            }
+        }
+        for join in &mut select.joins {
+            if let JoinCondition::On(expr) = &mut join.condition {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+            }
+        }
+        if let Some(filter) = &mut select.filter {
+            self.substitute_outer_expr(filter, outer_schema, outer_row, outer)?;
+        }
+        for expr in &mut select.group_by {
+            self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+        }
+        if let Some(having) = &mut select.having {
+            self.substitute_outer_expr(having, outer_schema, outer_row, outer)?;
+        }
+        for order in &mut select.order_by {
+            self.substitute_outer_expr(&mut order.expr, outer_schema, outer_row, outer)?;
+        }
+        Ok(())
+    }
+
+    fn substitute_outer_expr(
+        &mut self,
+        expr: &mut Expr,
+        outer_schema: &Schema,
+        outer_row: &Row,
+        outer: &str,
+    ) -> Result<(), SqlError> {
+        match expr {
+            Expr::Column {
+                table: Some(qualifier),
+                name,
+            } => {
+                if qualifier.as_str() == outer {
+                    let qualified = format!("{outer}.{name}");
+                    let index = outer_schema
+                        .index_of(name)
+                        .or_else(|| outer_schema.index_of(&qualified))
+                        .ok_or_else(|| SqlError::UnknownColumn(name.clone()))?;
+                    let value = outer_row[index].clone();
+                    *expr = Expr::Literal(value);
+                }
+                Ok(())
+            }
+            Expr::Literal(_) | Expr::Column { table: None, .. } => Ok(()),
+            Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)
+            }
+            Expr::InList { expr, values, .. } => {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+                for value in values {
+                    self.substitute_outer_expr(value, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+            Expr::InSubquery { query, .. } | Expr::ScalarSubquery { query } => {
+                self.substitute_outer(query, outer_schema, outer_row, outer)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+                self.substitute_outer_expr(low, outer_schema, outer_row, outer)?;
+                self.substitute_outer_expr(high, outer_schema, outer_row, outer)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+                self.substitute_outer_expr(pattern, outer_schema, outer_row, outer)
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    self.substitute_outer_expr(operand, outer_schema, outer_row, outer)?;
+                }
+                for (when, then) in branches {
+                    self.substitute_outer_expr(when, outer_schema, outer_row, outer)?;
+                    self.substitute_outer_expr(then, outer_schema, outer_row, outer)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.substitute_outer_expr(else_expr, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+            Expr::Binary { left, right, .. } => {
+                self.substitute_outer_expr(left, outer_schema, outer_row, outer)?;
+                self.substitute_outer_expr(right, outer_schema, outer_row, outer)
+            }
+            Expr::Aggregate { input, .. } => {
+                if let Some(input) = input {
+                    self.substitute_outer_expr(input, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2030,8 +2437,7 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
         Expr::Binary { left, right, .. } => {
             expr_sources(left, sources) && expr_sources(right, sources)
         }
-        Expr::InSubquery { expr, .. } => expr_sources(expr, sources),
-        Expr::ScalarSubquery { .. } => false,
+        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => false,
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| expr_sources(expr, sources)),
@@ -2113,10 +2519,7 @@ fn collect_expr_columns(
             collect_expr_columns(left, qualifiers, source_columns, keep)
                 && collect_expr_columns(right, qualifiers, source_columns, keep)
         }
-        Expr::InSubquery { expr, .. } => {
-            collect_expr_columns(expr, qualifiers, source_columns, keep)
-        }
-        Expr::ScalarSubquery { .. } => false,
+        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => false,
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep)),

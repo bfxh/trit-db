@@ -18,14 +18,24 @@
    - `IN` 子查询必须返回单列；标量子查询必须返回单列、零或一行。
    - 子查询可以是 `SELECT` 或 `WITH`（复用 [`Query`]）。
 
-2. **执行前物化（不做相关子查询）**
+2. **非相关：执行前物化**
    - `execute_statement` / `execute_query` 在执行前遍历表达式，把：
      - `InSubquery { expr, query, negated }` → `InList { expr, values: [Literal(v), ...], negated }`；
      - `ScalarSubquery { query }` → `Literal(value)`。
    - binder / executor / 常量折叠 / 列裁剪只看到 `InList` 与 `Literal`，不需要知道子查询存在。
    - `execute_query` 统一做物化，覆盖 `WITH` 的 seed/step、`INSERT ... SELECT`、`IN (SELECT ...)` 嵌套。
 
-3. **语义**
+3. **相关：逐行替换后执行**
+   - `WHERE` 中出现引用外层限定列（`outer.col`）的子查询时，`select` 走 `select_with_correlated_filter`：
+     1. `build_from` 得到外层表；
+     2. 每行把子查询中的 `outer.col` 替换成 `Literal(row[col])`；
+     3. 执行替换后的子查询，得到 `IN` 列表或标量；
+     4. 绑定并求值该行 filter，保留 `TRUE` 行；
+     5. 清空 filter，用 `execute_select` 做投影/分组/排序。
+   - 只支持 `WHERE`；投影 / `HAVING` / `ORDER BY` 中的相关子查询仍报 `Unsupported`。
+   - 外层列必须用外层表名或别名限定；未限定列按内层列解析。
+
+4. **语义**
    - `IN`：0 行 → 恒 `FALSE`（含 `NOT IN` → `TRUE`）；`NULL` 走既有三值 `IN` 规则。
    - 标量：0 行 → `NULL`；多行 → `Unsupported`；多列 → `Unsupported`。
    - 相关子查询不支持：子查询里引用外层列会解析失败并报 `UnknownColumn`。
@@ -38,7 +48,8 @@
 
 ## 后果 / 限制
 
-- **非相关**：相关子查询（引用外层列）不支持。
+- **相关子查询只在 `WHERE`**：投影 / `HAVING` / `ORDER BY` 中的相关子查询报 `Unsupported`；外层列必须限定。
+- **逐行执行**：相关子查询是 nested-loop 求值（外层行数 × 子查询成本），不是为大数据集设计的。
 - **物化内存**：`IN` 子查询把结果全部转成字面量，超大结果集会占用内存。
 - **`EXISTS` / `ANY` / `ALL`**：未实现。
 - **多列 `IN`**：不支持（`(a, b) IN (SELECT ...)`）。
@@ -55,4 +66,5 @@ cargo fmt --all -- --check
 
 - `IN` / `NOT IN` 过滤、标量投影、标量零行 `NULL`；
 - `WITH c AS (...) UPDATE ... WHERE id IN (SELECT id FROM c)` 与 `DELETE`；
-- 标量多行、`IN` 多列报错。
+- 标量多行、`IN` 多列报错；
+- 相关 `IN` / 相关标量（`WHERE`）、非相关路径回归、投影相关子查询被拒绝。
