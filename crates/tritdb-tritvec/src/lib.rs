@@ -100,6 +100,10 @@ pub enum TritVecError {
     },
     /// A balanced-ternary integer overflowed `i64`.
     Overflow,
+    /// A weight was `NaN` or infinite.
+    NonFiniteWeight,
+    /// The quantization step was non-positive or non-finite.
+    InvalidScale,
 }
 
 impl fmt::Display for TritVecError {
@@ -112,6 +116,10 @@ impl fmt::Display for TritVecError {
                 )
             }
             TritVecError::Overflow => formatter.write_str("balanced-ternary value overflows i64"),
+            TritVecError::NonFiniteWeight => formatter.write_str("weight must be a finite number"),
+            TritVecError::InvalidScale => {
+                formatter.write_str("quantization step must be finite and positive")
+            }
         }
     }
 }
@@ -382,6 +390,104 @@ impl fmt::Display for TritInt {
     }
 }
 
+/// A packed vector of balanced trits (`-1/0/+1`).
+///
+/// This is the representation ternary-quantized model weights use: `r3`
+/// packing gives `1.6` bit per weight, matching BitNet's 1.58-bit ternary
+/// weights, and the same type is the ballot vector for trit voting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TernaryVec {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl TernaryVec {
+    /// Builds a vector from balanced digits.
+    pub fn new(digits: &[BalancedTrit]) -> Self {
+        let trits: Vec<Trit> = digits.iter().map(|digit| digit.to_trit()).collect();
+        let bytes = tritdb_radix::pack(tritdb_radix::Radix::R3, &trits)
+            .expect("balanced digits always pack");
+        Self {
+            bytes,
+            len: digits.len(),
+        }
+    }
+
+    /// Quantizes floating-point weights to `-1/0/+1` with step `alpha`.
+    ///
+    /// Each weight becomes `round(w / alpha)` clamped to `[-1, 1]`, so
+    /// dequantizing with the same `alpha` keeps the error `<= alpha / 2` for
+    /// `|w| <= 1.5 * alpha` (the BitNet / ternary-quantization contract);
+    /// weights beyond that band saturate at `±1`. `alpha` is usually
+    /// `mean(|w|)`.
+    pub fn quantize(weights: &[f64], alpha: f64) -> Result<Self, TritVecError> {
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(TritVecError::InvalidScale);
+        }
+        let mut digits = Vec::with_capacity(weights.len());
+        for weight in weights {
+            if !weight.is_finite() {
+                return Err(TritVecError::NonFiniteWeight);
+            }
+            let scaled = (weight / alpha).round();
+            digits.push(if scaled >= 1.0 {
+                BalancedTrit::Pos
+            } else if scaled <= -1.0 {
+                BalancedTrit::Neg
+            } else {
+                BalancedTrit::Zero
+            });
+        }
+        Ok(Self::new(&digits))
+    }
+
+    /// Number of elements.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when the vector holds no elements.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Unpacks all digits.
+    pub fn digits(&self) -> Vec<BalancedTrit> {
+        tritdb_radix::unpack(tritdb_radix::Radix::R3, &self.bytes, self.len)
+            .expect("packed vector keeps canonical padding")
+            .into_iter()
+            .map(BalancedTrit::from_trit)
+            .collect()
+    }
+
+    /// Dequantizes with the same step used by [`TernaryVec::quantize`].
+    pub fn dequantize(&self, alpha: f64) -> Vec<f64> {
+        self.digits()
+            .into_iter()
+            .map(|digit| digit.value() as f64 * alpha)
+            .collect()
+    }
+
+    /// Unbiased tally of `+1/-1/0` ballots.
+    pub fn tally(&self) -> TritInt {
+        let total: i64 = self.digits().iter().map(|digit| digit.value()).sum();
+        TritInt::from_i64(total)
+    }
+}
+
+/// Maps a model confidence in `[0, 1]` to a Łukasiewicz annotation in
+/// thousandths (`0..=1000`), clamping out-of-range values.
+///
+/// This is the adapter from a model's softmax/score output to the
+/// `LOGIC LUKASIEWICZ` storage domain.
+pub fn confidence_to_annotation(confidence: f64) -> Result<u16, TritVecError> {
+    if !confidence.is_finite() {
+        return Err(TritVecError::NonFiniteWeight);
+    }
+    let clamped = confidence.clamp(0.0, 1.0);
+    Ok((clamped * 1000.0).round() as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +653,82 @@ mod tests {
             None
         );
         assert_eq!(TritInt::from_i64(i64::MIN).checked_neg(), None);
+    }
+
+    #[test]
+    fn ternary_quantization_round_trips_within_half_step() {
+        // Within |w| <= 1.5 * alpha every weight rounds without clamping, so
+        // the half-step error bound holds.
+        let weights = [0.1, -0.1, 0.7, -0.7, 0.5, -0.5];
+        let alpha = 0.5;
+        let quantized = TernaryVec::quantize(&weights, alpha).unwrap();
+        assert_eq!(
+            quantized.digits(),
+            vec![
+                BalancedTrit::Zero,
+                BalancedTrit::Zero,
+                BalancedTrit::Pos,
+                BalancedTrit::Neg,
+                BalancedTrit::Pos,
+                BalancedTrit::Neg,
+            ]
+        );
+        let restored = quantized.dequantize(alpha);
+        for (weight, back) in weights.iter().zip(&restored) {
+            assert!(
+                (weight - back).abs() <= alpha / 2.0 + 1e-12,
+                "weight={weight} back={back}"
+            );
+        }
+        // Packing stays at 5 digits per byte.
+        assert_eq!(quantized.digits().len(), weights.len());
+        // Weights beyond 1.5 * alpha saturate at +/-1; that is the documented
+        // trade-off of ternary quantization, not a half-step guarantee.
+        let clamped = TernaryVec::quantize(&[9.0, -9.0], 1.0).unwrap();
+        assert_eq!(clamped.digits(), vec![BalancedTrit::Pos, BalancedTrit::Neg]);
+    }
+
+    #[test]
+    fn ternary_quantization_rejects_bad_inputs() {
+        assert_eq!(
+            TernaryVec::quantize(&[0.1], 0.0),
+            Err(TritVecError::InvalidScale)
+        );
+        assert_eq!(
+            TernaryVec::quantize(&[0.1], f64::NAN),
+            Err(TritVecError::InvalidScale)
+        );
+        assert_eq!(
+            TernaryVec::quantize(&[f64::INFINITY], 1.0),
+            Err(TritVecError::NonFiniteWeight)
+        );
+    }
+
+    #[test]
+    fn ternary_tally_is_an_unbiased_sum() {
+        let ballots = TernaryVec::new(&[
+            BalancedTrit::Pos,
+            BalancedTrit::Neg,
+            BalancedTrit::Zero,
+            BalancedTrit::Pos,
+        ]);
+        assert_eq!(ballots.tally().to_i64(), 1);
+        let all_against = TernaryVec::new(&[BalancedTrit::Neg, BalancedTrit::Neg]);
+        assert_eq!(all_against.tally().to_i64(), -2);
+        assert_eq!(TernaryVec::new(&[]).tally().to_i64(), 0);
+    }
+
+    #[test]
+    fn confidence_maps_to_thousandths() {
+        assert_eq!(confidence_to_annotation(0.0).unwrap(), 0);
+        assert_eq!(confidence_to_annotation(0.5).unwrap(), 500);
+        assert_eq!(confidence_to_annotation(1.0).unwrap(), 1000);
+        assert_eq!(confidence_to_annotation(1.5).unwrap(), 1000);
+        assert_eq!(confidence_to_annotation(-0.2).unwrap(), 0);
+        assert_eq!(
+            confidence_to_annotation(f64::NAN),
+            Err(TritVecError::NonFiniteWeight)
+        );
     }
 
     #[test]
