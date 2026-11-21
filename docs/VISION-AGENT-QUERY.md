@@ -171,6 +171,8 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
   / `23505` / `22012` …），`hint()` 给出可执行的修复建议；CLI 输出
   `... [SQLSTATE 42P01]` + `hint: ...`，pgwire 的 `ErrorResponse` 带 `C`（SQLSTATE）与
   `H`（hint）字段。模型可以按码分支、按 hint 改查询，不必解析散文。
+  列/表名拼错时还会用 Levenshtein 给出 `did you mean `status`?` 候选
+  （`UnknownName { kind, name, candidates }`），模型可以直接改拼写。
   详见 `docs/results/M9-STRUCTURED-ERRORS.md`。
 
 - `TernaryVec::quantize(weights, alpha)` / `dequantize(alpha)`：BitNet 风格三值量化，

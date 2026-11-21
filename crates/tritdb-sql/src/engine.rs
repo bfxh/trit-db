@@ -17,7 +17,7 @@ use crate::ast::{
 use crate::bind::{
     bind_expr, bind_select, eval_constant, select_has_aggregate, BoundSelect, GroupExpr,
 };
-use crate::error::SqlError;
+use crate::error::{closest_names, NameKind, SqlError};
 use crate::parser::parse_script;
 use crate::plan::{
     AggregatePlan, JoinKey, JoinKeys, JoinPlan, Metrics, PlanExpr, PlanKind, PlanNode, ProjectItem,
@@ -549,6 +549,15 @@ pub struct SqlEngine {
 }
 
 impl SqlEngine {
+    /// Builds a table-not-found error with the closest existing table names.
+    fn unknown_table(&self, name: &str) -> SqlError {
+        SqlError::UnknownName {
+            kind: NameKind::Table,
+            name: name.to_string(),
+            candidates: closest_names(name, self.tables.keys().map(String::as_str)),
+        }
+    }
+
     /// Returns the column names and types of `name`, if the table exists.
     pub fn table_schema(&self, name: &str) -> Option<Vec<(String, DataType)>> {
         self.tables.get(name).map(|table| {
@@ -798,7 +807,7 @@ impl SqlEngine {
         definition: &crate::ast::ColumnDef,
     ) -> Result<QueryResult, SqlError> {
         let Some(existing) = self.tables.get(name) else {
-            return Err(SqlError::UnknownTable(name.to_string()));
+            return Err(self.unknown_table(name));
         };
         if existing
             .schema
@@ -846,7 +855,7 @@ impl SqlEngine {
         column_name: &str,
     ) -> Result<QueryResult, SqlError> {
         let Some(existing) = self.tables.get(name) else {
-            return Err(SqlError::UnknownTable(name.to_string()));
+            return Err(self.unknown_table(name));
         };
         let Some(index) = existing.schema.index_of(column_name) else {
             if if_exists {
@@ -891,7 +900,7 @@ impl SqlEngine {
         to: &str,
     ) -> Result<QueryResult, SqlError> {
         let Some(existing) = self.tables.get(name) else {
-            return Err(SqlError::UnknownTable(name.to_string()));
+            return Err(self.unknown_table(name));
         };
         let Some(index) = existing.schema.index_of(from) else {
             return Err(SqlError::UnknownColumn(from.to_string()));
@@ -912,7 +921,7 @@ impl SqlEngine {
 
     fn rename_table(&mut self, from: &str, to: &str) -> Result<QueryResult, SqlError> {
         let Some(existing) = self.tables.get(from) else {
-            return Err(SqlError::UnknownTable(from.to_string()));
+            return Err(self.unknown_table(from));
         };
         if self.tables.contains_key(to) {
             return Err(SqlError::TableExists(to.to_string()));
@@ -940,7 +949,7 @@ impl SqlEngine {
         data_type: DataType,
     ) -> Result<QueryResult, SqlError> {
         let Some(existing) = self.tables.get(table_name) else {
-            return Err(SqlError::UnknownTable(table_name.to_string()));
+            return Err(self.unknown_table(table_name));
         };
         let Some(index) = existing.schema.index_of(column_name) else {
             return Err(SqlError::UnknownColumn(column_name.to_string()));
@@ -973,7 +982,7 @@ impl SqlEngine {
             if if_exists {
                 return Ok(QueryResult::Message(format!("table {name} does not exist")));
             }
-            return Err(SqlError::UnknownTable(name.to_string()));
+            return Err(self.unknown_table(name));
         }
         let key = table_key(name);
         let stats = stats_key(name);
@@ -997,7 +1006,7 @@ impl SqlEngine {
             .tables
             .get(name)
             .cloned()
-            .ok_or_else(|| SqlError::UnknownTable(name.to_string()))?;
+            .ok_or_else(|| self.unknown_table(name))?;
         let schema = &table.schema;
         let indices = match target_columns {
             Some(names) => {
@@ -1111,7 +1120,7 @@ impl SqlEngine {
             .tables
             .get(name)
             .cloned()
-            .ok_or_else(|| SqlError::UnknownTable(name.to_string()))?;
+            .ok_or_else(|| self.unknown_table(name))?;
         let filter = filter
             .map(|expr| bind_expr(expr, &table.schema))
             .transpose()?;
@@ -1147,7 +1156,7 @@ impl SqlEngine {
             .tables
             .get(name)
             .cloned()
-            .ok_or_else(|| SqlError::UnknownTable(name.to_string()))?;
+            .ok_or_else(|| self.unknown_table(name))?;
         let schema = &table.schema;
         let mut targets = Vec::with_capacity(assignments.len());
         let mut seen = BTreeMap::new();
@@ -2467,7 +2476,7 @@ impl SqlEngine {
         let names = match table_name {
             Some(name) => {
                 if !self.tables.contains_key(name) {
-                    return Err(SqlError::UnknownTable(name.to_string()));
+                    return Err(self.unknown_table(name));
                 }
                 vec![name.to_string()]
             }
@@ -2713,7 +2722,7 @@ impl SqlEngine {
             .tables
             .get(&select.table)
             .cloned()
-            .ok_or_else(|| SqlError::UnknownTable(select.table.clone()))?;
+            .ok_or_else(|| self.unknown_table(&select.table))?;
         let mut qualifiers = BTreeSet::new();
         let mut sources = Vec::with_capacity(select.joins.len() + 1);
         let left_qualifier = select.table_alias.as_deref().unwrap_or(&select.table);
@@ -2726,7 +2735,7 @@ impl SqlEngine {
                 .tables
                 .get(&join.table)
                 .cloned()
-                .ok_or_else(|| SqlError::UnknownTable(join.table.clone()))?;
+                .ok_or_else(|| self.unknown_table(&join.table))?;
             let qualifier = join.alias.as_deref().unwrap_or(&join.table);
             if !qualifiers.insert(qualifier.to_string()) {
                 return Err(SqlError::DuplicateTableAlias(qualifier.to_string()));
@@ -4087,7 +4096,13 @@ fn natural_pairs(left: &Table, right: &Table) -> Result<Vec<(usize, usize)>, Sql
         }
         let right_index = match find_join_column(&right.schema, name) {
             Ok(index) => index,
-            Err(SqlError::UnknownColumn(_)) => continue,
+            Err(
+                SqlError::UnknownColumn(_)
+                | SqlError::UnknownName {
+                    kind: NameKind::Column,
+                    ..
+                },
+            ) => continue,
             Err(error) => return Err(error),
         };
         check_join_types(left_column, &right.schema.columns[right_index])?;

@@ -16,7 +16,7 @@ pub use ast::{
     WindowFunction, With,
 };
 pub use engine::{JoinStrategy, QueryResult, SqlEngine};
-pub use error::SqlError;
+pub use error::{NameKind, SqlError};
 pub use parser::parse_script;
 pub use stats::{ColumnStats, TableStats};
 pub use storage::{decode_table, encode_table, TABLE_KEY_PREFIX};

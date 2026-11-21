@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tritdb_exec::{eval, BinaryOp, Expr as ExecExpr, Schema, Table, TruthValue, Value};
 
 use crate::ast::{AggregateKind, Expr, Select, SelectItem};
-use crate::error::SqlError;
+use crate::error::{closest_names, NameKind, SqlError};
 
 /// A bound expression that may contain aggregate calls.
 #[derive(Clone, Debug)]
@@ -198,12 +198,35 @@ impl BoundSelect {
 }
 
 /// Resolves a column reference against a schema.
+/// Column-not-found error carrying the closest names in scope.
+fn unknown_column(name: &str, schema: &Schema, qualified: bool) -> SqlError {
+    let candidates: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|column| {
+            if qualified {
+                column.name.clone()
+            } else {
+                column
+                    .name
+                    .rsplit_once('.')
+                    .map_or_else(|| column.name.clone(), |(_, bare)| bare.to_string())
+            }
+        })
+        .collect();
+    SqlError::UnknownName {
+        kind: NameKind::Column,
+        name: name.to_string(),
+        candidates: closest_names(name, candidates.iter().map(String::as_str)),
+    }
+}
+
 fn resolve_column(schema: &Schema, table: Option<&str>, name: &str) -> Result<usize, SqlError> {
     if let Some(table) = table {
         let qualified = format!("{table}.{name}");
         return schema
             .index_of(&qualified)
-            .ok_or(SqlError::UnknownColumn(qualified));
+            .ok_or_else(|| unknown_column(&qualified, schema, true));
     }
     if let Some(index) = schema.index_of(name) {
         return Ok(index);
@@ -220,7 +243,7 @@ fn resolve_column(schema: &Schema, table: Option<&str>, name: &str) -> Result<us
                 .map(|_| index)
         });
     let Some(index) = matches.next() else {
-        return Err(SqlError::UnknownColumn(name.to_string()));
+        return Err(unknown_column(name, schema, false));
     };
     if matches.next().is_some() {
         return Err(SqlError::AmbiguousColumn(name.to_string()));
@@ -775,7 +798,13 @@ pub(crate) fn bind_select(select: &Select, table: &Table) -> Result<BoundSelect,
                         aggregate_query,
                         &group_columns,
                     )?,
-                    Err(SqlError::UnknownColumn(_)) => {
+                    Err(
+                        SqlError::UnknownColumn(_)
+                        | SqlError::UnknownName {
+                            kind: NameKind::Column,
+                            ..
+                        },
+                    ) => {
                         if let Some(alias) = aliases.get(name.as_str()) {
                             (*alias).clone()
                         } else {

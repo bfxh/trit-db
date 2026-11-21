@@ -88,9 +88,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## 7. 还没做
+## 7. did-you-mean（已落地）
 
-- **did-you-mean**：`UnknownColumn`/`UnknownTable` 还没有「最接近的名字」候选，需要 binder 侧的
-  schema 上下文（Levenshtein 或前缀匹配）；
+`SqlError::UnknownName { kind, name, candidates }` 在列/表名解析失败时，用大小写不敏感的
+Levenshtein 距离找最近的已知名字（预算随名字长度增长、最多 3 个），Display 与 hint 都带
+`did you mean `status`?`：
+
+- 列：`resolve_column` 失败时用 schema 的列名（未限定列去掉 `table.` 前缀）；
+- 表：引擎的表清单（`SqlEngine::unknown_table`），10 处构造点统一走它；
+- SQLSTATE 按 `kind` 保持 `42703` / `42P01`；
+- 别名回退逻辑（`ORDER BY <alias>`）同时识别 `UnknownColumn` 与 `UnknownName`。
+
+## 8. 还没做
+
 - **错误码文档页**：`docs/ERRORS.md` 的稳定清单（目前映射写在 `error.rs` 的注释里）；
 - **`--error-format json`**：CLI 的机器可读输出（pgwire 已经结构化，CLI 目前是「消息 + SQLSTATE + hint」文本）。

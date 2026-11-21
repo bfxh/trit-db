@@ -287,6 +287,37 @@ fn sql_errors_carry_sqlstate_and_hint() {
 }
 
 #[test]
+fn sql_errors_suggest_closest_names() {
+    let dir = TempDir::new("sql-did-you-mean");
+    let db = dir.join("suggest.db");
+    let db = db.to_str().expect("path");
+    let setup = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE customer (id INT NOT NULL, status TEXT);",
+    ]);
+    assert!(setup.status.success(), "stderr: {}", stderr(&setup));
+
+    // Column typo: 42703 with the closest column name.
+    let output = run(["sql", "--db", db, "--sql", "SELECT stat FROM customer;"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("[SQLSTATE 42703]"), "stderr: {text}");
+    assert!(text.contains("did you mean"), "stderr: {text}");
+    assert!(text.contains("status"), "stderr: {text}");
+
+    // Table typo: 42P01 with the closest table name.
+    let output = run(["sql", "--db", db, "--sql", "SELECT * FROM custmer;"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("[SQLSTATE 42P01]"), "stderr: {text}");
+    assert!(text.contains("did you mean"), "stderr: {text}");
+    assert!(text.contains("customer"), "stderr: {text}");
+}
+
+#[test]
 fn certainty_reports_verdicts_per_domain() {
     let dir = TempDir::new("sql-certainty");
     let db = dir.join("certainty.db");

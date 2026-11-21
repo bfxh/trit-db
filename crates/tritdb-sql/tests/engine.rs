@@ -1,5 +1,5 @@
 use tritdb_exec::Value;
-use tritdb_sql::{JoinStrategy, QueryResult, SqlEngine, SqlError};
+use tritdb_sql::{JoinStrategy, NameKind, QueryResult, SqlEngine, SqlError};
 use tritdb_testkit::TempDir;
 
 fn as_rows(result: &QueryResult) -> (&[String], &[Vec<Value>]) {
@@ -3276,7 +3276,14 @@ fn cross_join_handles_empty_inputs_and_validation() {
         .execute_script("SELECT * FROM a, missing;")
         .expect_err("unknown table");
     assert!(
-        matches!(&unknown, SqlError::UnknownTable(name) if name == "missing"),
+        matches!(
+            &unknown,
+            SqlError::UnknownName {
+                kind: NameKind::Table,
+                name,
+                ..
+            } if name == "missing"
+        ),
         "unexpected {unknown:?}"
     );
 }

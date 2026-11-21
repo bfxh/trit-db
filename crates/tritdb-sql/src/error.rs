@@ -4,6 +4,15 @@ use std::fmt;
 use tritdb_exec::ExecError;
 use tritdb_txn::TxnError;
 
+/// Which namespace an [`SqlError::UnknownName`] refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameKind {
+    /// Column namespace.
+    Column,
+    /// Table namespace.
+    Table,
+}
+
 /// SQL front-end error.
 #[derive(Debug)]
 pub enum SqlError {
@@ -20,6 +29,16 @@ pub enum SqlError {
     TableExists(String),
     /// Column does not exist in the table.
     UnknownColumn(String),
+    /// A column or table name that does not exist, with the closest known
+    /// names so a caller (or an agent) can fix a typo without guessing.
+    UnknownName {
+        /// Which namespace the name belongs to.
+        kind: NameKind,
+        /// The name that was not found.
+        name: String,
+        /// Closest known names; empty when nothing is close enough.
+        candidates: Vec<String>,
+    },
     /// Unqualified column name matches more than one joined column.
     AmbiguousColumn(String),
     /// Duplicate table name or alias in a `FROM` clause.
@@ -104,18 +123,26 @@ impl SqlError {
     /// column) from "fatal" (`XX001` corrupt data).
     pub fn code(&self) -> &'static str {
         match self {
-            SqlError::Parse { .. } => "42601",           // syntax_error
-            SqlError::UnknownTable(_) => "42P01",        // undefined_table
-            SqlError::TableExists(_) => "42P07",         // duplicate_table
-            SqlError::UnknownColumn(_) => "42703",       // undefined_column
-            SqlError::AmbiguousColumn(_) => "42702",     // ambiguous_column
+            SqlError::Parse { .. } => "42601",     // syntax_error
+            SqlError::UnknownTable(_) => "42P01",  // undefined_table
+            SqlError::TableExists(_) => "42P07",   // duplicate_table
+            SqlError::UnknownColumn(_) => "42703", // undefined_column
+            SqlError::UnknownName {
+                kind: NameKind::Column,
+                ..
+            } => "42703", // undefined_column
+            SqlError::UnknownName {
+                kind: NameKind::Table,
+                ..
+            } => "42P01", // undefined_table
+            SqlError::AmbiguousColumn(_) => "42702", // ambiguous_column
             SqlError::DuplicateTableAlias(_) => "42712", // duplicate_alias
-            SqlError::DuplicateColumn(_) => "42701",     // duplicate_column
-            SqlError::ColumnCount { .. } => "42601",     // syntax_error
-            SqlError::NotNull { .. } => "23502",         // not_null_violation
-            SqlError::CheckViolation { .. } => "23514",  // check_violation
-            SqlError::DuplicateKey { .. } => "23505",    // unique_violation
-            SqlError::NestedAggregate => "42803",        // grouping_error
+            SqlError::DuplicateColumn(_) => "42701", // duplicate_column
+            SqlError::ColumnCount { .. } => "42601", // syntax_error
+            SqlError::NotNull { .. } => "23502",   // not_null_violation
+            SqlError::CheckViolation { .. } => "23514", // check_violation
+            SqlError::DuplicateKey { .. } => "23505", // unique_violation
+            SqlError::NestedAggregate => "42803",  // grouping_error
             SqlError::ColumnOutsideAggregate(_) => "42803",
             SqlError::ColumnOutsideGroup(_) => "42803",
             SqlError::Unsupported(_) => "0A000", // feature_not_supported
@@ -148,6 +175,22 @@ impl SqlError {
             SqlError::UnknownColumn(name) => Some(format!(
                 "check the column name `{name}`; qualify it as `table.{name}` when several tables share it"
             )),
+            SqlError::UnknownName {
+                kind,
+                name,
+                candidates,
+            } => {
+                let mut hint = format!("check the {} name `{name}`", unknown_kind(*kind));
+                if candidates.is_empty() {
+                    hint.push_str(match kind {
+                        NameKind::Table => "; create it first if it is missing",
+                        NameKind::Column => "; qualify it as `table.<column>` when several tables share it",
+                    });
+                } else {
+                    hint.push_str(&format!("; did you mean {}?", quoted_list(candidates)));
+                }
+                Some(hint)
+            }
             SqlError::AmbiguousColumn(name) => {
                 Some(format!("qualify `{name}` as `table.{name}`"))
             }
@@ -234,6 +277,17 @@ impl fmt::Display for SqlError {
             SqlError::UnknownTable(name) => write!(f, "unknown table: {name}"),
             SqlError::TableExists(name) => write!(f, "table already exists: {name}"),
             SqlError::UnknownColumn(name) => write!(f, "unknown column: {name}"),
+            SqlError::UnknownName {
+                kind,
+                name,
+                candidates,
+            } => {
+                write!(f, "{}: {name}", unknown_kind_label(*kind))?;
+                if !candidates.is_empty() {
+                    write!(f, " (did you mean {}?)", quoted_list(candidates))?;
+                }
+                Ok(())
+            }
             SqlError::AmbiguousColumn(name) => write!(f, "ambiguous column: {name}"),
             SqlError::DuplicateTableAlias(name) => {
                 write!(f, "duplicate table name or alias: {name}")
@@ -308,6 +362,69 @@ impl From<std::io::Error> for SqlError {
     }
 }
 
+fn unknown_kind(kind: NameKind) -> &'static str {
+    match kind {
+        NameKind::Column => "column",
+        NameKind::Table => "table",
+    }
+}
+
+fn unknown_kind_label(kind: NameKind) -> &'static str {
+    match kind {
+        NameKind::Column => "unknown column",
+        NameKind::Table => "unknown table",
+    }
+}
+
+fn quoted_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Returns up to three known names close to `name` (case-insensitive
+/// Levenshtein, budget grows with the name length).
+pub(crate) fn closest_names<'a>(
+    name: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let target = name.to_ascii_lowercase();
+    let budget = (target.chars().count() / 2).clamp(1, 3);
+    let mut scored: Vec<(usize, String)> = candidates
+        .into_iter()
+        .map(|candidate| {
+            (
+                levenshtein(&target, &candidate.to_ascii_lowercase()),
+                candidate.to_string(),
+            )
+        })
+        .filter(|(distance, _)| *distance <= budget)
+        .collect();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    scored.dedup_by(|left, right| left.1 == right.1);
+    scored.into_iter().take(3).map(|(_, name)| name).collect()
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let cost = usize::from(left_char != right_char);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +486,28 @@ mod tests {
         assert!(hint.contains("divisor"));
         assert!(SqlError::parse("bad", 3).hint().is_none());
         assert!(SqlError::Io(std::io::Error::other("x")).hint().is_none());
+    }
+
+    #[test]
+    fn closest_names_suggests_typos() {
+        assert_eq!(
+            closest_names("stat", ["status", "id", "name"]),
+            vec!["status".to_string()]
+        );
+        assert_eq!(
+            closest_names("custmer", ["customer", "order"]),
+            vec!["customer".to_string()]
+        );
+        // Case-insensitive.
+        assert_eq!(
+            closest_names("STAT", ["status"]),
+            vec!["status".to_string()]
+        );
+        // Too far away: no suggestion instead of a bad one.
+        assert!(closest_names("zzz", ["status", "id"]).is_empty());
+        // At most three, sorted by distance then name.
+        let many = closest_names("user1", ["user2", "user3", "user4", "user9"]);
+        assert_eq!(many.len(), 3);
     }
 
     #[test]
