@@ -9,8 +9,8 @@ use std::fmt;
 
 use crate::ann::B4;
 use crate::{Row, Value};
-use tritdb_tritvec::TritVecError;
-pub use tritdb_tritvec::{TritVec, K3};
+pub use tritdb_tritvec::{pack, TritVec, K3};
+use tritdb_tritvec::{unpack, Radix, Trit, TritVecError};
 
 /// Errors from batch evaluation and as-of joins.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +171,31 @@ impl K3Column {
         &self.packed
     }
 
+    /// Rebuilds a column from packed `r3` bytes, validating the length.
+    pub fn from_parts(packed: &[u8], len: usize) -> Option<Self> {
+        if packed.len() != Radix::R3.packed_len(len) {
+            return None;
+        }
+        let trits = unpack(Radix::R3, packed, len).ok()?;
+        let values: Vec<K3> = trits.into_iter().map(K3::from_trit).collect();
+        Some(Self {
+            packed: TritVec::new(&values),
+        })
+    }
+
+    /// Row values (`Value::Bool` / `Value::Null`) for storage round-trips.
+    pub fn to_values(&self) -> Vec<Value> {
+        self.packed
+            .to_vec()
+            .into_iter()
+            .map(|value| match value {
+                K3::True => Value::Bool(true),
+                K3::False => Value::Bool(false),
+                K3::Unknown => Value::Null,
+            })
+            .collect()
+    }
+
     /// Rows whose value is `TRUE` (SQL `WHERE` keeps only `TRUE`).
     pub fn filter_true(&self) -> Vec<usize> {
         filter_indices(&self.packed)
@@ -183,6 +208,107 @@ pub fn k3_of_value(value: &Value) -> K3 {
         Value::Bool(true) | Value::Logic(B4::True) => K3::True,
         Value::Bool(false) | Value::Logic(B4::False) => K3::False,
         _ => K3::Unknown,
+    }
+}
+
+/// A packed Belnap column: two trits per value plus a NULL bitmap.
+///
+/// `BOTH`/`NEITHER` need four states, which a single K3 trit cannot carry;
+/// two trits per value keep them lossless. The NULL bitmap is one bit per row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct B4Column {
+    packed: Vec<u8>,
+    nulls: Vec<u8>,
+    len: usize,
+}
+
+impl B4Column {
+    /// Materializes column `index` from `rows`.
+    pub fn from_rows(rows: &[Row], index: usize) -> Option<Self> {
+        let mut trits = Vec::with_capacity(rows.len() * 2);
+        let mut nulls = vec![0u8; rows.len().div_ceil(8)];
+        for (row_index, row) in rows.iter().enumerate() {
+            let value = row.get(index)?;
+            let code = match value {
+                Value::Null => {
+                    nulls[row_index / 8] |= 1 << (row_index % 8);
+                    0
+                }
+                Value::Logic(four) => four.code(),
+                Value::Bool(true) => B4::True.code(),
+                Value::Bool(false) => B4::False.code(),
+                _ => return None,
+            };
+            trits.push(Trit::from_u8(code & 1).expect("0/1 is a trit"));
+            trits.push(Trit::from_u8((code >> 1) & 1).expect("0/1 is a trit"));
+        }
+        let packed = pack(Radix::R3, &trits).ok()?;
+        Some(Self {
+            packed,
+            nulls,
+            len: rows.len(),
+        })
+    }
+
+    /// Rebuilds a column from stored parts, validating their lengths.
+    pub fn from_parts(packed: Vec<u8>, nulls: Vec<u8>, len: usize) -> Option<Self> {
+        if packed.len() != Radix::R3.packed_len(len * 2) || nulls.len() != len.div_ceil(8) {
+            return None;
+        }
+        Some(Self { packed, nulls, len })
+    }
+
+    /// Number of rows.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when the column holds no rows.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// True when `row` is `NULL`.
+    pub fn is_null(&self, row: usize) -> bool {
+        row < self.len && (self.nulls[row / 8] >> (row % 8)) & 1 == 1
+    }
+
+    /// One element; `None` for `NULL` or an out-of-range row.
+    pub fn get(&self, row: usize) -> Option<B4> {
+        if row >= self.len || self.is_null(row) {
+            return None;
+        }
+        let trits = unpack(Radix::R3, &self.packed, self.len * 2).ok()?;
+        let low = trits[row * 2].get() & 1;
+        let high = trits[row * 2 + 1].get() & 1;
+        B4::from_code(low | (high << 1))
+    }
+
+    /// Packed trits (two per value).
+    pub fn packed(&self) -> &[u8] {
+        &self.packed
+    }
+
+    /// NULL bitmap (one bit per row).
+    pub fn nulls(&self) -> &[u8] {
+        &self.nulls
+    }
+
+    /// Rebuilds the row values (`Value::Logic` / `Value::Null`).
+    pub fn to_values(&self) -> Vec<Value> {
+        let trits = unpack(Radix::R3, &self.packed, self.len * 2).unwrap_or_default();
+        (0..self.len)
+            .map(|row| {
+                if self.is_null(row) {
+                    return Value::Null;
+                }
+                let low = trits[row * 2].get() & 1;
+                let high = trits[row * 2 + 1].get() & 1;
+                B4::from_code(low | (high << 1))
+                    .map(Value::Logic)
+                    .unwrap_or(Value::Null)
+            })
+            .collect()
     }
 }
 
@@ -388,6 +514,54 @@ mod tests {
                 current: 2
             })
         );
+    }
+
+    #[test]
+    fn k3_column_parts_round_trip_values() {
+        let rows: Vec<Row> = vec![
+            vec![Value::Bool(true)],
+            vec![Value::Bool(false)],
+            vec![Value::Null],
+        ];
+        let column = K3Column::from_rows(&rows, 0).expect("column");
+        let restored = K3Column::from_parts(column.packed().bytes(), 3).expect("parts");
+        assert_eq!(restored, column);
+        assert_eq!(
+            restored.to_values(),
+            vec![Value::Bool(true), Value::Bool(false), Value::Null]
+        );
+        assert!(K3Column::from_parts(&[], 3).is_none());
+    }
+
+    #[test]
+    fn b4_column_round_trips_values_and_nulls() {
+        let rows: Vec<Row> = vec![
+            vec![Value::Logic(B4::True)],
+            vec![Value::Logic(B4::False)],
+            vec![Value::Logic(B4::Both)],
+            vec![Value::Logic(B4::Neither)],
+            vec![Value::Null],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(false)],
+        ];
+        let column = B4Column::from_rows(&rows, 0).expect("column");
+        assert_eq!(column.len(), 7);
+        assert_eq!(column.get(0), Some(B4::True));
+        assert_eq!(column.get(2), Some(B4::Both));
+        assert_eq!(column.get(3), Some(B4::Neither));
+        assert!(column.is_null(4));
+        assert_eq!(column.get(4), None);
+        assert_eq!(column.get(5), Some(B4::True));
+        let values = column.to_values();
+        assert_eq!(values[0], Value::Logic(B4::True));
+        assert_eq!(values[4], Value::Null);
+        assert_eq!(
+            B4Column::from_parts(column.packed().to_vec(), column.nulls().to_vec(), 7)
+                .expect("parts"),
+            column
+        );
+        // Truncated parts are rejected.
+        assert!(B4Column::from_parts(vec![], vec![], 7).is_none());
     }
 
     #[test]

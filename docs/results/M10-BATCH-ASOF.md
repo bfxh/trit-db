@@ -76,20 +76,23 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
 - 测试：`k3_column_round_trips_row_values`（往返 / 过滤 / 越界）、
   `table_k3_column_only_for_annotation_columns`（类型校验）；批量 WHERE 的 debug 对拍继续覆盖。
 
-### 5.2 三值列存块（TRSQ v4）
+### 5.2 三值列存块（TRSQ v5）
 
-表格式升到 v4：行数据之后追加「K3 打包段」（`K3PK` + 段版本 + 段数 + 每段
-`column_index` / `row_count` / `packed_len` / packed bytes），只对 `LOGIC K3` 列打包。
+表格式 v5：行内**跳过** `LOGIC K3` / `LOGIC BELNAP` 列，值由段承担。
 
-- 写路径：行值保持 v3 编码，段是附加的列存块（第一版冗余，空间优化留 v5）；
-- 读路径：v4 严格校验（列类型、行数、段内容逐字节与 `K3Column::from_rows` 一致），
-  v3 无段回退到行值；段损坏报 `CorruptTable`，不静默回退；
-- 语义与边界见 `docs/ADR/047-k3-column-blocks.md`。
+- K3 列：`r3` 打包（1.6 bit/trit）；Belnap 列：**2 trit/值**（`BOTH`/`NEITHER` 需要四种状态）
+  + NULL 位图（1 bit/行）；
+- 段格式（版本 2）：`K3PK` + 段版本 + 段数 + 每段
+  `column_index / kind / row_count / packed_len / null_len / packed / nulls`；
+- 读路径：v5 从段回填并校验（列类型、行数、长度、NOT NULL）；v4 数据（行值完整 + 段版本 1）
+  与 v3 数据（无段）仍可读；结构性损坏报 `CorruptTable`；
+- 段内容不做逐字节 CRC，完整性依赖存储层（WAL/页 CRC）；
+- 语义见 `docs/ADR/047-k3-column-blocks.md`。
 
 ### 5.3 还没做
 
-- **行内跳过 K3 列（v5）**：让段替代行值，获得空间收益；
-- **Belnap 打包**：`BOTH`/`NEITHER` 需要 2 trit/值，不在 v4 范围。
+- **Belnap 的 2-trit 编码空间**：9 种组合只用 4 种（可压缩，但不是瓶颈）；
+- **Ł/ℕ 列打包**：不是三值，暂不做。
 
 ## 6. 验收
 

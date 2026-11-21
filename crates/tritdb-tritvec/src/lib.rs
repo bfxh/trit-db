@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use tritdb_radix::{unpack, Trit};
+pub use tritdb_radix::{pack, unpack, Radix, Trit};
 
 /// Kleene three-valued logic: `FALSE < UNKNOWN < TRUE`.
 ///
