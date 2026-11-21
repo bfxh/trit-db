@@ -1,6 +1,6 @@
 # M7 第一刀：最小 PostgreSQL wire protocol
 
-状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` / TLS（rustls，含 mTLS、热轮换、指纹吊销）/ trust、cleartext、MD5、SCRAM-SHA-256（含持久化 verifier）认证、COPY（text/csv/binary）、二进制结果与二进制参数、CRL/OCSP 吊销已实现；OCSP 在线查询未做
+状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` / TLS（rustls，含 mTLS、热轮换、指纹吊销）/ trust、cleartext、MD5、SCRAM-SHA-256（含持久化 verifier）认证、COPY（text/csv/binary + 自定义选项）、二进制结果与参数（含 numeric/date/timestamp/uuid）、CRL/预取 OCSP/在线 OCSP 吊销已实现；HTTPS responder 与 OCSP nonce 未做
 
 日期：2026-11-21
 
@@ -29,7 +29,7 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - StartupMessage v3（196608）→ `AuthenticationOk` + `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 - `SSLRequest`（80877103）→ 配置证书时回 `S` 并做 TLS 握手；否则回 `N`，客户端用明文重试。
 - 认证：默认 `AuthenticationOk`（trust）；`--auth password` 发 `AuthenticationCleartextPassword`（3）；`--auth md5` 发 `AuthenticationMD5Password`（5）+ 4 字节 salt；`--auth scram-sha-256` 走 `AuthenticationSASL`（10）→ `SASLContinue`（11）→ `SASLFinal`（12）→ `AuthenticationOk`；`--scram-verifier-file` 直接加载 `SCRAM-SHA-256$<iterations>:<salt>$<stored>:<server>` verifier。
-- 吊销：`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，验签后按序列号）或每行一个 SHA-256 指纹；`--tls-client-ocsp` 解析预取的 DER OCSP 响应、验签并读取 `CertStatus::Revoked` 的序列号；命中即 `CertificateError::Revoked`。
+- 吊销：`--tls-client-revoked` 支持 X.509 CRL（PEM/DER，验签后按序列号）或每行一个 SHA-256 指纹；`--tls-client-ocsp` 解析预取的 DER OCSP 响应；`--tls-client-ocsp-url` 在线向 responder 发 `application/ocsp-request`（SHA-1 `CertID`，60 秒缓存）；两者都先验签再按 `CertStatus::Revoked` 判定，命中即 `CertificateError::Revoked`。
 - mTLS：`--tls-client-ca` 提供 CA 时用 `WebPkiClientVerifier` 校验客户端证书。
 - 证书热轮换：`--tls-cert`/`--tls-key`/`--tls-client-ca` 的内容哈希变化后，下一个 TLS 连接使用新证书；重载失败保留旧证书。
 - `Query`（`Q`）→ 执行 `execute_script`，每个结果返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
@@ -37,7 +37,7 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - `Terminate`（`X`）断开。
 - 空查询 → `EmptyQueryResponse`；SQL 错误 → `ErrorResponse` + `ReadyForQuery`。
 - 事务状态：`BEGIN`/`START TRANSACTION` → `ReadyForQuery('T')`；语句失败 → `'E'`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝；`COMMIT`/`ROLLBACK` → `'I'`。
-- `COPY <table> [(cols)] FROM STDIN` → `CopyInResponse`（`G`）+ `CopyData`（`d`）行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；支持 `text`（`\N` 为 NULL）、`csv`（引号/`""` 转义、空字段为 NULL）与 `binary`（`PGCOPY` 头 + 每行字段长度）；按列类型构造 `INSERT`（每 1024 行一批）。
+- `COPY <table> [(cols)] FROM STDIN` → `CopyInResponse`（`G`）+ `CopyData`（`d`）行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；支持 `text`（`\N` 为 NULL）、`csv`（引号/`""` 转义）与 `binary`（`PGCOPY` 头 + 每行字段长度），并接受 `HEADER`/`DELIMITER`/`NULL`/`QUOTE`/`ESCAPE`；按列类型构造 `INSERT`（每 1024 行一批）。
 - `COPY <table> [(cols)] TO STDOUT` → `CopyOutResponse`（`H`）+ `CopyData` 行 + `CopyDone`（`c`）→ `CommandComplete("COPY n")`；同样支持三种格式。
 - 二进制结果：扩展查询 `Bind` 的 result format code（0/1，或每列一个）；`RowDescription` 的每列 format code 与 `DataRow` 编码一致（`int8` 8 字节 BE、`bool` 1 字节、`text` UTF-8）。
 
@@ -60,6 +60,6 @@ cargo fmt --all -- --check
 
 ## 6. 还没做
 
-- **OCSP 在线查询**：只校验运维预取的 OCSP 响应，不主动访问 responder；
-- **COPY 选项**：不支持 `HEADER`/`DELIMITER`/`NULL` 等自定义选项；
+- **HTTPS responder**：在线查询只支持 `http://`；
+- **OCSP nonce 与吊销原因**：不发送 nonce，不区分吊销原因；
 - **完整 CRL/OCSP**：吊销只支持 SHA-256 指纹列表，不做 CRL 签名验证或 OCSP 在线查询；

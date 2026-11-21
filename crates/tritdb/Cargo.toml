@@ -22,7 +22,13 @@ tritdb-wal.workspace = true
 [dev-dependencies]
 tritdb-testkit.workspace = true
 base64 = "0.22"
+der = "0.7"
 md-5 = "0.11"
+ring = "0.17"
+sha1 = "0.10"
+spki = "0.7"
+x509-cert = "0.2"
+x509-ocsp = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 

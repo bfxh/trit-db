@@ -19,9 +19,13 @@ rustls-pemfile = "2"
 x509-parser = { version = "0.18.1", features = ["verify"] }
 x509-ocsp = "0.2.1"
 der = "0.7"
+sha1 = "0.10"
+spki = "0.7"
+x509-cert = "0.2"
 
 [dev-dependencies]
 rcgen = "0.13"
+ring = "0.17"
 
 [lints]
 workspace = true
