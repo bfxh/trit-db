@@ -275,3 +275,75 @@ fn extended_query_roundtrip() {
 
     stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
 }
+
+fn ready_status(messages: &[(u8, Vec<u8>)]) -> u8 {
+    messages
+        .iter()
+        .find(|(kind, _)| *kind == b'Z')
+        .map(|(_, payload)| payload[0])
+        .expect("ReadyForQuery")
+}
+
+#[test]
+fn transaction_status_roundtrip() {
+    let dir = TempDir::new("pgwire-tx");
+    let db = dir.join("pg.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    // BEGIN switches ReadyForQuery to 'T'.
+    query(&mut stream, "BEGIN;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(ready_status(&messages), b'T');
+    assert!(messages
+        .iter()
+        .any(|(kind, payload)| *kind == b'C' && payload == b"BEGIN\0"));
+
+    // A normal statement keeps the transaction open.
+    query(&mut stream, "SELECT id FROM t;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(ready_status(&messages), b'T');
+    assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+
+    // A failing statement marks the transaction aborted ('E').
+    query(&mut stream, "SELECT * FROM missing;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(ready_status(&messages), b'E');
+    assert!(messages.iter().any(|(kind, _)| *kind == b'E'));
+
+    // Further statements are rejected until the transaction ends.
+    query(&mut stream, "SELECT id FROM t;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(ready_status(&messages), b'E');
+    assert!(messages.iter().any(|(kind, _)| *kind == b'E'));
+
+    // ROLLBACK returns to idle.
+    query(&mut stream, "ROLLBACK;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(ready_status(&messages), b'I');
+    assert!(messages
+        .iter()
+        .any(|(kind, payload)| *kind == b'C' && payload == b"ROLLBACK\0"));
+
+    // The connection works again.
+    query(&mut stream, "SELECT id FROM t;");
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(ready_status(&messages), b'I');
+    assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+
+    stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
+}
