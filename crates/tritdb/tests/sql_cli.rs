@@ -1345,3 +1345,133 @@ fn aggregate_window_functions() {
     assert!(text.contains("3\t10\t5\t15"), "out: {text}");
     assert!(text.contains("4\t10\t5\t15"), "out: {text}");
 }
+
+#[test]
+fn lag_lead_window_functions() {
+    let dir = TempDir::new("sql-lag-lead");
+    let db = dir.join("lag.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, dept TEXT NOT NULL, score INT NOT NULL); \
+         INSERT INTO t VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',15);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, LAG(score) OVER (PARTITION BY dept ORDER BY id) AS prev, \
+         LEAD(score) OVER (PARTITION BY dept ORDER BY id) AS next FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\tNULL\t20", "2\t10\tNULL", "3\tNULL\t15", "4\t5\tNULL"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+}
+
+#[test]
+fn correlated_subquery_in_order_by() {
+    let dir = TempDir::new("sql-corr-order");
+    let db = dir.join("ord.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, y INT NOT NULL); \
+         INSERT INTO t VALUES (1,10),(2,20),(3,30); \
+         CREATE TABLE u (id INT NOT NULL, x INT NOT NULL); \
+         INSERT INTO u VALUES (1,10),(2,10),(3,20);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t ORDER BY (SELECT MAX(u.id) FROM u WHERE u.x = t.y) DESC;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(rows, vec!["2", "1", "3"], "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t ORDER BY (SELECT MAX(u.id) FROM u WHERE u.x = t.y) ASC;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(rows, vec!["3", "1", "2"], "out: {text}");
+}
+
+#[test]
+fn alter_table_drop_and_rename_column() {
+    let dir = TempDir::new("sql-alter-schema");
+    let db = dir.join("schema.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c INT); \
+         INSERT INTO t VALUES (1,2,3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "ALTER TABLE t DROP COLUMN b; SELECT a, c FROM t;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("dropped column b from table t"),
+        "out: {text}"
+    );
+    assert!(text.contains("1\t3"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "ALTER TABLE t RENAME COLUMN a TO id; SELECT id, c FROM t;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("renamed column a to id in table t"),
+        "out: {text}"
+    );
+    assert!(text.contains("1\t3"), "out: {text}");
+
+    // Reopen: the rewritten schema is persisted.
+    let output = run(["sql", "--db", db, "--sql", "SELECT id, c FROM t;"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("1\t3"));
+
+    // Dropping the last column is rejected.
+    let output = run(["sql", "--db", db, "--sql", "ALTER TABLE t DROP COLUMN id;"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let output = run(["sql", "--db", db, "--sql", "ALTER TABLE t DROP COLUMN c;"]);
+    assert!(!output.status.success(), "last column must not be dropped");
+    assert!(stderr(&output).contains("cannot drop the last column"));
+}

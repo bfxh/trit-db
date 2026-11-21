@@ -1,6 +1,6 @@
 # trit-db 测试矩阵与 CI/CD
 
-M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 join 非键合取项/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/结构化 Scan 下推谓词/解析嵌套上限/恶意输入 fuzz/执行汇总/加法 schema 迁移语义拆开验证。当前工作区有 **354 个正常测试 + 4 个 `#[ignore]` 压力测试**。
+M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引擎、跨语言、崩溃、并发和 SQL 三值/分组/JOIN/DML/谓词/CASE/源表列裁剪/投影常量折叠/结构化计划/结构化 join 键/结构化过滤谓词/结构化 join 谓词/结构化 join 残余谓词/结构化 join 非键合取项/结构化 HAVING 谓词/结构化 Aggregate 分组键与聚合项/结构化 Sort 键与方向/结构化 Project 项与表达式/结构化 Scan 表名与别名/结构化 Scan 下推谓词/解析嵌套上限/恶意输入 fuzz/执行汇总/加法 schema 迁移语义拆开验证。当前工作区有 **357 个正常测试 + 4 个 `#[ignore]` 压力测试**。
 
 ## 1. 分层与计数
 
@@ -15,8 +15,8 @@ M0/M1 的测试目标不是“覆盖率数字好看”，而是把格式、引�
 | `tritdb-exec` | 34 | — | 34 | 三值 AND/OR/NOT 真值表、NULL 比较、算术、IN/BETWEEN/LIKE 三值语义、CASE 短路/简单式/缺省 NULL、非布尔谓词；标注域 K3/Belnap/Łukasiewicz/ℕ、精确模型计数、最小修复 CQA；CSR 排序去重、三值可达（certain/contingent/impossible + 见证路径）、BFS 层、三值 k-NN 分组与距离溢出、`TRGR` 往返与坏字节拒绝 |
 | `tritdb-cas` | 9 | — | 9 | SHA-256/HMAC 向量、chunk 去重/篡改检测、manifest 往返、parent 链/缺失 parent、GC、部分复制、锚点签名 |
 | `tritdb-sql` | 32 | 57 engine/security | 89 | parser、`WITH [RECURSIVE]`（working-table 不动点/UNION 去重/UNION ALL/列数与迭代上限）、TRSQ/TRSS 编解码、3VL WHERE、NULL 排序、GROUP BY/HAVING、INNER/CROSS/LEFT/RIGHT/FULL/NATURAL/USING JOIN、等值 hash join/非等值回退、`ANALYZE` 统计持久化与 DML 失效、`Auto` join 成本选择、`WHERE` 合取项拆分与单源下推、源表列裁剪（含无歧义未限定列裁剪、歧义回退与零列源表投影）、常量折叠与恒真条件简化、投影常量折叠（`SELECT` 常量项折叠/标签保持/投影错误保留）、结构化 `PlanNode` 与 `EXPLAIN SEXPR`（文本逐字保持、括号化计划、估算与零列、结构化过滤谓词、结构化 Scan 表名/别名/下推谓词）、结构化 `JoinKeys`（USING/NATURAL 列名、ON 等值对、residual/on-expr 标志、完整 join `:pred` 的 ON/USING/nested-loop 渲染、同源列等值的非键 `:residual-pred`）、`Having :pred`（`COUNT(*)` / `SUM` / 标量列谓词）、`EXPLAIN ANALYZE SEXPR`（执行汇总、节点 actual 字段、无 est 混入）、解析嵌套深度上限（括号/`NOT`/一元负号超限返回 parse error）、恶意输入 corpus + 2000 条确定性随机 SQL 字节汤不 panic、加法 schema 迁移（旧行 `NULL` 回填/重开持久化/统计失效/`IF NOT EXISTS` 幂等/`NOT NULL` 拒绝）、`EXPLAIN` 估算/`EXPLAIN ANALYZE` 实际行数与耗时/策略开关、逗号 `FROM`、空表、IN/BETWEEN/LIKE、CASE（投影/WHERE/聚合/JOIN/UPDATE）、UPDATE、聚合排序、DELETE/reopen |
-| `tritdb`（集成） | — | — | 59 | CLI 6、SQL CLI 24、PITR CLI 2、注解 CLI 5、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
-| **合计** | **124** | **138** | **354** | 另有 4 个 ignored 压力测试 |
+| `tritdb`（集成） | — | — | 62 | CLI 6、SQL CLI 27、PITR CLI 2、注解 CLI 5、crash matrix 1、硬杀 1、pstore 硬杀 1、cross-engine 2、vectors 5 |
+| **合计** | **124** | **138** | **357** | 另有 4 个 ignored 压力测试 |
 
 `vectors` 的 5 个测试覆盖 `radix.txt`、`trbl.txt`、`page.txt`、`wal.txt`、`snapshot.txt`。向量由 Python 参考实现生成，Rust 只负责解码、重编码和语义恢复。
 

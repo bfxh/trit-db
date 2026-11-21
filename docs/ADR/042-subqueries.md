@@ -42,8 +42,9 @@
    - `EXISTS`：子查询有行 → `TRUE`，否则 `FALSE`；`NOT EXISTS` 由 `Not` 包裹。
    - `ANY` / `ALL`：逐值比较后按三值 `OR` / `AND` 合并；空集 `ANY` → `FALSE`、`ALL` → `TRUE`。
    - 标量：0 行 → `NULL`；多行 → `Unsupported`；多列 → `Unsupported`。
-   - 相关子查询支持 `WHERE`、投影与 `HAVING`；外层列必须限定。
+   - 相关子查询支持 `WHERE`、投影、`HAVING` 与 `ORDER BY`；外层列必须限定。
    - `HAVING` 中的相关标量子查询按 `GROUP BY` 键生成 `CASE WHEN group_key = value THEN <subquery value> ... ELSE NULL END`，要求 `GROUP BY` 非空；非标量相关子查询仍报 `Unsupported`。
+   - `ORDER BY` 中的相关子查询逐行求值成隐藏列 `__ordN`，排序键替换为对该列的引用。
 
 ## 理由
 
@@ -53,7 +54,7 @@
 
 ## 后果 / 限制
 
-- **相关子查询只在 `WHERE`、投影与 `HAVING`**：`ORDER BY` 中的相关子查询、带 `GROUP BY`/聚合的相关投影、`HAVING` 中的非标量相关子查询报 `Unsupported`；外层列必须限定。
+- **相关子查询只在 `WHERE`、投影、`HAVING` 与 `ORDER BY`**：带 `GROUP BY`/聚合的相关投影、`HAVING` 中的非标量相关子查询报 `Unsupported`；外层列必须限定。
 - **逐行执行**：相关子查询是 nested-loop 求值（外层行数 × 子查询成本），不是为大数据集设计的。
 - **物化内存**：`IN` 子查询把结果全部转成字面量，超大结果集会占用内存。
 - **多列 `IN`**：已支持；左侧元组必须和子查询列数一致，右侧不支持值列表形式。

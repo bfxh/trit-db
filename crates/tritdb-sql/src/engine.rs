@@ -580,6 +580,14 @@ impl SqlEngine {
                 if_not_exists,
                 column,
             } => self.alter_table_add_column(name, *if_not_exists, column),
+            Statement::AlterTableDropColumn {
+                name,
+                if_exists,
+                column,
+            } => self.alter_table_drop_column(name, *if_exists, column),
+            Statement::AlterTableRenameColumn { name, from, to } => {
+                self.alter_table_rename_column(name, from, to)
+            }
             Statement::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
             Statement::Insert {
                 table,
@@ -750,6 +758,77 @@ impl SqlEngine {
         Ok(QueryResult::Message(format!(
             "added column {} to table {name}",
             definition.name
+        )))
+    }
+
+    fn alter_table_drop_column(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+        column_name: &str,
+    ) -> Result<QueryResult, SqlError> {
+        let Some(existing) = self.tables.get(name) else {
+            return Err(SqlError::UnknownTable(name.to_string()));
+        };
+        let Some(index) = existing.schema.index_of(column_name) else {
+            if if_exists {
+                return Ok(QueryResult::Message(format!(
+                    "column {column_name} does not exist in table {name}"
+                )));
+            }
+            return Err(SqlError::UnknownColumn(column_name.to_string()));
+        };
+        if existing.schema.len() <= 1 {
+            return Err(SqlError::Unsupported(
+                "cannot drop the last column of a table".to_string(),
+            ));
+        }
+        let mut table = existing.clone();
+        let mut schema = table.schema.clone();
+        schema.columns.remove(index);
+        for set in &mut schema.unique_sets {
+            set.retain(|&column| column != index);
+            for column in set.iter_mut() {
+                if *column > index {
+                    *column -= 1;
+                }
+            }
+        }
+        schema.unique_sets.retain(|set| !set.is_empty());
+        table.schema = schema;
+        for row in &mut table.rows {
+            row.remove(index);
+        }
+        self.put_table(table)?;
+        self.stats.remove(name);
+        Ok(QueryResult::Message(format!(
+            "dropped column {column_name} from table {name}"
+        )))
+    }
+
+    fn alter_table_rename_column(
+        &mut self,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<QueryResult, SqlError> {
+        let Some(existing) = self.tables.get(name) else {
+            return Err(SqlError::UnknownTable(name.to_string()));
+        };
+        let Some(index) = existing.schema.index_of(from) else {
+            return Err(SqlError::UnknownColumn(from.to_string()));
+        };
+        if existing.schema.index_of(to).is_some() {
+            return Err(SqlError::DuplicateColumn(to.to_string()));
+        }
+        let mut table = existing.clone();
+        let mut schema = table.schema.clone();
+        schema.columns[index].name = to.to_string();
+        table.schema = schema;
+        self.put_table(table)?;
+        self.stats.remove(name);
+        Ok(QueryResult::Message(format!(
+            "renamed column {from} to {to} in table {name}"
         )))
     }
 
@@ -1442,7 +1521,11 @@ impl SqlEngine {
             || folded
                 .having
                 .as_ref()
-                .is_some_and(|having| expr_has_outer_subquery(having, &outer));
+                .is_some_and(|having| expr_has_outer_subquery(having, &outer))
+            || folded
+                .order_by
+                .iter()
+                .any(|order| expr_has_outer_subquery(&order.expr, &outer));
         if has_correlated {
             return self.select_with_correlated(select, &folded, &outer);
         }
@@ -1585,6 +1668,25 @@ impl SqlEngine {
                     WindowFunction::RowNumber => Value::Int((position + 1) as i64),
                     WindowFunction::Rank => Value::Int(rank as i64),
                     WindowFunction::DenseRank => Value::Int(dense as i64),
+                    WindowFunction::Lag | WindowFunction::Lead => {
+                        let Some(bound) = bound_input.as_ref() else {
+                            return Err(SqlError::Unsupported(
+                                "LAG/LEAD requires an argument".to_string(),
+                            ));
+                        };
+                        let target = if function == WindowFunction::Lag {
+                            position.checked_sub(1)
+                        } else {
+                            Some(position + 1).filter(|next| *next < group.len())
+                        };
+                        match target {
+                            Some(target) => {
+                                let row_index = group[target].1;
+                                eval(bound, &table.schema, &table.rows[row_index])?
+                            }
+                            None => Value::Null,
+                        }
+                    }
                     WindowFunction::Aggregate(kind) => {
                         // Without ORDER BY the frame is the whole partition; with
                         // ORDER BY it is a running frame up to the current row.
@@ -1627,16 +1729,6 @@ impl SqlEngine {
                 "correlated subqueries with GROUP BY or aggregates are not supported".to_string(),
             ));
         }
-        if folded
-            .order_by
-            .iter()
-            .any(|order| expr_has_outer_subquery(&order.expr, outer))
-        {
-            return Err(SqlError::Unsupported(
-                "correlated subqueries in ORDER BY are not supported".to_string(),
-            ));
-        }
-
         let pushdown = plan_filter_pushdown(folded);
         let projection = self.plan_scan_projection(folded)?;
         let mut table = self.build_from(folded, &pushdown, &projection)?;
@@ -1691,6 +1783,35 @@ impl SqlEngine {
                 expr: Expr::Column { table: None, name },
                 alias: alias.clone(),
             };
+        }
+
+        for (index, order) in folded.order_by.iter().enumerate() {
+            if !expr_has_outer_subquery(&order.expr, outer) {
+                continue;
+            }
+            let name = format!("__ord{index}");
+            let mut values = Vec::with_capacity(table.rows.len());
+            for row in &table.rows {
+                let mut row_expr = order.expr.clone();
+                self.bind_correlated_expr(&mut row_expr, &table.schema, row, outer)?;
+                let bound = bind_expr(&row_expr, &table.schema)?;
+                values.push(eval(&bound, &table.schema, row)?);
+            }
+            let data_type = values
+                .iter()
+                .find_map(|value| match value {
+                    Value::Null => None,
+                    other => Some(value_data_type(other)),
+                })
+                .unwrap_or(DataType::Text);
+            table
+                .schema
+                .columns
+                .push(Column::new(name.clone(), data_type));
+            for (row, value) in table.rows.iter_mut().zip(values) {
+                row.push(value);
+            }
+            planned.order_by[index].expr = Expr::Column { table: None, name };
         }
 
         if let Some(having) = &folded.having {
