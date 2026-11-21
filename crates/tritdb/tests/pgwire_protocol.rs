@@ -2007,13 +2007,41 @@ fn ocsp_responder_response(
         .expect("DER")
 }
 
+fn read_http_request(stream: &mut TcpStream) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buffer[..end]).to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let lowered = line.to_ascii_lowercase();
+                            lowered
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 fn start_ocsp_responder(response: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind responder");
     let addr = listener.local_addr().expect("responder address");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buffer = [0u8; 8192];
-            let _ = stream.read(&mut buffer);
+            read_http_request(&mut stream);
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
@@ -2030,8 +2058,7 @@ fn start_failing_ocsp_responder() -> String {
     let addr = listener.local_addr().expect("responder address");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buffer = [0u8; 8192];
-            let _ = stream.read(&mut buffer);
+            read_http_request(&mut stream);
             let body = b"error";
             let header = format!(
                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
