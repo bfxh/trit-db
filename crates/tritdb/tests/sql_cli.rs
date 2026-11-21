@@ -876,3 +876,70 @@ fn subquery_errors_are_reported() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("NULL"));
 }
+
+#[test]
+fn correlated_subqueries_in_where() {
+    let dir = TempDir::new("sql-correlated");
+    let db = dir.join("corr.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, y INT NOT NULL); \
+         INSERT INTO t VALUES (1,10),(2,20),(3,30); \
+         CREATE TABLE u (id INT NOT NULL, x INT NOT NULL); \
+         INSERT INTO u VALUES (1,10),(2,10),(3,20);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id IN (SELECT u.id FROM u WHERE u.x = t.y) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "1"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "2"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "3"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id > (SELECT MAX(u.id) FROM u WHERE u.x = t.y) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert_eq!(text.trim(), "id", "no row should match: {text}");
+
+    // Uncorrelated subqueries keep using the materialize-once path.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id IN (SELECT u.id FROM u) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1", "2", "3"] {
+        assert!(text.lines().any(|line| line == expected), "out: {text}");
+    }
+
+    // Correlated subqueries in the projection are outside the supported subset.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, (SELECT MAX(u.id) FROM u WHERE u.x = t.y) AS m FROM t;",
+    ]);
+    assert!(!output.status.success(), "correlated projection must fail");
+    assert!(stderr(&output).contains("materialized before binding"));
+}
