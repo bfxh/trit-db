@@ -290,10 +290,14 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             right: Box::new(bind_expr(right, schema)?),
         }),
         Expr::InSubquery { .. }
+        | Expr::InSubqueryTuple { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::Exists { .. }
         | Expr::Quantified { .. } => Err(SqlError::Unsupported(
             "subquery must be materialized before binding".to_string(),
+        )),
+        Expr::Tuple(_) => Err(SqlError::Unsupported(
+            "parenthesized expression list is only allowed in IN".to_string(),
         )),
         Expr::Aggregate { .. } => Err(SqlError::Unsupported(
             "aggregate is only allowed in SELECT, HAVING, or ORDER BY".to_string(),
@@ -349,7 +353,9 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
+        Expr::InSubqueryTuple { exprs, .. } => exprs.iter().any(expr_has_aggregate),
         Expr::Quantified { expr, .. } => expr_has_aggregate(expr),
+        Expr::Tuple(exprs) => exprs.iter().any(expr_has_aggregate),
         Expr::ScalarSubquery { .. } | Expr::Exists { .. } => false,
         Expr::Aggregate { .. } => true,
     }
@@ -549,10 +555,14 @@ fn bind_group_expr(
             )?),
         }),
         Expr::InSubquery { .. }
+        | Expr::InSubqueryTuple { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::Exists { .. }
         | Expr::Quantified { .. } => Err(SqlError::Unsupported(
             "subquery must be materialized before binding".to_string(),
+        )),
+        Expr::Tuple(_) => Err(SqlError::Unsupported(
+            "parenthesized expression list is only allowed in IN".to_string(),
         )),
         Expr::Aggregate { kind, input } => {
             let input = match input {

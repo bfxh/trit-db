@@ -61,6 +61,8 @@ pub enum Expr {
     },
     /// `NOT expr`.
     Not(Box<Expr>),
+    /// Parenthesized expression list, used by multi-column `IN`.
+    Tuple(Vec<Expr>),
     /// `expr [NOT] IN (value, ...)`.
     InList {
         /// Probe expression.
@@ -83,6 +85,15 @@ pub enum Expr {
     ScalarSubquery {
         /// Subquery; must return zero or one row and one column.
         query: Box<Query>,
+    },
+    /// `(expr, ...) [NOT] IN (SELECT ...)`.
+    InSubqueryTuple {
+        /// Left-hand expressions.
+        exprs: Vec<Expr>,
+        /// Subquery; must return as many columns as `exprs`.
+        query: Box<Query>,
+        /// `true` for `NOT IN`.
+        negated: bool,
     },
     /// `[NOT] EXISTS (SELECT ...)`.
     Exists {

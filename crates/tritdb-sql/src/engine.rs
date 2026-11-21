@@ -62,6 +62,46 @@ const MAX_RECURSIVE_ITERATIONS: usize = 1000;
 /// Hard cap on the materialized size of one recursive CTE.
 const MAX_RECURSIVE_ROWS: usize = 100_000;
 
+fn tuple_in_expr(exprs: Vec<Expr>, rows: Vec<Vec<Value>>, negated: bool) -> Expr {
+    if rows.is_empty() {
+        return Expr::Literal(Value::Bool(negated));
+    }
+    let mut combined: Option<Expr> = None;
+    for row in rows {
+        let mut comparison: Option<Expr> = None;
+        for (expr, value) in exprs.iter().cloned().zip(row) {
+            let pair = Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(expr),
+                right: Box::new(Expr::Literal(value)),
+            };
+            comparison = Some(match comparison {
+                None => pair,
+                Some(previous) => Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(previous),
+                    right: Box::new(pair),
+                },
+            });
+        }
+        let row_expr = comparison.expect("tuple has at least one expression");
+        combined = Some(match combined {
+            None => row_expr,
+            Some(previous) => Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(previous),
+                right: Box::new(row_expr),
+            },
+        });
+    }
+    let in_expr = combined.expect("non-empty rows");
+    if negated {
+        Expr::Not(Box::new(in_expr))
+    } else {
+        in_expr
+    }
+}
+
 fn quantified_expr(probe: Expr, op: BinaryOp, kind: Quantifier, values: Vec<Value>) -> Expr {
     if values.is_empty() {
         return Expr::Literal(Value::Bool(matches!(kind, Quantifier::All)));
@@ -104,6 +144,15 @@ fn expr_has_outer_subquery(expr: &Expr, outer: &str) -> bool {
         Expr::InSubquery { expr, query, .. } => {
             expr_has_outer_subquery(expr, outer) || query_has_outer_ref(query, outer)
         }
+        Expr::InSubqueryTuple { exprs, query, .. } => {
+            exprs
+                .iter()
+                .any(|expr| expr_has_outer_subquery(expr, outer))
+                || query_has_outer_ref(query, outer)
+        }
+        Expr::Tuple(exprs) => exprs
+            .iter()
+            .any(|expr| expr_has_outer_subquery(expr, outer)),
         Expr::ScalarSubquery { query } => query_has_outer_ref(query, outer),
         Expr::Exists { query } => query_has_outer_ref(query, outer),
         Expr::Quantified { expr, query, .. } => {
@@ -186,6 +235,11 @@ fn expr_mentions_outer(expr: &Expr, outer: &str) -> bool {
         Expr::InSubquery { expr, query, .. } => {
             expr_mentions_outer(expr, outer) || query_has_outer_ref(query, outer)
         }
+        Expr::InSubqueryTuple { exprs, query, .. } => {
+            exprs.iter().any(|expr| expr_mentions_outer(expr, outer))
+                || query_has_outer_ref(query, outer)
+        }
+        Expr::Tuple(exprs) => exprs.iter().any(|expr| expr_mentions_outer(expr, outer)),
         Expr::ScalarSubquery { query } => query_has_outer_ref(query, outer),
         Expr::Exists { query } => query_has_outer_ref(query, outer),
         Expr::Quantified { expr, query, .. } => {
@@ -940,6 +994,37 @@ impl SqlEngine {
                 }
                 Ok(())
             }
+            Expr::Tuple(exprs) => {
+                for expr in exprs {
+                    self.materialize_expr(expr, outer)?;
+                }
+                Ok(())
+            }
+            Expr::InSubqueryTuple { .. } => {
+                let (mut exprs, query, negated) =
+                    match std::mem::replace(expr, Expr::Literal(Value::Null)) {
+                        Expr::InSubqueryTuple {
+                            exprs,
+                            query,
+                            negated,
+                        } => (exprs, query, negated),
+                        _ => unreachable!("replaced expression was not tuple IN subquery"),
+                    };
+                if query_has_outer_ref(&query, outer) {
+                    *expr = Expr::InSubqueryTuple {
+                        exprs,
+                        query,
+                        negated,
+                    };
+                    return Ok(());
+                }
+                for expr in &mut exprs {
+                    self.materialize_expr(expr, outer)?;
+                }
+                let rows = self.evaluate_subquery_rows(&query, exprs.len())?;
+                *expr = tuple_in_expr(exprs, rows, negated);
+                Ok(())
+            }
             Expr::InSubquery { query, negated, .. } => {
                 if query_has_outer_ref(query, outer) {
                     return Ok(());
@@ -1058,6 +1143,26 @@ impl SqlEngine {
             .into_iter()
             .map(|mut row| Expr::Literal(row.pop().unwrap_or(Value::Null)))
             .collect())
+    }
+
+    fn evaluate_subquery_rows(
+        &mut self,
+        query: &Query,
+        width: usize,
+    ) -> Result<Vec<Vec<Value>>, SqlError> {
+        let result = self.execute_query(query)?;
+        let QueryResult::Rows { columns, rows } = result else {
+            return Err(SqlError::Unsupported(
+                "tuple IN subquery must return rows".to_string(),
+            ));
+        };
+        if columns.len() != width {
+            return Err(SqlError::Unsupported(format!(
+                "tuple IN subquery returns {} column(s), expected {width}",
+                columns.len()
+            )));
+        }
+        Ok(rows)
     }
 
     fn evaluate_quantified_column(&mut self, query: &Query) -> Result<Vec<Value>, SqlError> {
@@ -1263,7 +1368,11 @@ impl SqlEngine {
             || folded.items.iter().any(|item| match item {
                 SelectItem::Wildcard => false,
                 SelectItem::Expr { expr, .. } => expr_has_outer_subquery(expr, &outer),
-            });
+            })
+            || folded
+                .having
+                .as_ref()
+                .is_some_and(|having| expr_has_outer_subquery(having, &outer));
         if has_correlated {
             return self.select_with_correlated(select, &folded, &outer);
         }
@@ -1292,14 +1401,13 @@ impl SqlEngine {
         folded: &Select,
         outer: &str,
     ) -> Result<QueryResult, SqlError> {
-        if !folded.group_by.is_empty() || select_has_aggregate(folded) {
+        let items_have_correlated = folded.items.iter().any(|item| match item {
+            SelectItem::Wildcard => false,
+            SelectItem::Expr { expr, .. } => expr_has_outer_subquery(expr, outer),
+        });
+        if items_have_correlated && (!folded.group_by.is_empty() || select_has_aggregate(folded)) {
             return Err(SqlError::Unsupported(
                 "correlated subqueries with GROUP BY or aggregates are not supported".to_string(),
-            ));
-        }
-        if folded.having.is_some() {
-            return Err(SqlError::Unsupported(
-                "correlated subqueries with HAVING are not supported".to_string(),
             ));
         }
         if folded
@@ -1368,12 +1476,178 @@ impl SqlEngine {
             };
         }
 
+        if let Some(having) = &folded.having {
+            if expr_has_outer_subquery(having, outer) {
+                if folded.group_by.is_empty() {
+                    return Err(SqlError::Unsupported(
+                        "correlated subqueries in HAVING require GROUP BY".to_string(),
+                    ));
+                }
+                let groups = self.group_keys(folded, &table)?;
+                let mut planned_having = having.clone();
+                self.replace_having_subqueries(
+                    &mut planned_having,
+                    &table,
+                    &folded.group_by,
+                    &groups,
+                    outer,
+                )?;
+                planned.having = Some(planned_having);
+            }
+        }
+
         let plan = bind_select(&planned, &table)?;
         let result = execute_select(&table, &plan)?;
         match &original.under_repair {
             Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
         }
+    }
+
+    /// One representative row per `GROUP BY` key.
+    fn group_keys(
+        &self,
+        select: &Select,
+        table: &Table,
+    ) -> Result<Vec<(Vec<Value>, Row)>, SqlError> {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        let mut groups: Vec<(Vec<Value>, Row)> = Vec::new();
+        for row in &table.rows {
+            let mut key = Vec::with_capacity(select.group_by.len());
+            for expr in &select.group_by {
+                let bound = bind_expr(expr, &table.schema)?;
+                key.push(eval(&bound, &table.schema, row)?);
+            }
+            if !seen.contains(&key) {
+                seen.push(key.clone());
+                groups.push((key, row.clone()));
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Rewrites scalar correlated subqueries in `HAVING` into a `CASE` over
+    /// the group keys, so the ordinary grouping executor can evaluate it.
+    fn replace_having_subqueries(
+        &mut self,
+        expr: &mut Expr,
+        table: &Table,
+        group_by: &[Expr],
+        groups: &[(Vec<Value>, Row)],
+        outer: &str,
+    ) -> Result<(), SqlError> {
+        match expr {
+            Expr::ScalarSubquery { query } => {
+                if !query_has_outer_ref(query, outer) {
+                    return Ok(());
+                }
+                *expr = self.having_case(query, table, group_by, groups, outer)?;
+                Ok(())
+            }
+            Expr::InSubquery { .. }
+            | Expr::InSubqueryTuple { .. }
+            | Expr::Exists { .. }
+            | Expr::Quantified { .. } => {
+                if expr_has_outer_subquery(expr, outer) {
+                    return Err(SqlError::Unsupported(
+                        "only scalar correlated subqueries are supported in HAVING".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Expr::Literal(_) | Expr::Column { .. } | Expr::Tuple(_) => Ok(()),
+            Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+                self.replace_having_subqueries(expr, table, group_by, groups, outer)
+            }
+            Expr::InList { expr, values, .. } => {
+                self.replace_having_subqueries(expr, table, group_by, groups, outer)?;
+                for value in values {
+                    self.replace_having_subqueries(value, table, group_by, groups, outer)?;
+                }
+                Ok(())
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.replace_having_subqueries(expr, table, group_by, groups, outer)?;
+                self.replace_having_subqueries(low, table, group_by, groups, outer)?;
+                self.replace_having_subqueries(high, table, group_by, groups, outer)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.replace_having_subqueries(expr, table, group_by, groups, outer)?;
+                self.replace_having_subqueries(pattern, table, group_by, groups, outer)
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    self.replace_having_subqueries(operand, table, group_by, groups, outer)?;
+                }
+                for (when, then) in branches {
+                    self.replace_having_subqueries(when, table, group_by, groups, outer)?;
+                    self.replace_having_subqueries(then, table, group_by, groups, outer)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.replace_having_subqueries(else_expr, table, group_by, groups, outer)?;
+                }
+                Ok(())
+            }
+            Expr::Binary { left, right, .. } => {
+                self.replace_having_subqueries(left, table, group_by, groups, outer)?;
+                self.replace_having_subqueries(right, table, group_by, groups, outer)
+            }
+            Expr::Aggregate { input, .. } => {
+                if let Some(input) = input {
+                    self.replace_having_subqueries(input, table, group_by, groups, outer)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn having_case(
+        &mut self,
+        query: &Query,
+        table: &Table,
+        group_by: &[Expr],
+        groups: &[(Vec<Value>, Row)],
+        outer: &str,
+    ) -> Result<Expr, SqlError> {
+        let mut branches = Vec::with_capacity(groups.len());
+        for (key, row) in groups {
+            let mut query = query.clone();
+            self.substitute_outer(&mut query, &table.schema, row, outer)?;
+            let value = self.evaluate_scalar_subquery(&query)?;
+            let mut condition: Option<Expr> = None;
+            for (expr, value) in group_by.iter().cloned().zip(key) {
+                let pair = Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(expr),
+                    right: Box::new(Expr::Literal(value.clone())),
+                };
+                condition = Some(match condition {
+                    None => pair,
+                    Some(previous) => Expr::Binary {
+                        op: BinaryOp::And,
+                        left: Box::new(previous),
+                        right: Box::new(pair),
+                    },
+                });
+            }
+            let condition = condition.ok_or_else(|| {
+                SqlError::Unsupported(
+                    "correlated subqueries in HAVING require GROUP BY".to_string(),
+                )
+            })?;
+            branches.push((condition, Expr::Literal(value)));
+        }
+        Ok(Expr::Case {
+            operand: None,
+            branches,
+            else_expr: Some(Box::new(Expr::Literal(Value::Null))),
+        })
     }
 
     /// Replaces correlated subqueries in one row's filter with their values.
@@ -1394,6 +1668,31 @@ impl SqlEngine {
                 for value in values {
                     self.bind_correlated_expr(value, outer_schema, outer_row, outer)?;
                 }
+                Ok(())
+            }
+            Expr::Tuple(exprs) => {
+                for expr in exprs {
+                    self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+            Expr::InSubqueryTuple { .. } => {
+                let (mut exprs, query, negated) =
+                    match std::mem::replace(expr, Expr::Literal(Value::Null)) {
+                        Expr::InSubqueryTuple {
+                            exprs,
+                            query,
+                            negated,
+                        } => (exprs, query, negated),
+                        _ => unreachable!("replaced expression was not tuple IN subquery"),
+                    };
+                for expr in &mut exprs {
+                    self.bind_correlated_expr(expr, outer_schema, outer_row, outer)?;
+                }
+                let mut query = query.as_ref().clone();
+                self.substitute_outer(&mut query, outer_schema, outer_row, outer)?;
+                let rows = self.evaluate_subquery_rows(&query, exprs.len())?;
+                *expr = tuple_in_expr(exprs, rows, negated);
                 Ok(())
             }
             Expr::InSubquery { query, negated, .. } => {
@@ -1569,6 +1868,18 @@ impl SqlEngine {
                     self.substitute_outer_expr(value, outer_schema, outer_row, outer)?;
                 }
                 Ok(())
+            }
+            Expr::Tuple(exprs) => {
+                for expr in exprs {
+                    self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+                }
+                Ok(())
+            }
+            Expr::InSubqueryTuple { exprs, query, .. } => {
+                for expr in exprs {
+                    self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
+                }
+                self.substitute_outer(query, outer_schema, outer_row, outer)
             }
             Expr::InSubquery { query, .. } | Expr::ScalarSubquery { query } => {
                 self.substitute_outer(query, outer_schema, outer_row, outer)
@@ -2622,9 +2933,11 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
             expr_sources(left, sources) && expr_sources(right, sources)
         }
         Expr::InSubquery { .. }
+        | Expr::InSubqueryTuple { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::Exists { .. }
         | Expr::Quantified { .. } => false,
+        Expr::Tuple(exprs) => exprs.iter().all(|expr| expr_sources(expr, sources)),
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| expr_sources(expr, sources)),
@@ -2707,9 +3020,13 @@ fn collect_expr_columns(
                 && collect_expr_columns(right, qualifiers, source_columns, keep)
         }
         Expr::InSubquery { .. }
+        | Expr::InSubqueryTuple { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::Exists { .. }
         | Expr::Quantified { .. } => false,
+        Expr::Tuple(exprs) => exprs
+            .iter()
+            .all(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep)),
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep)),
@@ -2999,9 +3316,11 @@ fn fold_expr(expr: &Expr) -> Expr {
             })
         }
         Expr::InSubquery { .. }
+        | Expr::InSubqueryTuple { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::Exists { .. }
         | Expr::Quantified { .. } => expr.clone(),
+        Expr::Tuple(exprs) => Expr::Tuple(exprs.iter().map(fold_expr).collect()),
         Expr::Aggregate { .. } => expr.clone(),
     }
 }
@@ -3033,7 +3352,9 @@ fn expr_is_constant(expr: &Expr) -> bool {
         }
         Expr::Binary { left, right, .. } => expr_is_constant(left) && expr_is_constant(right),
         Expr::InSubquery { expr, .. } => expr_is_constant(expr),
+        Expr::InSubqueryTuple { exprs, .. } => exprs.iter().all(expr_is_constant),
         Expr::Quantified { expr, .. } => expr_is_constant(expr),
+        Expr::Tuple(exprs) => exprs.iter().all(expr_is_constant),
         Expr::ScalarSubquery { .. } | Expr::Exists { .. } => false,
     }
 }

@@ -923,10 +923,17 @@ impl Parser {
             ) {
                 let query = self.parse_query()?;
                 self.expect_symbol(Symbol::RParen)?;
-                return Ok(Expr::InSubquery {
-                    expr: Box::new(left),
-                    query: Box::new(query),
-                    negated,
+                return Ok(match left {
+                    Expr::Tuple(exprs) => Expr::InSubqueryTuple {
+                        exprs,
+                        query: Box::new(query),
+                        negated,
+                    },
+                    other => Expr::InSubquery {
+                        expr: Box::new(other),
+                        query: Box::new(query),
+                        negated,
+                    },
                 });
             }
             let mut values = Vec::new();
@@ -1129,9 +1136,21 @@ impl Parser {
                         query: Box::new(query),
                     });
                 }
-                let expr = self.parse_expr()?;
+                let first = self.parse_expr()?;
+                if self.eat_symbol(Symbol::Comma) {
+                    let mut exprs = vec![first];
+                    loop {
+                        exprs.push(self.parse_expr()?);
+                        if self.eat_symbol(Symbol::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                    self.expect_symbol(Symbol::RParen)?;
+                    return Ok(Expr::Tuple(exprs));
+                }
                 self.expect_symbol(Symbol::RParen)?;
-                Ok(expr)
+                Ok(first)
             }
             _ => Err(SqlError::parse("expected expression", token.offset)),
         }
