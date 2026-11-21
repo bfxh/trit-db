@@ -64,6 +64,34 @@ jobs:
       - run: grep -q '"bench_id":"sql_join"' /tmp/sql-join.txt
       - run: cargo run --locked --release -p tritdb-bench -- sql-exec --rows 256 --rounds 1 --query filter | tee /tmp/sql-exec.txt
       - run: grep -q '"bench_id":"sql_exec"' /tmp/sql-exec.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-scan --rows 256 --rounds 1 | tee /tmp/bench-sql-scan.txt
+      - run: grep -q '"bench_id":"sql_scan"' /tmp/bench-sql-scan.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-point --rows 256 --lookups 16 | tee /tmp/bench-sql-point.txt
+      - run: grep -q '"bench_id":"sql_point"' /tmp/bench-sql-point.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-group --rows 256 --groups 8 --rounds 1 | tee /tmp/bench-sql-group.txt
+      - run: grep -q '"bench_id":"sql_group"' /tmp/bench-sql-group.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-sort --rows 256 --limit 8 --rounds 1 | tee /tmp/bench-sql-sort.txt
+      - run: grep -q '"bench_id":"sql_sort"' /tmp/bench-sql-sort.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-insert --rows 32 --rounds 1 | tee /tmp/bench-sql-insert.txt
+      - run: grep -q '"bench_id":"sql_insert"' /tmp/bench-sql-insert.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-update --rows 256 --cutoff 16 --rounds 1 | tee /tmp/bench-sql-update.txt
+      - run: grep -q '"bench_id":"sql_update"' /tmp/bench-sql-update.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-delete --rows 256 --cutoff 16 --rounds 1 | tee /tmp/bench-sql-delete.txt
+      - run: grep -q '"bench_id":"sql_delete"' /tmp/bench-sql-delete.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-subquery --rows 128 --rounds 1 | tee /tmp/bench-sql-subquery.txt
+      - run: grep -q '"bench_id":"sql_subquery"' /tmp/bench-sql-subquery.txt
+      - run: cargo run --locked --release -p tritdb-bench -- sql-window --rows 256 --rounds 1 | tee /tmp/bench-sql-window.txt
+      - run: grep -q '"bench_id":"sql_window"' /tmp/bench-sql-window.txt
+      - run: cargo run --locked --release -p tritdb-bench -- pstore-scan --pages 16 --payload 512 --rounds 1 | tee /tmp/bench-pstore-scan.txt
+      - run: grep -q '"bench_id":"pstore_scan"' /tmp/bench-pstore-scan.txt
+      - run: cargo run --locked --release -p tritdb-bench -- txn-put --txns 16 --keys-per-txn 2 --rounds 1 | tee /tmp/bench-txn-put.txt
+      - run: grep -q '"bench_id":"txn_put"' /tmp/bench-txn-put.txt
+      - run: cargo run --locked --release -p tritdb-bench -- pgwire --rows 32 --queries 8 --rounds 1 | tee /tmp/bench-pgwire.txt
+      - run: grep -q '"bench_id":"pgwire_roundtrip"' /tmp/bench-pgwire.txt
+      - run: cargo run --locked --release -p tritdb-bench -- ann-knn --points 256 --dims 8 --k 5 --rounds 1 | tee /tmp/bench-ann-knn.txt
+      - run: grep -q '"bench_id":"ann_knn"' /tmp/bench-ann-knn.txt
+      - run: cargo run --locked --release -p tritdb-bench -- graph-reach --nodes 64 --fanout 4 --hops 4 --rounds 1 | tee /tmp/bench-graph-reach.txt
+      - run: grep -q '"bench_id":"graph_reach"' /tmp/bench-graph-reach.txt
 
   python-crosscheck:
     name: python crosscheck (${{ matrix.os }})
