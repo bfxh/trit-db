@@ -297,23 +297,65 @@ impl SqlEngine {
                 columns,
                 rows,
                 select,
-            } => self.insert(table, columns.as_deref(), rows, select.as_deref()),
+            } => {
+                let mut rows = rows.clone();
+                for row in &mut rows {
+                    for value in row {
+                        self.materialize_expr(value)?;
+                    }
+                }
+                self.insert(table, columns.as_deref(), &rows, select.as_deref())
+            }
             Statement::CountModels { expr, vars } => self.count_models(expr, *vars),
-            Statement::Select(select) => self.select(select),
+            Statement::Select(select) => {
+                let mut select = select.clone();
+                self.materialize_subqueries(&mut select)?;
+                self.select(&select)
+            }
             Statement::With(with) => self.with_query(with),
-            Statement::Explain(select) => self.explain(select, false, ExplainFormat::Text),
-            Statement::ExplainSexpr(select) => self.explain(select, false, ExplainFormat::Sexpr),
-            Statement::ExplainAnalyze(select) => self.explain(select, true, ExplainFormat::Text),
+            Statement::Explain(select) => {
+                let mut select = select.clone();
+                self.materialize_subqueries(&mut select)?;
+                self.explain(&select, false, ExplainFormat::Text)
+            }
+            Statement::ExplainSexpr(select) => {
+                let mut select = select.clone();
+                self.materialize_subqueries(&mut select)?;
+                self.explain(&select, false, ExplainFormat::Sexpr)
+            }
+            Statement::ExplainAnalyze(select) => {
+                let mut select = select.clone();
+                self.materialize_subqueries(&mut select)?;
+                self.explain(&select, true, ExplainFormat::Text)
+            }
             Statement::ExplainAnalyzeSexpr(select) => {
-                self.explain(select, true, ExplainFormat::Sexpr)
+                let mut select = select.clone();
+                self.materialize_subqueries(&mut select)?;
+                self.explain(&select, true, ExplainFormat::Sexpr)
             }
             Statement::Analyze { table } => self.analyze(table.as_deref()),
-            Statement::Delete { table, filter } => self.delete(table, filter.as_ref()),
+            Statement::Delete { table, filter } => {
+                let mut filter = filter.clone();
+                if let Some(filter) = &mut filter {
+                    self.materialize_expr(filter)?;
+                }
+                self.delete(table, filter.as_ref())
+            }
             Statement::Update {
                 table,
                 assignments,
                 filter,
-            } => self.update(table, assignments, filter.as_ref()),
+            } => {
+                let mut assignments = assignments.clone();
+                for assignment in &mut assignments {
+                    self.materialize_expr(&mut assignment.value)?;
+                }
+                let mut filter = filter.clone();
+                if let Some(filter) = &mut filter {
+                    self.materialize_expr(filter)?;
+                }
+                self.update(table, &assignments, filter.as_ref())
+            }
         }
     }
 
@@ -668,8 +710,161 @@ impl SqlEngine {
 
     fn execute_query(&mut self, query: &Query) -> Result<QueryResult, SqlError> {
         match query {
-            Query::Select(select) => self.select(select),
+            Query::Select(select) => {
+                let mut select = select.as_ref().clone();
+                self.materialize_subqueries(&mut select)?;
+                self.select(&select)
+            }
             Query::With(with) => self.with_query(with),
+        }
+    }
+
+    /// Replaces `IN (SELECT ...)` and scalar subqueries with literal
+    /// expressions, so the binder and executor never see a subquery.
+    ///
+    /// Only uncorrelated subqueries are supported: a subquery that references
+    /// an outer column fails to resolve and reports `UnknownColumn`.
+    fn materialize_subqueries(&mut self, select: &mut Select) -> Result<(), SqlError> {
+        for item in &mut select.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.materialize_expr(expr)?;
+            }
+        }
+        for join in &mut select.joins {
+            if let JoinCondition::On(expr) = &mut join.condition {
+                self.materialize_expr(expr)?;
+            }
+        }
+        if let Some(filter) = &mut select.filter {
+            self.materialize_expr(filter)?;
+        }
+        for expr in &mut select.group_by {
+            self.materialize_expr(expr)?;
+        }
+        if let Some(having) = &mut select.having {
+            self.materialize_expr(having)?;
+        }
+        for order in &mut select.order_by {
+            self.materialize_expr(&mut order.expr)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_expr(&mut self, expr: &mut Expr) -> Result<(), SqlError> {
+        match expr {
+            Expr::Literal(_) | Expr::Column { .. } => Ok(()),
+            Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+                self.materialize_expr(expr)
+            }
+            Expr::InList { expr, values, .. } => {
+                self.materialize_expr(expr)?;
+                for value in values {
+                    self.materialize_expr(value)?;
+                }
+                Ok(())
+            }
+            Expr::InSubquery { query, negated, .. } => {
+                let values = self.evaluate_subquery_column(query)?;
+                let negated = *negated;
+                let probe = match std::mem::replace(expr, Expr::Literal(Value::Null)) {
+                    Expr::InSubquery { expr: probe, .. } => probe,
+                    _ => unreachable!("replaced expression was not IN subquery"),
+                };
+                let mut probe = *probe;
+                self.materialize_expr(&mut probe)?;
+                *expr = Expr::InList {
+                    expr: Box::new(probe),
+                    values,
+                    negated,
+                };
+                Ok(())
+            }
+            Expr::ScalarSubquery { query } => {
+                let value = self.evaluate_scalar_subquery(query)?;
+                *expr = Expr::Literal(value);
+                Ok(())
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.materialize_expr(expr)?;
+                self.materialize_expr(low)?;
+                self.materialize_expr(high)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.materialize_expr(expr)?;
+                self.materialize_expr(pattern)
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    self.materialize_expr(operand)?;
+                }
+                for (when, then) in branches {
+                    self.materialize_expr(when)?;
+                    self.materialize_expr(then)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.materialize_expr(else_expr)?;
+                }
+                Ok(())
+            }
+            Expr::Binary { left, right, .. } => {
+                self.materialize_expr(left)?;
+                self.materialize_expr(right)
+            }
+            Expr::Aggregate { input, .. } => {
+                if let Some(input) = input {
+                    self.materialize_expr(input)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn evaluate_subquery_column(&mut self, query: &Query) -> Result<Vec<Expr>, SqlError> {
+        let result = self.execute_query(query)?;
+        let QueryResult::Rows { columns, rows } = result else {
+            return Err(SqlError::Unsupported(
+                "subquery in IN must return rows".to_string(),
+            ));
+        };
+        if columns.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "subquery in IN must return exactly one column".to_string(),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|mut row| Expr::Literal(row.pop().unwrap_or(Value::Null)))
+            .collect())
+    }
+
+    fn evaluate_scalar_subquery(&mut self, query: &Query) -> Result<Value, SqlError> {
+        let result = self.execute_query(query)?;
+        let QueryResult::Rows { columns, rows } = result else {
+            return Err(SqlError::Unsupported(
+                "scalar subquery must return rows".to_string(),
+            ));
+        };
+        if columns.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "scalar subquery must return exactly one column".to_string(),
+            ));
+        }
+        match rows.len() {
+            0 => Ok(Value::Null),
+            1 => Ok(rows
+                .into_iter()
+                .next()
+                .and_then(|mut row| row.pop())
+                .unwrap_or(Value::Null)),
+            _ => Err(SqlError::Unsupported(
+                "scalar subquery returned more than one row".to_string(),
+            )),
         }
     }
 
@@ -1835,6 +2030,8 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
         Expr::Binary { left, right, .. } => {
             expr_sources(left, sources) && expr_sources(right, sources)
         }
+        Expr::InSubquery { expr, .. } => expr_sources(expr, sources),
+        Expr::ScalarSubquery { .. } => false,
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| expr_sources(expr, sources)),
@@ -1916,6 +2113,10 @@ fn collect_expr_columns(
             collect_expr_columns(left, qualifiers, source_columns, keep)
                 && collect_expr_columns(right, qualifiers, source_columns, keep)
         }
+        Expr::InSubquery { expr, .. } => {
+            collect_expr_columns(expr, qualifiers, source_columns, keep)
+        }
+        Expr::ScalarSubquery { .. } => false,
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep)),
@@ -2204,6 +2405,7 @@ fn fold_expr(expr: &Expr) -> Expr {
                 right: Box::new(right),
             })
         }
+        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => expr.clone(),
         Expr::Aggregate { .. } => expr.clone(),
     }
 }
@@ -2234,6 +2436,8 @@ fn expr_is_constant(expr: &Expr) -> bool {
                 && else_expr.as_deref().is_none_or(expr_is_constant)
         }
         Expr::Binary { left, right, .. } => expr_is_constant(left) && expr_is_constant(right),
+        Expr::InSubquery { expr, .. } => expr_is_constant(expr),
+        Expr::ScalarSubquery { .. } => false,
     }
 }
 

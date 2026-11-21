@@ -734,3 +734,145 @@ fn with_dml_bodies_and_insert_select() {
     assert!(!output.status.success(), "WITH + DDL must fail");
     assert!(stderr(&output).contains("WITH must be followed by"));
 }
+
+#[test]
+fn subqueries_in_where_and_projection() {
+    let dir = TempDir::new("sql-subquery");
+    let db = dir.join("subq.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2),(3); \
+         CREATE TABLE u (id INT NOT NULL); INSERT INTO u VALUES (2),(3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "2"), "out: {text}");
+    assert!(text.lines().any(|line| line == "3"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "1"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id NOT IN (SELECT id FROM u) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "1"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "2"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, (SELECT MAX(id) FROM u) AS m FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t3"), "out: {text}");
+    assert!(text.contains("2\t3"), "out: {text}");
+}
+
+#[test]
+fn subqueries_connect_ctes_to_update_and_delete() {
+    let dir = TempDir::new("sql-subquery");
+    let db = dir.join("subq.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2),(3); \
+         CREATE TABLE u (id INT NOT NULL); INSERT INTO u VALUES (2),(3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH c AS (SELECT id FROM u) UPDATE t SET id = id WHERE id IN (SELECT id FROM c);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("updated 2 row(s)"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "WITH c AS (SELECT id FROM u WHERE id = 2) DELETE FROM t WHERE id IN (SELECT id FROM c);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("deleted 1 row(s)"));
+
+    let output = run(["sql", "--db", db, "--sql", "SELECT id FROM t ORDER BY id;"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "1"), "out: {text}");
+    assert!(text.lines().any(|line| line == "3"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "2"), "out: {text}");
+}
+
+#[test]
+fn subquery_errors_are_reported() {
+    let dir = TempDir::new("sql-subquery");
+    let db = dir.join("subq.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2),(3); \
+         CREATE TABLE u (id INT NOT NULL); INSERT INTO u VALUES (2),(3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT (SELECT id FROM u) AS m FROM t;",
+    ]);
+    assert!(!output.status.success(), "scalar multi-row must fail");
+    assert!(stderr(&output).contains("more than one row"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id IN (SELECT id, id FROM u);",
+    ]);
+    assert!(!output.status.success(), "IN multi-column must fail");
+    assert!(stderr(&output).contains("exactly one column"));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT (SELECT id FROM u WHERE id = 99) AS m;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("NULL"));
+}

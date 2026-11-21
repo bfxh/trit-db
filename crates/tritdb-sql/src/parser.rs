@@ -917,6 +917,18 @@ impl Parser {
 
         if self.eat_keyword(Keyword::In) {
             self.expect_symbol(Symbol::LParen)?;
+            if matches!(
+                self.peek().map(|token| &token.kind),
+                Some(TokenKind::Keyword(Keyword::Select)) | Some(TokenKind::Keyword(Keyword::With))
+            ) {
+                let query = self.parse_query()?;
+                self.expect_symbol(Symbol::RParen)?;
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(left),
+                    query: Box::new(query),
+                    negated,
+                });
+            }
             let mut values = Vec::new();
             loop {
                 values.push(self.parse_expr()?);
@@ -1087,6 +1099,17 @@ impl Parser {
             TokenKind::Keyword(Keyword::Max) => self.parse_aggregate(AggregateKind::Max),
             TokenKind::Keyword(Keyword::Case) => self.parse_case(),
             TokenKind::Symbol(Symbol::LParen) => {
+                if matches!(
+                    self.peek().map(|token| &token.kind),
+                    Some(TokenKind::Keyword(Keyword::Select))
+                        | Some(TokenKind::Keyword(Keyword::With))
+                ) {
+                    let query = self.parse_query()?;
+                    self.expect_symbol(Symbol::RParen)?;
+                    return Ok(Expr::ScalarSubquery {
+                        query: Box::new(query),
+                    });
+                }
                 let expr = self.parse_expr()?;
                 self.expect_symbol(Symbol::RParen)?;
                 Ok(expr)

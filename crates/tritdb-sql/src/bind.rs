@@ -289,6 +289,9 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
             left: Box::new(bind_expr(left, schema)?),
             right: Box::new(bind_expr(right, schema)?),
         }),
+        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => Err(SqlError::Unsupported(
+            "subquery must be materialized before binding".to_string(),
+        )),
         Expr::Aggregate { .. } => Err(SqlError::Unsupported(
             "aggregate is only allowed in SELECT, HAVING, or ORDER BY".to_string(),
         )),
@@ -342,6 +345,8 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
                 || else_expr.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
+        Expr::ScalarSubquery { .. } => false,
         Expr::Aggregate { .. } => true,
     }
 }
@@ -539,6 +544,9 @@ fn bind_group_expr(
                 group_columns,
             )?),
         }),
+        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => Err(SqlError::Unsupported(
+            "subquery must be materialized before binding".to_string(),
+        )),
         Expr::Aggregate { kind, input } => {
             let input = match input {
                 Some(input) => {
