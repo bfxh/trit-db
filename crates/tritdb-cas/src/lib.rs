@@ -636,10 +636,19 @@ impl Anchor {
     /// Verifies the HMAC tag.
     pub fn verify(&self, key: &[u8]) -> bool {
         match self.hmac {
-            Some(tag) => hmac_sha256(key, &self.encode_unsigned()) == tag,
+            Some(tag) => constant_time_eq(&hmac_sha256(key, &self.encode_unsigned()), &tag),
             None => false,
         }
     }
+}
+
+/// Compares two byte strings without short-circuiting on the first mismatch.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for (a, b) in left.iter().zip(right) {
+        diff |= usize::from(a ^ b);
+    }
+    diff == 0
 }
 
 /// HMAC-SHA256 (FIPS 198-1) over the in-crate SHA-256.
@@ -952,6 +961,14 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn constant_time_eq_matches_byte_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
     fn anchor_signs_and_detects_tampering() {
         let head = Hash::of(b"head");
         let mut anchor = Anchor::new(head);

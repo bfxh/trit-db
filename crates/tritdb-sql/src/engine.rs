@@ -2059,7 +2059,9 @@ impl SqlEngine {
         select: &Select,
         table: &Table,
     ) -> Result<Vec<(Vec<Value>, Row)>, SqlError> {
-        let mut seen: Vec<Vec<Value>> = Vec::new();
+        // A hash set keeps this O(rows); the previous linear `seen` vector
+        // made a high-cardinality GROUP BY quadratic.
+        let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
         let mut groups: Vec<(Vec<Value>, Row)> = Vec::new();
         for row in &table.rows {
             let mut key = Vec::with_capacity(select.group_by.len());
@@ -2067,8 +2069,7 @@ impl SqlEngine {
                 let bound = bind_expr(expr, &table.schema)?;
                 key.push(eval(&bound, &table.schema, row)?);
             }
-            if !seen.contains(&key) {
-                seen.push(key.clone());
+            if seen.insert(key.clone()) {
                 groups.push((key, row.clone()));
             }
         }
@@ -2179,6 +2180,12 @@ impl SqlEngine {
         groups: &[(Vec<Value>, Row)],
         outer: &str,
     ) -> Result<Expr, SqlError> {
+        if groups.len() > MAX_CORRELATED_ROWS {
+            return Err(SqlError::Unsupported(format!(
+                "correlated subquery in HAVING would run for {} groups (limit {MAX_CORRELATED_ROWS})",
+                groups.len()
+            )));
+        }
         let mut branches = Vec::with_capacity(groups.len());
         for (key, row) in groups {
             let mut query = query.clone();
@@ -5859,6 +5866,40 @@ fn eval_aggregate(
 mod tests {
     use super::*;
     use crate::parser::parse_script;
+
+    #[test]
+    fn having_correlated_subquery_group_cap() {
+        let dir = tritdb_testkit::TempDir::new("engine-having-cap");
+        let db = dir.join("having.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        engine
+            .execute_script("CREATE TABLE g (x INT NOT NULL); CREATE TABLE s (x INT NOT NULL);")
+            .expect("create");
+        let values: String = (0..MAX_CORRELATED_ROWS + 1)
+            .map(|value| format!("({value}),"))
+            .collect::<String>();
+        engine
+            .execute_script(&format!(
+                "INSERT INTO g VALUES {};",
+                values.trim_end_matches(',')
+            ))
+            .expect("seed g");
+        engine
+            .execute_script("INSERT INTO s VALUES (0);")
+            .expect("seed s");
+
+        let error = match engine.execute_script(
+            "SELECT x, COUNT(*) FROM g GROUP BY x \
+             HAVING COUNT(*) = (SELECT COUNT(*) FROM s WHERE s.x = g.x);",
+        ) {
+            Ok(_) => panic!("a correlated HAVING subquery over the group cap must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SqlError::Unsupported(ref message) if message.contains("correlated subquery")),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn correlated_subquery_row_cap() {

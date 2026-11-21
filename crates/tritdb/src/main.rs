@@ -1077,11 +1077,11 @@ fn manifest_restore_pages(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let capacity = usize::try_from(page_count)
-        .ok()
-        .and_then(|count| count.checked_mul(page_size))
-        .ok_or_else(|| "page file size overflows this platform".to_string())?;
-    let mut bytes = Vec::with_capacity(capacity);
+    // Stream one page at a time: a multi-gigabyte database used to be fully
+    // materialized here (page_count * page_size) before the first byte landed.
+    let tmp = format!("{out}.tmp");
+    let mut file = std::fs::File::create(&tmp).map_err(|error| format!("create {tmp}: {error}"))?;
+    let mut written = 0u64;
     for index in 0..page_count {
         let name = format!("page/{index:016x}");
         let hash = manifest
@@ -1095,13 +1095,15 @@ fn manifest_restore_pages(args: &[String]) -> Result<(), String> {
                 page.len()
             ));
         }
-        bytes.extend_from_slice(&page);
+        std::io::Write::write_all(&mut file, &page)
+            .map_err(|error| format!("write {tmp}: {error}"))?;
+        written += page.len() as u64;
     }
-
-    let tmp = format!("{out}.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|error| format!("write {tmp}: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync {tmp}: {error}"))?;
+    drop(file);
     std::fs::rename(&tmp, &out).map_err(|error| format!("rename {tmp} -> {out}: {error}"))?;
-    println!("pages={page_count} bytes={} out={out}", bytes.len());
+    println!("pages={page_count} bytes={written} out={out}");
     Ok(())
 }
 

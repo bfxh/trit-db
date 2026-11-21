@@ -107,6 +107,17 @@ pub enum SqlError {
     Io(std::io::Error),
 }
 
+/// Truncates an identifier echoed in a hint, so a 16 MiB name cannot turn
+/// every error line into a 16 MiB log entry.
+fn hint_name(name: &str) -> String {
+    const MAX: usize = 128;
+    if name.chars().count() <= MAX {
+        return name.to_string();
+    }
+    let truncated: String = name.chars().take(MAX).collect();
+    format!("{truncated}…")
+}
+
 impl SqlError {
     pub(crate) fn parse(message: impl Into<String>, position: usize) -> Self {
         Self::Parse {
@@ -168,20 +179,28 @@ impl SqlError {
         match self {
             SqlError::Parse { .. } => None,
             SqlError::UnknownTable(name) => Some(format!(
-                "check the table name `{name}`; create it first if it is missing"
+                "check the table name `{}`; create it first if it is missing",
+                hint_name(name)
             )),
             SqlError::TableExists(name) => Some(format!(
-                "table `{name}` already exists; drop it first or pick another name"
+                "table `{}` already exists; drop it first or pick another name",
+                hint_name(name)
             )),
             SqlError::UnknownColumn(name) => Some(format!(
-                "check the column name `{name}`; qualify it as `table.{name}` when several tables share it"
+                "check the column name `{}`; qualify it as `table.{}` when several tables share it",
+                hint_name(name),
+                hint_name(name)
             )),
             SqlError::UnknownName {
                 kind,
                 name,
                 candidates,
             } => {
-                let mut hint = format!("check the {} name `{name}`", unknown_kind(*kind));
+                let mut hint = format!(
+                    "check the {} name `{}`",
+                    unknown_kind(*kind),
+                    hint_name(name)
+                );
                 if candidates.is_empty() {
                     hint.push_str(match kind {
                         NameKind::Table => "; create it first if it is missing",
@@ -192,43 +211,57 @@ impl SqlError {
                 }
                 Some(hint)
             }
-            SqlError::AmbiguousColumn(name) => {
-                Some(format!("qualify `{name}` as `table.{name}`"))
-            }
+            SqlError::AmbiguousColumn(name) => Some(format!(
+                "qualify `{}` as `table.{}`",
+                hint_name(name),
+                hint_name(name)
+            )),
             SqlError::DuplicateTableAlias(name) => Some(format!(
-                "`{name}` is used twice in FROM; give each item a distinct alias"
+                "`{}` is used twice in FROM; give each item a distinct alias",
+                hint_name(name)
             )),
             SqlError::DuplicateColumn(name) => Some(format!(
-                "column `{name}` is declared twice; rename one of them"
+                "column `{}` is declared twice; rename one of them",
+                hint_name(name)
             )),
             SqlError::ColumnCount {
                 table,
                 expected,
                 actual,
             } => Some(format!(
-                "INSERT INTO {table} needs {expected} values but got {actual}; list the target columns if the row is partial"
+                "INSERT INTO {} needs {expected} values but got {actual}; list the target columns if the row is partial",
+                hint_name(table)
             )),
             SqlError::NotNull { table, column } => Some(format!(
-                "supply a value for `{table}.{column}` or make the column nullable"
+                "supply a value for `{}.{}` or make the column nullable",
+                hint_name(table),
+                hint_name(column)
             )),
             SqlError::CheckViolation { table, expression } => Some(format!(
-                "the row violates `CHECK ({expression})` on `{table}`; adjust the values"
+                "the row violates `CHECK ({})` on `{}`; adjust the values",
+                hint_name(expression),
+                hint_name(table)
             )),
             SqlError::DuplicateKey {
                 table,
                 column,
                 value,
             } => Some(format!(
-                "`{table}.{column}` is UNIQUE; `{value}` already exists, pick another value"
+                "`{}.{}` is UNIQUE; `{}` already exists, pick another value",
+                hint_name(table),
+                hint_name(column),
+                hint_name(value)
             )),
             SqlError::NestedAggregate => {
                 Some("compute the inner aggregate in a subquery first".to_string())
             }
             SqlError::ColumnOutsideAggregate(name) => Some(format!(
-                "wrap `{name}` in an aggregate (SUM/COUNT/MIN/MAX/AVG) or add it to GROUP BY"
+                "wrap `{}` in an aggregate (SUM/COUNT/MIN/MAX/AVG) or add it to GROUP BY",
+                hint_name(name)
             )),
             SqlError::ColumnOutsideGroup(name) => Some(format!(
-                "add `{name}` to GROUP BY or wrap it in an aggregate"
+                "add `{}` to GROUP BY or wrap it in an aggregate",
+                hint_name(name)
             )),
             SqlError::Unsupported(_) => Some(
                 "this build does not implement it; see docs/specs/SQL.md for the supported subset"
@@ -482,6 +515,18 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn hint_echoes_are_bounded() {
+        let long = "x".repeat(4096);
+        let hint = SqlError::UnknownColumn(long.clone()).hint().expect("hint");
+        assert!(hint.chars().count() < 512, "hint must be bounded: {hint}");
+        assert!(hint.contains('…'));
+        let hint = SqlError::UnknownTable("t".to_string())
+            .hint()
+            .expect("hint");
+        assert!(hint.contains('t'));
+    }
+
     fn hints_are_actionable() {
         let hint = SqlError::UnknownColumn("stat".into()).hint().unwrap();
         assert!(hint.contains("stat") && hint.contains("table.stat"));
