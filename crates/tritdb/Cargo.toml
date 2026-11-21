@@ -22,6 +22,7 @@ tritdb-wal.workspace = true
 [dev-dependencies]
 tritdb-testkit.workspace = true
 base64 = "0.22"
+const-oid = "0.9"
 der = "0.7"
 md-5 = "0.11"
 ring = "0.17"

@@ -16,9 +16,11 @@ getrandom = "0.3"
 md-5 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
+webpki-roots = "1"
 x509-parser = { version = "0.18.1", features = ["verify"] }
 x509-ocsp = "0.2.1"
 der = "0.7"
+const-oid = "0.9"
 sha1 = "0.10"
 spki = "0.7"
 x509-cert = "0.2"

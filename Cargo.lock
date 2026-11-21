@@ -652,6 +652,7 @@ name = "tritdb"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "const-oid 0.9.6",
  "der",
  "md-5",
  "rcgen",
@@ -718,6 +719,7 @@ name = "tritdb-pgwire"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "const-oid 0.9.6",
  "der",
  "getrandom 0.3.4",
  "md-5",
@@ -730,6 +732,7 @@ dependencies = [
  "tritdb-cas",
  "tritdb-exec",
  "tritdb-sql",
+ "webpki-roots",
  "x509-cert",
  "x509-ocsp",
  "x509-parser",
@@ -818,6 +821,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
