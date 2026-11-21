@@ -644,12 +644,13 @@ fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, PgError> {
     let mut stream = TcpStream::connect((host, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let request = format!(
+    let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/ocsp-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(body)?;
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request)?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     let header_end = response
