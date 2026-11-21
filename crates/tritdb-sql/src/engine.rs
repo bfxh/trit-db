@@ -11,8 +11,8 @@ use tritdb_exec::{
 use tritdb_txn::TxnStore;
 
 use crate::ast::{
-    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Query, Select, SelectItem,
-    Statement, With,
+    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Quantifier, Query, Select,
+    SelectItem, Statement, With,
 };
 use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
 use crate::error::SqlError;
@@ -60,6 +60,33 @@ const MAX_RECURSIVE_ITERATIONS: usize = 1000;
 /// Hard cap on the materialized size of one recursive CTE.
 const MAX_RECURSIVE_ROWS: usize = 100_000;
 
+fn quantified_expr(probe: Expr, op: BinaryOp, kind: Quantifier, values: Vec<Value>) -> Expr {
+    if values.is_empty() {
+        return Expr::Literal(Value::Bool(matches!(kind, Quantifier::All)));
+    }
+    let combine = match kind {
+        Quantifier::Any => BinaryOp::Or,
+        Quantifier::All => BinaryOp::And,
+    };
+    let mut combined: Option<Expr> = None;
+    for value in values {
+        let comparison = Expr::Binary {
+            op,
+            left: Box::new(probe.clone()),
+            right: Box::new(Expr::Literal(value)),
+        };
+        combined = Some(match combined {
+            None => comparison,
+            Some(previous) => Expr::Binary {
+                op: combine,
+                left: Box::new(previous),
+                right: Box::new(comparison),
+            },
+        });
+    }
+    combined.expect("values is non-empty")
+}
+
 fn expr_has_outer_subquery(expr: &Expr, outer: &str) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Column { .. } => false,
@@ -76,6 +103,10 @@ fn expr_has_outer_subquery(expr: &Expr, outer: &str) -> bool {
             expr_has_outer_subquery(expr, outer) || query_has_outer_ref(query, outer)
         }
         Expr::ScalarSubquery { query } => query_has_outer_ref(query, outer),
+        Expr::Exists { query } => query_has_outer_ref(query, outer),
+        Expr::Quantified { expr, query, .. } => {
+            expr_has_outer_subquery(expr, outer) || query_has_outer_ref(query, outer)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -154,6 +185,10 @@ fn expr_mentions_outer(expr: &Expr, outer: &str) -> bool {
             expr_mentions_outer(expr, outer) || query_has_outer_ref(query, outer)
         }
         Expr::ScalarSubquery { query } => query_has_outer_ref(query, outer),
+        Expr::Exists { query } => query_has_outer_ref(query, outer),
+        Expr::Quantified { expr, query, .. } => {
+            expr_mentions_outer(expr, outer) || query_has_outer_ref(query, outer)
+        }
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_mentions_outer(expr, outer)
         }
@@ -930,6 +965,40 @@ impl SqlEngine {
                 *expr = Expr::Literal(value);
                 Ok(())
             }
+            Expr::Exists { query } => {
+                if query_has_outer_ref(query, outer) {
+                    return Ok(());
+                }
+                let result = self.execute_query(query)?;
+                let exists = matches!(&result, QueryResult::Rows { rows, .. } if !rows.is_empty());
+                *expr = Expr::Literal(Value::Bool(exists));
+                Ok(())
+            }
+            Expr::Quantified { .. } => {
+                let (mut probe, op, kind, query) =
+                    match std::mem::replace(expr, Expr::Literal(Value::Null)) {
+                        Expr::Quantified {
+                            expr,
+                            op,
+                            kind,
+                            query,
+                        } => (expr, op, kind, query),
+                        _ => unreachable!("replaced expression was not quantified"),
+                    };
+                if query_has_outer_ref(&query, outer) {
+                    *expr = Expr::Quantified {
+                        expr: probe,
+                        op,
+                        kind,
+                        query,
+                    };
+                    return Ok(());
+                }
+                self.materialize_expr(&mut probe, outer)?;
+                let values = self.evaluate_quantified_column(&query)?;
+                *expr = quantified_expr(*probe, op, kind, values);
+                Ok(())
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -986,6 +1055,24 @@ impl SqlEngine {
         Ok(rows
             .into_iter()
             .map(|mut row| Expr::Literal(row.pop().unwrap_or(Value::Null)))
+            .collect())
+    }
+
+    fn evaluate_quantified_column(&mut self, query: &Query) -> Result<Vec<Value>, SqlError> {
+        let result = self.execute_query(query)?;
+        let QueryResult::Rows { columns, rows } = result else {
+            return Err(SqlError::Unsupported(
+                "quantified subquery must return rows".to_string(),
+            ));
+        };
+        if columns.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "quantified subquery must return exactly one column".to_string(),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|mut row| row.pop().unwrap_or(Value::Null))
             .collect())
     }
 
@@ -1267,6 +1354,31 @@ impl SqlEngine {
                 *expr = Expr::Literal(value);
                 Ok(())
             }
+            Expr::Exists { query } => {
+                let mut query = query.as_ref().clone();
+                self.substitute_outer(&mut query, outer_schema, outer_row, outer)?;
+                let result = self.execute_query(&query)?;
+                let exists = matches!(&result, QueryResult::Rows { rows, .. } if !rows.is_empty());
+                *expr = Expr::Literal(Value::Bool(exists));
+                Ok(())
+            }
+            Expr::Quantified { .. } => {
+                let (mut probe, op, kind, mut query) =
+                    match std::mem::replace(expr, Expr::Literal(Value::Null)) {
+                        Expr::Quantified {
+                            expr,
+                            op,
+                            kind,
+                            query,
+                        } => (expr, op, kind, query),
+                        _ => unreachable!("replaced expression was not quantified"),
+                    };
+                self.bind_correlated_expr(&mut probe, outer_schema, outer_row, outer)?;
+                self.substitute_outer(&mut query, outer_schema, outer_row, outer)?;
+                let values = self.evaluate_quantified_column(&query)?;
+                *expr = quantified_expr(*probe, op, kind, values);
+                Ok(())
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -1392,6 +1504,11 @@ impl SqlEngine {
                 Ok(())
             }
             Expr::InSubquery { query, .. } | Expr::ScalarSubquery { query } => {
+                self.substitute_outer(query, outer_schema, outer_row, outer)
+            }
+            Expr::Exists { query } => self.substitute_outer(query, outer_schema, outer_row, outer),
+            Expr::Quantified { expr, query, .. } => {
+                self.substitute_outer_expr(expr, outer_schema, outer_row, outer)?;
                 self.substitute_outer(query, outer_schema, outer_row, outer)
             }
             Expr::Between {
@@ -2437,7 +2554,10 @@ fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
         Expr::Binary { left, right, .. } => {
             expr_sources(left, sources) && expr_sources(right, sources)
         }
-        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => false,
+        Expr::InSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Quantified { .. } => false,
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| expr_sources(expr, sources)),
@@ -2519,7 +2639,10 @@ fn collect_expr_columns(
             collect_expr_columns(left, qualifiers, source_columns, keep)
                 && collect_expr_columns(right, qualifiers, source_columns, keep)
         }
-        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => false,
+        Expr::InSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Quantified { .. } => false,
         Expr::Aggregate { input, .. } => input
             .as_deref()
             .is_none_or(|expr| collect_expr_columns(expr, qualifiers, source_columns, keep)),
@@ -2808,7 +2931,10 @@ fn fold_expr(expr: &Expr) -> Expr {
                 right: Box::new(right),
             })
         }
-        Expr::InSubquery { .. } | Expr::ScalarSubquery { .. } => expr.clone(),
+        Expr::InSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Quantified { .. } => expr.clone(),
         Expr::Aggregate { .. } => expr.clone(),
     }
 }
@@ -2840,7 +2966,8 @@ fn expr_is_constant(expr: &Expr) -> bool {
         }
         Expr::Binary { left, right, .. } => expr_is_constant(left) && expr_is_constant(right),
         Expr::InSubquery { expr, .. } => expr_is_constant(expr),
-        Expr::ScalarSubquery { .. } => false,
+        Expr::Quantified { expr, .. } => expr_is_constant(expr),
+        Expr::ScalarSubquery { .. } | Expr::Exists { .. } => false,
     }
 }
 

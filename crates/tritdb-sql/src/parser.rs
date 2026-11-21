@@ -1,8 +1,8 @@
 use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
-    AggregateKind, Assignment, ColumnDef, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy, Query,
-    Select, SelectItem, Statement, With,
+    AggregateKind, Assignment, ColumnDef, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy,
+    Quantifier, Query, Select, SelectItem, Statement, With,
 };
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -977,6 +977,24 @@ impl Parser {
         };
         if let Some(op) = op {
             self.pos += 1;
+            let kind = if self.eat_keyword(Keyword::Any) {
+                Some(Quantifier::Any)
+            } else if self.eat_keyword(Keyword::All) {
+                Some(Quantifier::All)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.expect_symbol(Symbol::LParen)?;
+                let query = self.parse_query()?;
+                self.expect_symbol(Symbol::RParen)?;
+                return Ok(Expr::Quantified {
+                    expr: Box::new(left),
+                    op,
+                    kind,
+                    query: Box::new(query),
+                });
+            }
             let right = self.parse_additive()?;
             return Ok(binary(op, left, right));
         }
@@ -1098,6 +1116,7 @@ impl Parser {
             TokenKind::Keyword(Keyword::Min) => self.parse_aggregate(AggregateKind::Min),
             TokenKind::Keyword(Keyword::Max) => self.parse_aggregate(AggregateKind::Max),
             TokenKind::Keyword(Keyword::Case) => self.parse_case(),
+            TokenKind::Keyword(Keyword::Exists) => self.parse_exists(),
             TokenKind::Symbol(Symbol::LParen) => {
                 if matches!(
                     self.peek().map(|token| &token.kind),
@@ -1116,6 +1135,15 @@ impl Parser {
             }
             _ => Err(SqlError::parse("expected expression", token.offset)),
         }
+    }
+
+    fn parse_exists(&mut self) -> Result<Expr, SqlError> {
+        self.expect_symbol(Symbol::LParen)?;
+        let query = self.parse_query()?;
+        self.expect_symbol(Symbol::RParen)?;
+        Ok(Expr::Exists {
+            query: Box::new(query),
+        })
     }
 
     fn parse_case(&mut self) -> Result<Expr, SqlError> {

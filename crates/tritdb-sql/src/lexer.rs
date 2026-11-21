@@ -70,6 +70,7 @@ pub enum Keyword {
     Recursive,
     Union,
     All,
+    Any,
 }
 
 impl Keyword {
@@ -142,6 +143,7 @@ impl Keyword {
             "recursive" => Some(Keyword::Recursive),
             "union" => Some(Keyword::Union),
             "all" => Some(Keyword::All),
+            "any" => Some(Keyword::Any),
             _ => None,
         }
     }

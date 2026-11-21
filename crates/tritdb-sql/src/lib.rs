@@ -12,7 +12,8 @@ mod stats;
 mod storage;
 
 pub use ast::{
-    AggregateKind, ColumnDef, Cte, Expr, OrderBy, Query, Select, SelectItem, Statement, With,
+    AggregateKind, ColumnDef, Cte, Expr, OrderBy, Quantifier, Query, Select, SelectItem, Statement,
+    With,
 };
 pub use engine::{JoinStrategy, QueryResult, SqlEngine};
 pub use error::SqlError;

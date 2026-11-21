@@ -943,3 +943,102 @@ fn correlated_subqueries_in_where() {
     assert!(!output.status.success(), "correlated projection must fail");
     assert!(stderr(&output).contains("materialized before binding"));
 }
+
+#[test]
+fn exists_and_quantified_subqueries() {
+    let dir = TempDir::new("sql-exists");
+    let db = dir.join("exists.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1),(2),(3); \
+         CREATE TABLE u (id INT NOT NULL); INSERT INTO u VALUES (2),(3);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "2"), "out: {text}");
+    assert!(text.lines().any(|line| line == "3"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "1"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "1"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "2"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id > ANY (SELECT id FROM u) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "3"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "2"), "out: {text}");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id > ALL (SELECT id FROM u) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "id");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id <> ALL (SELECT id FROM u) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.lines().any(|line| line == "1"), "out: {text}");
+    assert!(!text.lines().any(|line| line == "2"), "out: {text}");
+
+    // Empty subquery: ANY is false, ALL is true.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id > ANY (SELECT id FROM u WHERE u.id > 10) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "id");
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id FROM t WHERE id < ALL (SELECT id FROM u WHERE u.id > 10) ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1", "2", "3"] {
+        assert!(text.lines().any(|line| line == expected), "out: {text}");
+    }
+}

@@ -21,7 +21,9 @@
 2. **非相关：执行前物化**
    - `execute_statement` / `execute_query` 在执行前遍历表达式，把：
      - `InSubquery { expr, query, negated }` → `InList { expr, values: [Literal(v), ...], negated }`；
-     - `ScalarSubquery { query }` → `Literal(value)`。
+     - `ScalarSubquery { query }` → `Literal(value)`；
+     - `Exists { query }` → `Literal(Bool(rows > 0))`；
+     - `Quantified { expr, op, kind, query }` → 对每个结果值生成 `expr op value`，按 `ANY`→`OR` / `ALL`→`AND` 串起来（空集：`ANY`→`FALSE`、`ALL`→`TRUE`）。
    - binder / executor / 常量折叠 / 列裁剪只看到 `InList` 与 `Literal`，不需要知道子查询存在。
    - `execute_query` 统一做物化，覆盖 `WITH` 的 seed/step、`INSERT ... SELECT`、`IN (SELECT ...)` 嵌套。
 
@@ -37,6 +39,8 @@
 
 4. **语义**
    - `IN`：0 行 → 恒 `FALSE`（含 `NOT IN` → `TRUE`）；`NULL` 走既有三值 `IN` 规则。
+   - `EXISTS`：子查询有行 → `TRUE`，否则 `FALSE`；`NOT EXISTS` 由 `Not` 包裹。
+   - `ANY` / `ALL`：逐值比较后按三值 `OR` / `AND` 合并；空集 `ANY` → `FALSE`、`ALL` → `TRUE`。
    - 标量：0 行 → `NULL`；多行 → `Unsupported`；多列 → `Unsupported`。
    - 相关子查询不支持：子查询里引用外层列会解析失败并报 `UnknownColumn`。
 
@@ -51,7 +55,6 @@
 - **相关子查询只在 `WHERE`**：投影 / `HAVING` / `ORDER BY` 中的相关子查询报 `Unsupported`；外层列必须限定。
 - **逐行执行**：相关子查询是 nested-loop 求值（外层行数 × 子查询成本），不是为大数据集设计的。
 - **物化内存**：`IN` 子查询把结果全部转成字面量，超大结果集会占用内存。
-- **`EXISTS` / `ANY` / `ALL`**：未实现。
 - **多列 `IN`**：不支持（`(a, b) IN (SELECT ...)`）。
 - 子查询的 `NULL` 语义依赖既有 `IN` 三值实现，`NOT IN` 遇到 `NULL` 会得到 `UNKNOWN` 而不是 `TRUE`。
 
@@ -67,4 +70,5 @@ cargo fmt --all -- --check
 - `IN` / `NOT IN` 过滤、标量投影、标量零行 `NULL`；
 - `WITH c AS (...) UPDATE ... WHERE id IN (SELECT id FROM c)` 与 `DELETE`；
 - 标量多行、`IN` 多列报错；
-- 相关 `IN` / 相关标量（`WHERE`）、非相关路径回归、投影相关子查询被拒绝。
+- 相关 `IN` / 相关标量（`WHERE`）、非相关路径回归、投影相关子查询被拒绝；
+- `EXISTS` / `NOT EXISTS` / `> ANY` / `> ALL` / `<> ALL`、空集 `ANY` → 空、空集 `ALL` → 全保留。
