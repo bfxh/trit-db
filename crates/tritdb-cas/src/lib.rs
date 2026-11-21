@@ -961,7 +961,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn constant_time_eq_matches_byte_equality() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(constant_time_eq(b"", b""));
@@ -969,6 +968,7 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
     }
 
+    #[test]
     fn anchor_signs_and_detects_tampering() {
         let head = Hash::of(b"head");
         let mut anchor = Anchor::new(head);

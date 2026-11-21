@@ -7,6 +7,14 @@ use tritdb_exec::ann::B4;
 use tritdb_exec::{Column, DataType, Schema, Table, Value};
 use tritdb_testkit::{Rng, TempDir};
 
+/// Fuzz rounds per test; CI raises this with `TRITDB_FUZZ_ROUNDS`.
+fn fuzz_rounds() -> usize {
+    std::env::var("TRITDB_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2000)
+}
+
 fn random_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
     (0..len).map(|_| rng.next_u64() as u8).collect()
 }
@@ -35,7 +43,7 @@ fn sample_table() -> Table {
 #[test]
 fn random_bytes_never_panic_any_decoder() {
     let mut rng = Rng::new(0xF022_0001);
-    for _ in 0..2000 {
+    for _ in 0..fuzz_rounds() {
         let len = (rng.below(300) + 1) as usize;
         let bytes = random_bytes(&mut rng, len);
         let _ = tritdb_sql::decode_table("fuzz", &bytes);
@@ -57,7 +65,7 @@ fn random_bytes_never_panic_any_decoder() {
 fn mutated_valid_payloads_never_panic() {
     let bytes = tritdb_sql::encode_table(&sample_table()).expect("encode");
     let mut rng = Rng::new(0xF022_0002);
-    for _ in 0..2000 {
+    for _ in 0..fuzz_rounds() {
         let mut mutated = bytes.clone();
         let flips = (rng.below(3) + 1) as usize;
         for _ in 0..flips {
@@ -76,7 +84,7 @@ fn mutated_valid_payloads_never_panic() {
 #[test]
 fn mutated_cas_and_format_payloads_never_panic() {
     let mut rng = Rng::new(0xF022_0003);
-    for _ in 0..2000 {
+    for _ in 0..fuzz_rounds() {
         let len = (rng.below(128) + 1) as usize;
         let mut bytes = random_bytes(&mut rng, len);
         if len >= 5 {
@@ -95,7 +103,7 @@ fn mutated_cas_and_format_payloads_never_panic() {
 fn page_view_parse_never_panics() {
     let mut rng = Rng::new(0xF022_0004);
     let mut block = [0u8; tritdb_page::PAGE_SIZE];
-    for _ in 0..2000 {
+    for _ in 0..fuzz_rounds() {
         for byte in block.iter_mut() {
             *byte = rng.next_u64() as u8;
         }
@@ -143,7 +151,7 @@ fn random_page_store_files_never_panic() {
 #[test]
 fn random_graph_payloads_never_panic() {
     let mut rng = Rng::new(0xF022_0007);
-    for _ in 0..2000 {
+    for _ in 0..fuzz_rounds() {
         let len = (rng.below(300) + 1) as usize;
         let mut bytes = random_bytes(&mut rng, len);
         let _ = tritdb_exec::graph::AnnotatedGraph::decode(&bytes);
@@ -196,7 +204,7 @@ fn random_sql_text_never_panics() {
         "1e999",
     ];
     let mut rng = Rng::new(0xF022_0008);
-    for _ in 0..2000 {
+    for _ in 0..fuzz_rounds() {
         let mut sql = String::new();
         for _ in 0..=(rng.below(24)) {
             sql.push_str(fragments[rng.below(fragments.len() as u32) as usize]);

@@ -17,6 +17,48 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  fuzz:
+    name: fuzz (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release -p tritdb --test fuzz_decode
+        env:
+          TRITDB_FUZZ_ROUNDS: "20000"
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  diff:
+    name: pgwire diff (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p tritdb --test pgwire_diff -- --ignored --nocapture
+        env:
+          TRITDB_PG_HOST: 127.0.0.1
+          TRITDB_PG_PORT: "5432"
+
   lint:
     name: lint
     runs-on: ubuntu-latest

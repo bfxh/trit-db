@@ -424,6 +424,62 @@ fn extended_query_substitutes_typed_parameters() {
 }
 
 #[test]
+fn execute_max_rows_suspends_and_resumes() {
+    let (_dir, mut stream) = start_server("pgproto-max-rows");
+    write_startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(
+        &mut stream,
+        "CREATE TABLE t (x INT NOT NULL); INSERT INTO t VALUES (1), (2), (3), (4), (5);",
+    );
+    let _ = read_until_ready(&mut stream);
+
+    // Parse("s", "SELECT x FROM t") with no parameters.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"s\0");
+    payload.extend_from_slice(b"SELECT x FROM t;\0");
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    write_message(&mut stream, b'P', &payload);
+
+    // Bind("p", "s") with no parameters and no result formats.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"p\0s\0");
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    payload.extend_from_slice(&0i16.to_be_bytes());
+    write_message(&mut stream, b'B', &payload);
+
+    let execute = |stream: &mut TcpStream, max_rows: i32| {
+        let mut payload = b"p\0".to_vec();
+        payload.extend_from_slice(&max_rows.to_be_bytes());
+        write_message(stream, b'E', &payload);
+        write_message(stream, b'S', b"");
+        read_until_ready(stream)
+    };
+
+    let messages = execute(&mut stream, 2);
+    assert!(!has_error(&messages), "first page failed: {messages:?}");
+    assert_eq!(messages.iter().filter(|(kind, _)| *kind == b'D').count(), 2);
+    assert!(
+        messages.iter().any(|(kind, _)| *kind == b's'),
+        "expected PortalSuspended: {messages:?}"
+    );
+
+    let messages = execute(&mut stream, 2);
+    assert_eq!(messages.iter().filter(|(kind, _)| *kind == b'D').count(), 2);
+    assert!(messages.iter().any(|(kind, _)| *kind == b's'));
+
+    let messages = execute(&mut stream, 2);
+    assert_eq!(messages.iter().filter(|(kind, _)| *kind == b'D').count(), 1);
+    assert!(
+        messages.iter().any(|(kind, _)| *kind == b'C'),
+        "expected CommandComplete on the last page: {messages:?}"
+    );
+    assert!(!messages.iter().any(|(kind, _)| *kind == b's'));
+}
+
+#[test]
 fn terminate_closes_connection_cleanly() {
     let (_dir, mut stream) = start_server("pgproto-terminate");
     write_startup(&mut stream);

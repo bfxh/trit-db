@@ -577,6 +577,8 @@ pub struct SqlEngine {
     tables: BTreeMap<String, Table>,
     stats: BTreeMap<String, TableStats>,
     join_strategy: JoinStrategy,
+    /// Deadline checked while scanning rows; `None` means "no limit".
+    deadline: std::sync::RwLock<Option<Instant>>,
 }
 
 impl SqlEngine {
@@ -679,6 +681,7 @@ impl SqlEngine {
             tables,
             stats,
             join_strategy: JoinStrategy::Auto,
+            deadline: std::sync::RwLock::new(None),
         })
     }
 
@@ -695,6 +698,26 @@ impl SqlEngine {
     /// Overrides the JOIN strategy for benchmarks or differential tests.
     pub fn set_join_strategy(&mut self, strategy: JoinStrategy) {
         self.join_strategy = strategy;
+    }
+
+    /// Sets a deadline checked while scanning rows (`None` clears it).
+    ///
+    /// A query that runs past the deadline returns
+    /// `Unsupported("query cancelled: ...")` instead of holding the engine
+    /// lock until it finishes.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        *self
+            .deadline
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
+    }
+
+    /// Current scan deadline, if any.
+    pub fn deadline(&self) -> Option<Instant> {
+        *self
+            .deadline
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Executes a SQL script and returns one result per statement.
@@ -1791,7 +1814,7 @@ impl SqlEngine {
         let table = self.build_from(&folded, &pushdown, &projection)?;
         let filtered_select = select_with_filter(&folded, pushdown.residual.clone());
         let plan = bind_select(&filtered_select, &table)?;
-        let result = execute_select(&table, &plan)?;
+        let result = execute_select(&table, &plan, self.deadline())?;
         match &select.under_repair {
             Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
@@ -1870,7 +1893,7 @@ impl SqlEngine {
         }
 
         let plan = bind_select(&planned, &table)?;
-        let result = execute_select(&table, &plan)?;
+        let result = execute_select(&table, &plan, self.deadline())?;
         match &original.under_repair {
             Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
@@ -2099,7 +2122,7 @@ impl SqlEngine {
         }
 
         let plan = bind_select(&planned, &table)?;
-        let result = execute_select(&table, &plan)?;
+        let result = execute_select(&table, &plan, self.deadline())?;
         match &original.under_repair {
             Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
@@ -2643,7 +2666,7 @@ impl SqlEngine {
             let mut stats = ExecutionStats::default();
             let table = self.build_from_inner(&folded, &pushdown, &projection, Some(&mut stats))?;
             let plan = bind_select(&filtered_select, &table)?;
-            let result = execute_select_inner(&table, &plan, Some(&mut stats))?;
+            let result = execute_select_inner(&table, &plan, Some(&mut stats), self.deadline())?;
             if let QueryResult::Rows { rows, .. } = &result {
                 stats.output_rows = rows.len();
             }
@@ -5316,14 +5339,19 @@ fn batch_filter_indices(filter: &ExecExpr, schema: &Schema, rows: &[Row]) -> Opt
     Some(filter_indices(&truth))
 }
 
-fn execute_select(table: &Table, plan: &BoundSelect) -> Result<QueryResult, SqlError> {
-    execute_select_inner(table, plan, None)
+fn execute_select(
+    table: &Table,
+    plan: &BoundSelect,
+    deadline: Option<Instant>,
+) -> Result<QueryResult, SqlError> {
+    execute_select_inner(table, plan, None, deadline)
 }
 
 fn execute_select_inner(
     table: &Table,
     plan: &BoundSelect,
     mut stats: Option<&mut ExecutionStats>,
+    deadline: Option<Instant>,
 ) -> Result<QueryResult, SqlError> {
     let filter_start = stats.is_some().then(Instant::now);
     let batch_indices = plan
@@ -5335,17 +5363,26 @@ fn execute_select_inner(
             .iter()
             .map(|index| table.rows[*index].clone())
             .collect(),
-        None => table
-            .rows
-            .iter()
-            .filter_map(
-                |row| match passes_filter(plan.filter.as_ref(), &table.schema, row) {
-                    Ok(true) => Some(Ok(row.clone())),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect::<Result<Vec<_>, _>>()?,
+        None => {
+            let mut filtered = Vec::new();
+            for (index, row) in table.rows.iter().enumerate() {
+                if index % 1024 == 0 {
+                    if let Some(deadline) = deadline {
+                        if Instant::now() >= deadline {
+                            return Err(SqlError::Unsupported(
+                                "query cancelled: deadline exceeded".to_string(),
+                            ));
+                        }
+                    }
+                }
+                match passes_filter(plan.filter.as_ref(), &table.schema, row) {
+                    Ok(true) => filtered.push(row.clone()),
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            filtered
+        }
     };
     // The batch path is opt-in; in debug builds it is checked against the
     // row-at-a-time implementation on every query that takes it.
@@ -6026,6 +6063,51 @@ mod tests {
             rows.is_empty(),
             "NOT IN with a NULL candidate must not return rows: {rows:?}"
         );
+    }
+
+    #[test]
+    fn deadline_cancels_a_scan() {
+        let dir = tritdb_testkit::TempDir::new("engine-deadline");
+        let db = dir.join("deadline.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        engine
+            .execute_script("CREATE TABLE t (x INT NOT NULL); INSERT INTO t VALUES (1);")
+            .expect("seed");
+
+        engine.set_deadline(Some(Instant::now() - std::time::Duration::from_millis(1)));
+        let error = match engine.execute_script("SELECT * FROM t;") {
+            Ok(_) => panic!("an expired deadline must cancel the scan"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SqlError::Unsupported(ref message) if message.contains("cancelled")),
+            "unexpected error: {error}"
+        );
+
+        engine.set_deadline(None);
+        assert!(engine.execute_script("SELECT * FROM t;").is_ok());
+    }
+
+    #[test]
+    fn multi_statement_scripts_stay_supported() {
+        // `parse_script` returning several statements is by design (script
+        // files); the injection-prone entry points have their own checks.
+        let dir = tritdb_testkit::TempDir::new("engine-multi");
+        let db = dir.join("multi.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        let results = engine
+            .execute_script(
+                "CREATE TABLE t (x INT NOT NULL); \
+                 INSERT INTO t VALUES (1), (2); \
+                 SELECT COUNT(*) FROM t;",
+            )
+            .expect("multi statement script");
+        assert_eq!(results.len(), 3);
+        let rows = match &results[2] {
+            QueryResult::Rows { rows, .. } => rows,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(rows[0][0], Value::Int(2));
     }
 
     #[test]

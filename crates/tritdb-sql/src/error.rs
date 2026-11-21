@@ -515,7 +515,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn hint_echoes_are_bounded() {
         let long = "x".repeat(4096);
         let hint = SqlError::UnknownColumn(long.clone()).hint().expect("hint");
@@ -527,6 +526,7 @@ mod tests {
         assert!(hint.contains('t'));
     }
 
+    #[test]
     fn hints_are_actionable() {
         let hint = SqlError::UnknownColumn("stat".into()).hint().unwrap();
         assert!(hint.contains("stat") && hint.contains("table.stat"));

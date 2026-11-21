@@ -113,7 +113,7 @@ fn print_help() {
     outln!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
     outln!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http(s)://...>] [--tls-client-ocsp-ca <pem>] [--tls-client-ocsp-allow-hold]]");
     outln!("        [--allow-plaintext-password]");
-    outln!("        [--max-connections 64] [--lock-timeout-ms 30000]");
+    outln!("        [--max-connections 64] [--lock-timeout-ms 30000] [--query-timeout-ms 0]");
     outln!("        [--scram-verifier-file <file>]");
     outln!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
     outln!("  sql --db sql.db --file script.sql");
@@ -1871,6 +1871,18 @@ fn run_serve(args: &[String]) -> Result<(), String> {
             tritdb_pgwire::DEFAULT_ENGINE_LOCK_TIMEOUT_MS,
         )),
     };
+    let query_timeout = match arg_value(args, "--query-timeout-ms") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(millis) => Some(std::time::Duration::from_millis(millis)),
+            Err(_) => {
+                return Err(format!(
+                    "bad --query-timeout-ms {value}: expected milliseconds (0 disables)"
+                ))
+            }
+        },
+        None => None,
+    };
     if matches!(auth, tritdb_pgwire::AuthMode::Password(_))
         && tls_cert.is_none()
         && !allow_plaintext_password
@@ -1896,6 +1908,7 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         allow_plaintext_password,
         max_connections,
         engine_lock_timeout,
+        query_timeout,
     };
     let listener =
         std::net::TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;

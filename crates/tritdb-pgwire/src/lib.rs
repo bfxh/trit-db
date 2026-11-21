@@ -226,6 +226,8 @@ pub struct ServerOptions {
     /// How long a connection waits for the shared engine lock before it
     /// reports a timeout; `None` waits forever.
     pub engine_lock_timeout: Option<Duration>,
+    /// Wall-clock budget for one query's row scan; `None` means unlimited.
+    pub query_timeout: Option<Duration>,
 }
 
 impl Default for ServerOptions {
@@ -244,6 +246,7 @@ impl Default for ServerOptions {
             allow_plaintext_password: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             engine_lock_timeout: Some(Duration::from_millis(DEFAULT_ENGINE_LOCK_TIMEOUT_MS)),
+            query_timeout: None,
         }
     }
 }
@@ -1453,7 +1456,9 @@ fn handle_connection(
                 let Some(mut guard) = acquire_engine(stream, &engine, &options, tx_status)? else {
                     continue;
                 };
+                guard.set_deadline(options.query_timeout.map(|budget| Instant::now() + budget));
                 handle_query(stream, &mut guard, &sql, &mut tx_status)?;
+                guard.set_deadline(None);
             }
             b'S' => write_message(stream, b'Z', &[tx_status.byte()])?,
             b'X' => return Ok(()),
@@ -1469,7 +1474,9 @@ fn handle_connection(
                 let Some(mut guard) = acquire_engine(stream, &engine, &options, tx_status)? else {
                     continue;
                 };
-                execute_portal(stream, &mut guard, &portals, &payload, &mut tx_status)?;
+                guard.set_deadline(options.query_timeout.map(|budget| Instant::now() + budget));
+                execute_portal(stream, &mut guard, &mut portals, &payload, &mut tx_status)?;
+                guard.set_deadline(None);
             }
             b'C' => close_portal(stream, &mut prepared, &mut portals, &payload)?,
             b'H' => {}
@@ -2041,8 +2048,17 @@ fn copy_literal_value(value: Option<&str>, data_type: DataType) -> String {
 fn copy_literal(value: &str, data_type: DataType) -> String {
     let value = copy_unescape(value);
     match data_type {
-        DataType::Int | DataType::Lukasiewicz | DataType::Nat => {
-            if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        // Integer columns accept integers only: `1e999` parses as `f64::INFINITY`
+        // and used to be spliced in verbatim.
+        DataType::Int | DataType::Lukasiewicz => {
+            if value.parse::<i64>().is_ok() {
+                value
+            } else {
+                copy_quote(&value)
+            }
+        }
+        DataType::Nat => {
+            if value.parse::<u64>().is_ok() {
                 value
             } else {
                 copy_quote(&value)
@@ -2950,6 +2966,16 @@ struct Prepared {
 struct Bound {
     sql: String,
     result_formats: Vec<i16>,
+    /// Rows buffered for a paged `Execute` (`max_rows > 0`).
+    paged: Option<PagedResult>,
+}
+
+/// Rows buffered for a paged `Execute`, with how many were already sent.
+struct PagedResult {
+    columns: Vec<String>,
+    oids: Vec<i32>,
+    rows: Vec<Vec<Value>>,
+    sent: usize,
 }
 
 fn read_cstring(payload: &[u8], offset: usize) -> Result<(String, usize), PgError> {
@@ -3077,6 +3103,7 @@ fn bind_portal(
         Bound {
             sql,
             result_formats,
+            paged: None,
         },
     );
     write_message(stream, b'2', &[])
@@ -3216,14 +3243,14 @@ fn column_oids(rows: &[Vec<Value>], column_count: usize) -> Vec<i32> {
 fn execute_portal(
     stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
-    portals: &BTreeMap<String, Bound>,
+    portals: &mut BTreeMap<String, Bound>,
     payload: &[u8],
     tx_status: &mut TxStatus,
 ) -> Result<(), PgError> {
     let (portal, cursor) = read_cstring(payload, 0)?;
-    let _max_rows = read_i32(payload, cursor)?;
+    let max_rows = read_i32(payload, cursor)?;
     let bound = portals
-        .get(&portal)
+        .get_mut(&portal)
         .ok_or_else(|| PgError::Protocol(format!("unknown portal {portal:?}")))?;
     if *tx_status == TxStatus::Failed {
         write_error(
@@ -3232,9 +3259,74 @@ fn execute_portal(
         )?;
         return Ok(());
     }
-    let success = execute_and_write(stream, engine, &bound.sql, &bound.result_formats)?;
-    if !success && *tx_status == TxStatus::InTransaction {
-        *tx_status = TxStatus::Failed;
+    if max_rows <= 0 {
+        // One-shot execution: the previous behaviour.
+        bound.paged = None;
+        let success = execute_and_write(stream, engine, &bound.sql, &bound.result_formats)?;
+        if !success && *tx_status == TxStatus::InTransaction {
+            *tx_status = TxStatus::Failed;
+        }
+        return Ok(());
+    }
+    if bound.paged.is_none() {
+        let results = match engine.execute_script(&bound.sql) {
+            Ok(results) => results,
+            Err(error) => {
+                write_sql_error(stream, &error)?;
+                bound.paged = None;
+                if *tx_status == TxStatus::InTransaction {
+                    *tx_status = TxStatus::Failed;
+                }
+                return Ok(());
+            }
+        };
+        match results.into_iter().next() {
+            Some(QueryResult::Rows { columns, rows }) => {
+                let oids = column_oids(&rows, columns.len());
+                bound.paged = Some(PagedResult {
+                    columns,
+                    oids,
+                    rows,
+                    sent: 0,
+                });
+            }
+            Some(QueryResult::Message(message)) => {
+                let tag = format!("{}\0", command_tag(&message));
+                write_message(stream, b'C', tag.as_bytes())?;
+                return Ok(());
+            }
+            None => {
+                write_message(stream, b'C', b"SELECT 0\0")?;
+                return Ok(());
+            }
+        }
+    }
+    let formats = bound.result_formats.clone();
+    let mut finished = false;
+    {
+        let Some(paged) = bound.paged.as_mut() else {
+            return Ok(());
+        };
+        let remaining = paged.rows.len() - paged.sent;
+        let take = remaining.min(max_rows as usize);
+        if paged.sent == 0 {
+            write_row_description(stream, &paged.columns, &paged.oids, &formats)?;
+        }
+        for row in &paged.rows[paged.sent..paged.sent + take] {
+            write_data_row(stream, row, &paged.oids, &formats)?;
+        }
+        paged.sent += take;
+        if paged.sent < paged.rows.len() {
+            // PortalSuspended: more rows are waiting for the next Execute.
+            write_message(stream, b's', &[])?;
+        } else {
+            let tag = format!("SELECT {}\0", paged.rows.len());
+            write_message(stream, b'C', tag.as_bytes())?;
+            finished = true;
+        }
+    }
+    if finished {
+        bound.paged = None;
     }
     Ok(())
 }
@@ -3469,13 +3561,60 @@ fn substitute_params(
     let mut output = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     let mut in_string = false;
+    let mut in_line_comment = false;
+    let mut block_depth = 0usize;
     while let Some(character) = chars.next() {
+        if in_line_comment {
+            output.push(character);
+            if character == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if block_depth > 0 {
+            output.push(character);
+            if character == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                output.push('*');
+                block_depth += 1;
+            } else if character == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                output.push('/');
+                block_depth -= 1;
+            }
+            continue;
+        }
+        if in_string {
+            output.push(character);
+            if character == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    // `''` is an escaped quote, not the end of the literal.
+                    chars.next();
+                    output.push('\'');
+                } else {
+                    in_string = false;
+                }
+            }
+            continue;
+        }
         if character == '\'' {
-            in_string = !in_string;
+            in_string = true;
             output.push(character);
             continue;
         }
-        if character == '$' && !in_string {
+        if character == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            output.push_str("--");
+            in_line_comment = true;
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            output.push_str("/*");
+            block_depth = 1;
+            continue;
+        }
+        if character == '$' {
             let mut digits = String::new();
             while let Some(next) = chars.peek() {
                 if next.is_ascii_digit() {
@@ -3770,6 +3909,12 @@ mod security_tests {
             "'1; DROP TABLE t'"
         );
         assert_eq!(copy_literal("42", DataType::Int), "42");
+        assert_eq!(copy_literal("1e999", DataType::Int), "'1e999'");
+        assert_eq!(copy_literal("1.5", DataType::Int), "'1.5'");
+        assert_eq!(
+            copy_literal("18446744073709551615", DataType::Nat),
+            "18446744073709551615"
+        );
         assert_eq!(copy_literal("TRUE", DataType::Bool), "TRUE");
         assert_eq!(copy_literal("a\\b", DataType::Text), "'a\\b'");
     }
@@ -3902,6 +4047,26 @@ mod security_tests {
         assert!(
             plan.is_none() || !plan.unwrap().table.contains(';'),
             "COPY table name leaked a statement"
+        );
+    }
+
+    #[test]
+    fn substitution_skips_comments_and_strings() {
+        let params = vec![Some("7".to_string())];
+        let types = vec![23];
+        assert_eq!(
+            substitute_params("SELECT $1 -- $1\n, '$1' /* $1 */", &types, &params)
+                .expect("substitute"),
+            "SELECT 7 -- $1\n, '$1' /* $1 */"
+        );
+        assert_eq!(
+            substitute_params("SELECT /* a /* b */ $1 */ $1", &types, &params)
+                .expect("nested block comment"),
+            "SELECT /* a /* b */ $1 */ 7"
+        );
+        assert_eq!(
+            substitute_params("SELECT '$1''$1', $1", &types, &params).expect("escaped quote"),
+            "SELECT '$1''$1', 7"
         );
     }
 
