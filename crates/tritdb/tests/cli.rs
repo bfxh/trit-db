@@ -254,7 +254,7 @@ fn serve_rejects_incomplete_auth_and_tls_flags() {
     );
 
     // Unknown auth mode.
-    let output = run(["serve", "--db", db, "--auth", "md5"]);
+    let output = run(["serve", "--db", db, "--auth", "kerberos"]);
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("unknown --auth"),
@@ -267,6 +267,23 @@ fn serve_rejects_incomplete_auth_and_tls_flags() {
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("must be given together"),
+        "stderr: {}",
+        stderr(&output)
+    );
+
+    // Cleartext password without TLS needs an explicit opt-in.
+    let output = run([
+        "serve",
+        "--db",
+        db,
+        "--auth",
+        "password",
+        "--password",
+        "s3cret",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--allow-plaintext-password"),
         "stderr: {}",
         stderr(&output)
     );
