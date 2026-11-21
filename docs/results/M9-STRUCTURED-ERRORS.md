@@ -99,7 +99,9 @@ Levenshtein 距离找最近的已知名字（预算随名字长度增长、最�
 - SQLSTATE 按 `kind` 保持 `42703` / `42P01`；
 - 别名回退逻辑（`ORDER BY <alias>`）同时识别 `UnknownColumn` 与 `UnknownName`。
 
-## 8. 还没做
+## 8. 错误码清单与机器可读输出（已落地）
 
-- **错误码文档页**：`docs/ERRORS.md` 的稳定清单（目前映射写在 `error.rs` 的注释里）；
-- **`--error-format json`**：CLI 的机器可读输出（pgwire 已经结构化，CLI 目前是「消息 + SQLSTATE + hint」文本）。
+- 稳定清单：`docs/ERRORS.md`（SQLSTATE、触发场景、hint 策略、兼容规则）；
+- CLI `--error-format text|json`：json 模式在 stderr 输出
+  `{"sqlstate":"42P01","message":"...","hint":"..."|null}`；未知格式在运行前直接报错；
+- CLI 与 pgwire 现在共享同一套码与 hint（`docs/ERRORS.md` 的三种消费方式）。

@@ -19,7 +19,7 @@ use tritdb_exec::TruthValue;
 use tritdb_format::Block;
 use tritdb_page::{Page, PageKind, PAGE_SIZE};
 use tritdb_radix::{pack, unpack, Radix, Trit};
-use tritdb_sql::{QueryResult, SqlEngine};
+use tritdb_sql::{QueryResult, SqlEngine, SqlError};
 use tritdb_store::{PageId, PageStore};
 use tritdb_txn::TxnStore;
 use tritdb_wal::{TailState, WalReader};
@@ -94,6 +94,7 @@ fn print_help() {
     println!("  pstore checkpoint --data pstore.pages --wal pstore.wal");
     println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
     println!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
+    println!("      [--error-format text|json]");
     println!("  serve --db sql.db [--listen 127.0.0.1:5432]");
     println!(
         "        [--auth trust|password|md5|scram-sha-256 --password <pwd>|--password-file <file>]"
@@ -1886,11 +1887,36 @@ fn run_sql(args: &[String]) -> Result<(), String> {
         return Err("sql requires --sql or --file".to_string());
     };
 
-    let mut engine =
-        SqlEngine::open(Path::new(&db)).map_err(|error| format!("open {db}: {error}"))?;
-    let results = engine
-        .execute_script(&script)
-        .map_err(|error| error.format_structured())?;
+    let error_format = arg_value(args, "--error-format").unwrap_or_else(|| "text".to_string());
+    let json_errors = match error_format.as_str() {
+        "text" => false,
+        "json" => true,
+        other => {
+            return Err(format!(
+                "unknown --error-format {other}; expected text or json"
+            ))
+        }
+    };
+    let mut engine = match SqlEngine::open(Path::new(&db)) {
+        Ok(engine) => engine,
+        Err(error) => {
+            if json_errors {
+                eprintln!("{}", sql_error_json(&error));
+                std::process::exit(1);
+            }
+            return Err(format!("open {db}: {error}"));
+        }
+    };
+    let results = match engine.execute_script(&script) {
+        Ok(results) => results,
+        Err(error) => {
+            if json_errors {
+                eprintln!("{}", sql_error_json(&error));
+                std::process::exit(1);
+            }
+            return Err(error.format_structured());
+        }
+    };
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
             println!();
@@ -1898,6 +1924,39 @@ fn run_sql(args: &[String]) -> Result<(), String> {
         print_query_result(result);
     }
     Ok(())
+}
+
+/// One-line JSON error for `--error-format json`.
+///
+/// Shape: `{"sqlstate":"42703","message":"...","hint":"..."|null}`.
+fn sql_error_json(error: &SqlError) -> String {
+    let hint = match error.hint() {
+        Some(hint) => format!("\"{}\"", json_escape(&hint)),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"sqlstate\":\"{}\",\"message\":\"{}\",\"hint\":{hint}}}",
+        error.code(),
+        json_escape(&error.to_string()),
+    )
+}
+
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => out.push(character),
+        }
+    }
+    out
 }
 
 fn print_query_result(result: &QueryResult) {

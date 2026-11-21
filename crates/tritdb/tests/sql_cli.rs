@@ -287,6 +287,47 @@ fn sql_errors_carry_sqlstate_and_hint() {
 }
 
 #[test]
+fn sql_errors_emit_json_when_requested() {
+    let dir = TempDir::new("sql-error-json");
+    let db = dir.join("errors.db");
+    let db = db.to_str().expect("path");
+
+    // Machine-readable errors: one JSON object on stderr.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--error-format",
+        "json",
+        "--sql",
+        "SELECT * FROM nope;",
+    ]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.trim_start().starts_with('{'), "stderr: {text}");
+    assert!(text.contains("\"sqlstate\":\"42P01\""), "stderr: {text}");
+    assert!(text.contains("\"hint\":"), "stderr: {text}");
+    assert!(text.contains("nope"), "stderr: {text}");
+
+    // Unknown formats are rejected before anything runs.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--error-format",
+        "yaml",
+        "--sql",
+        "SELECT 1;",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("unknown --error-format"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn sql_errors_suggest_closest_names() {
     let dir = TempDir::new("sql-did-you-mean");
     let db = dir.join("suggest.db");
