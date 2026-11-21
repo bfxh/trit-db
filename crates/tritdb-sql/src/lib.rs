@@ -13,7 +13,7 @@ mod storage;
 
 pub use ast::{
     AggregateKind, ColumnDef, Cte, Expr, OrderBy, Quantifier, Query, Select, SelectItem, Statement,
-    With,
+    WindowFunction, With,
 };
 pub use engine::{JoinStrategy, QueryResult, SqlEngine};
 pub use error::SqlError;

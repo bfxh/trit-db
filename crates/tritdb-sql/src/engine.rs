@@ -11,8 +11,8 @@ use tritdb_exec::{
 use tritdb_txn::TxnStore;
 
 use crate::ast::{
-    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Quantifier, Query, Select,
-    SelectItem, Statement, With,
+    AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy, Quantifier,
+    Query, Select, SelectItem, Statement, WindowFunction, With,
 };
 use crate::bind::{
     bind_expr, bind_select, eval_constant, select_has_aggregate, BoundSelect, GroupExpr,
@@ -102,6 +102,67 @@ fn tuple_in_expr(exprs: Vec<Expr>, rows: Vec<Vec<Value>>, negated: bool) -> Expr
     }
 }
 
+fn compare_window_keys(left: &[Value], right: &[Value], order_by: &[OrderBy]) -> Ordering {
+    for (index, order) in order_by.iter().enumerate() {
+        let ordering = match (&left[index], &right[index]) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            (left, right) => compare_values(left, right)
+                .ok()
+                .flatten()
+                .unwrap_or(Ordering::Equal),
+        };
+        if ordering != Ordering::Equal {
+            return if order.ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            };
+        }
+    }
+    Ordering::Equal
+}
+
+fn expr_contains_window(expr: &Expr) -> bool {
+    match expr {
+        Expr::Window { .. } => true,
+        Expr::Literal(_) | Expr::Column { .. } => false,
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
+            expr_contains_window(expr)
+        }
+        Expr::InList { expr, values, .. } => {
+            expr_contains_window(expr) || values.iter().any(expr_contains_window)
+        }
+        Expr::InSubquery { expr, .. } => expr_contains_window(expr),
+        Expr::InSubqueryTuple { exprs, .. } => exprs.iter().any(expr_contains_window),
+        Expr::ScalarSubquery { .. } | Expr::Exists { .. } => false,
+        Expr::Quantified { expr, .. } => expr_contains_window(expr),
+        Expr::Tuple(exprs) => exprs.iter().any(expr_contains_window),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_contains_window(expr) || expr_contains_window(low) || expr_contains_window(high),
+        Expr::Like { expr, pattern, .. } => {
+            expr_contains_window(expr) || expr_contains_window(pattern)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_window)
+                || branches
+                    .iter()
+                    .any(|(when, then)| expr_contains_window(when) || expr_contains_window(then))
+                || else_expr.as_deref().is_some_and(expr_contains_window)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_window(left) || expr_contains_window(right)
+        }
+        Expr::Aggregate { input, .. } => input.as_deref().is_some_and(expr_contains_window),
+    }
+}
+
 fn quantified_expr(probe: Expr, op: BinaryOp, kind: Quantifier, values: Vec<Value>) -> Expr {
     if values.is_empty() {
         return Expr::Literal(Value::Bool(matches!(kind, Quantifier::All)));
@@ -131,6 +192,7 @@ fn quantified_expr(probe: Expr, op: BinaryOp, kind: Quantifier, values: Vec<Valu
 
 fn expr_has_outer_subquery(expr: &Expr, outer: &str) -> bool {
     match expr {
+        Expr::Window { .. } => false,
         Expr::Literal(_) | Expr::Column { .. } => false,
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
             expr_has_outer_subquery(expr, outer)
@@ -227,6 +289,7 @@ fn select_has_outer_ref(select: &Select, outer: &str) -> bool {
 
 fn expr_mentions_outer(expr: &Expr, outer: &str) -> bool {
     match expr {
+        Expr::Window { .. } => false,
         Expr::Column {
             table: Some(qualifier),
             ..
@@ -983,6 +1046,7 @@ impl SqlEngine {
 
     fn materialize_expr(&mut self, expr: &mut Expr, outer: &str) -> Result<(), SqlError> {
         match expr {
+            Expr::Window { .. } => Ok(()),
             Expr::Literal(_) | Expr::Column { .. } => Ok(()),
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
                 self.materialize_expr(expr, outer)
@@ -1361,6 +1425,12 @@ impl SqlEngine {
             .as_deref()
             .unwrap_or(&folded.table)
             .to_string();
+        if folded.items.iter().any(|item| match item {
+            SelectItem::Wildcard => false,
+            SelectItem::Expr { expr, .. } => expr_contains_window(expr),
+        }) {
+            return self.select_with_window(select, &folded);
+        }
         let has_correlated = folded
             .filter
             .as_ref()
@@ -1386,6 +1456,126 @@ impl SqlEngine {
             Some(keys) => filter_under_repair(result, keys),
             None => Ok(result),
         }
+    }
+
+    /// Evaluates window functions in the select list.
+    fn select_with_window(
+        &mut self,
+        original: &Select,
+        folded: &Select,
+    ) -> Result<QueryResult, SqlError> {
+        if !folded.group_by.is_empty() || select_has_aggregate(folded) {
+            return Err(SqlError::Unsupported(
+                "window functions with GROUP BY or aggregates are not supported".to_string(),
+            ));
+        }
+        let outer = folded
+            .table_alias
+            .as_deref()
+            .unwrap_or(&folded.table)
+            .to_string();
+        if folded.items.iter().any(|item| match item {
+            SelectItem::Wildcard => false,
+            SelectItem::Expr { expr, .. } => expr_has_outer_subquery(expr, &outer),
+        }) {
+            return Err(SqlError::Unsupported(
+                "window functions combined with correlated subqueries are not supported"
+                    .to_string(),
+            ));
+        }
+
+        let pushdown = plan_filter_pushdown(folded);
+        let projection = self.plan_scan_projection(folded)?;
+        let mut table = self.build_from(folded, &pushdown, &projection)?;
+        let mut planned = folded.clone();
+        for (index, item) in folded.items.iter().enumerate() {
+            let SelectItem::Expr { expr, alias } = item else {
+                continue;
+            };
+            let Expr::Window {
+                function,
+                partition_by,
+                order_by,
+            } = expr
+            else {
+                if expr_contains_window(expr) {
+                    return Err(SqlError::Unsupported(
+                        "window function must be a top-level select item".to_string(),
+                    ));
+                }
+                continue;
+            };
+            let values = self.window_values(&table, *function, partition_by, order_by)?;
+            let name = format!("__win{index}");
+            table
+                .schema
+                .columns
+                .push(Column::new(name.clone(), DataType::Int));
+            for (row, value) in table.rows.iter_mut().zip(values) {
+                row.push(Value::Int(value as i64));
+            }
+            planned.items[index] = SelectItem::Expr {
+                expr: Expr::Column { table: None, name },
+                alias: alias.clone(),
+            };
+        }
+
+        let plan = bind_select(&planned, &table)?;
+        let result = execute_select(&table, &plan)?;
+        match &original.under_repair {
+            Some(keys) => filter_under_repair(result, keys),
+            None => Ok(result),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn window_values(
+        &self,
+        table: &Table,
+        function: WindowFunction,
+        partition_by: &[Expr],
+        order_by: &[OrderBy],
+    ) -> Result<Vec<usize>, SqlError> {
+        let mut groups: Vec<(Vec<Value>, Vec<(Vec<Value>, usize)>)> = Vec::new();
+        for (index, row) in table.rows.iter().enumerate() {
+            let mut partition = Vec::with_capacity(partition_by.len());
+            for expr in partition_by {
+                let bound = bind_expr(expr, &table.schema)?;
+                partition.push(eval(&bound, &table.schema, row)?);
+            }
+            let mut keys = Vec::with_capacity(order_by.len());
+            for order in order_by {
+                let bound = bind_expr(&order.expr, &table.schema)?;
+                keys.push(eval(&bound, &table.schema, row)?);
+            }
+            if let Some((_, group)) = groups.iter_mut().find(|(key, _)| *key == partition) {
+                group.push((keys, index));
+            } else {
+                groups.push((partition, vec![(keys, index)]));
+            }
+        }
+
+        let mut values = vec![0usize; table.rows.len()];
+        for (_, mut group) in groups {
+            group.sort_by(|(left, _), (right, _)| compare_window_keys(left, right, order_by));
+            let mut rank = 1usize;
+            let mut dense = 1usize;
+            for (position, (keys, index)) in group.iter().enumerate() {
+                if position > 0 {
+                    let previous = &group[position - 1].0;
+                    if compare_window_keys(previous, keys, order_by) != Ordering::Equal {
+                        rank = position + 1;
+                        dense += 1;
+                    }
+                }
+                values[*index] = match function {
+                    WindowFunction::RowNumber => position + 1,
+                    WindowFunction::Rank => rank,
+                    WindowFunction::DenseRank => dense,
+                };
+            }
+        }
+        Ok(values)
     }
 
     /// Evaluates correlated subqueries in `WHERE` and in the select list.
@@ -1537,6 +1727,7 @@ impl SqlEngine {
         outer: &str,
     ) -> Result<(), SqlError> {
         match expr {
+            Expr::Window { .. } => Ok(()),
             Expr::ScalarSubquery { query } => {
                 if !query_has_outer_ref(query, outer) {
                     return Ok(());
@@ -1659,6 +1850,7 @@ impl SqlEngine {
         outer: &str,
     ) -> Result<(), SqlError> {
         match expr {
+            Expr::Window { .. } => Ok(()),
             Expr::Literal(_) | Expr::Column { .. } => Ok(()),
             Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {
                 self.bind_correlated_expr(expr, outer_schema, outer_row, outer)
@@ -1843,6 +2035,7 @@ impl SqlEngine {
         outer: &str,
     ) -> Result<(), SqlError> {
         match expr {
+            Expr::Window { .. } => Ok(()),
             Expr::Column {
                 table: Some(qualifier),
                 name,
@@ -2892,6 +3085,7 @@ fn source_qualifiers(select: &Select) -> Vec<String> {
 /// by the binder, so it is not safe to move at this stage.
 fn expr_sources(expr: &Expr, sources: &mut BTreeSet<String>) -> bool {
     match expr {
+        Expr::Window { .. } => false,
         Expr::Literal(_) => true,
         Expr::Column {
             table: Some(table), ..
@@ -2954,6 +3148,7 @@ fn collect_expr_columns(
     keep: &mut [BTreeSet<String>],
 ) -> bool {
     match expr {
+        Expr::Window { .. } => false,
         Expr::Literal(_) => true,
         Expr::Column {
             table: Some(table),
@@ -3234,6 +3429,7 @@ fn fold_constant(expr: Expr) -> Expr {
 
 fn fold_expr(expr: &Expr) -> Expr {
     match expr {
+        Expr::Window { .. } => expr.clone(),
         Expr::Literal(_) | Expr::Column { .. } => expr.clone(),
         Expr::IsNull { expr, negated } => fold_constant(Expr::IsNull {
             expr: Box::new(fold_expr(expr)),
@@ -3327,6 +3523,7 @@ fn fold_expr(expr: &Expr) -> Expr {
 
 fn expr_is_constant(expr: &Expr) -> bool {
     match expr {
+        Expr::Window { .. } => false,
         Expr::Literal(_) => true,
         Expr::Column { .. } | Expr::Aggregate { .. } => false,
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::Not(expr) => {

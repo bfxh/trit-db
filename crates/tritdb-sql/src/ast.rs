@@ -31,6 +31,28 @@ impl AggregateKind {
     }
 }
 
+/// Window function kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFunction {
+    /// `ROW_NUMBER()`.
+    RowNumber,
+    /// `RANK()`.
+    Rank,
+    /// `DENSE_RANK()`.
+    DenseRank,
+}
+
+impl WindowFunction {
+    /// SQL name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            WindowFunction::RowNumber => "ROW_NUMBER",
+            WindowFunction::Rank => "RANK",
+            WindowFunction::DenseRank => "DENSE_RANK",
+        }
+    }
+}
+
 /// Parsed, unbound expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -155,6 +177,15 @@ pub enum Expr {
         kind: AggregateKind,
         /// Argument.
         input: Option<Box<Expr>>,
+    },
+    /// Window function call.
+    Window {
+        /// Function.
+        function: WindowFunction,
+        /// `PARTITION BY` expressions.
+        partition_by: Vec<Expr>,
+        /// `ORDER BY` keys inside `OVER (...)`.
+        order_by: Vec<OrderBy>,
     },
 }
 

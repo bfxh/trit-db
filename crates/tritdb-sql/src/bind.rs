@@ -299,6 +299,9 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
         Expr::Tuple(_) => Err(SqlError::Unsupported(
             "parenthesized expression list is only allowed in IN".to_string(),
         )),
+        Expr::Window { .. } => Err(SqlError::Unsupported(
+            "window function must be a top-level select item".to_string(),
+        )),
         Expr::Aggregate { .. } => Err(SqlError::Unsupported(
             "aggregate is only allowed in SELECT, HAVING, or ORDER BY".to_string(),
         )),
@@ -356,7 +359,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::InSubqueryTuple { exprs, .. } => exprs.iter().any(expr_has_aggregate),
         Expr::Quantified { expr, .. } => expr_has_aggregate(expr),
         Expr::Tuple(exprs) => exprs.iter().any(expr_has_aggregate),
-        Expr::ScalarSubquery { .. } | Expr::Exists { .. } => false,
+        Expr::ScalarSubquery { .. } | Expr::Exists { .. } | Expr::Window { .. } => false,
         Expr::Aggregate { .. } => true,
     }
 }
@@ -563,6 +566,9 @@ fn bind_group_expr(
         )),
         Expr::Tuple(_) => Err(SqlError::Unsupported(
             "parenthesized expression list is only allowed in IN".to_string(),
+        )),
+        Expr::Window { .. } => Err(SqlError::Unsupported(
+            "window function must be a top-level select item".to_string(),
         )),
         Expr::Aggregate { kind, input } => {
             let input = match input {
