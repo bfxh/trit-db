@@ -31,6 +31,13 @@ pub(crate) enum GroupExpr {
         /// Optional threshold.
         threshold: Option<Box<GroupExpr>>,
     },
+    /// `certainty(expr [, threshold])`.
+    Certainty {
+        /// Input.
+        expr: Box<GroupExpr>,
+        /// Optional threshold.
+        threshold: Option<Box<GroupExpr>>,
+    },
     /// `expr IS [NOT] TRUE|FALSE|UNKNOWN`.
     IsTruth {
         /// Input.
@@ -100,6 +107,12 @@ impl GroupExpr {
                 expr.has_aggregate()
             }
             GroupExpr::Truth { expr, threshold } => {
+                expr.has_aggregate()
+                    || threshold
+                        .as_ref()
+                        .is_some_and(|threshold| threshold.has_aggregate())
+            }
+            GroupExpr::Certainty { expr, threshold } => {
                 expr.has_aggregate()
                     || threshold
                         .as_ref()
@@ -238,6 +251,13 @@ pub(crate) fn bind_expr(expr: &Expr, schema: &Schema) -> Result<ExecExpr, SqlErr
                 None => None,
             },
         }),
+        Expr::Certainty { expr, threshold } => Ok(ExecExpr::Certainty {
+            expr: Box::new(bind_expr(expr, schema)?),
+            threshold: match threshold {
+                Some(threshold) => Some(Box::new(bind_expr(threshold, schema)?)),
+                None => None,
+            },
+        }),
         Expr::IsNull { expr, negated } => Ok(ExecExpr::IsNull {
             expr: Box::new(bind_expr(expr, schema)?),
             negated: *negated,
@@ -358,6 +378,9 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Truth { expr, threshold } => {
             expr_has_aggregate(expr) || threshold.as_deref().is_some_and(expr_has_aggregate)
         }
+        Expr::Certainty { expr, threshold } => {
+            expr_has_aggregate(expr) || threshold.as_deref().is_some_and(expr_has_aggregate)
+        }
         Expr::Not(expr) => expr_has_aggregate(expr),
         Expr::InList { expr, values, .. } => {
             expr_has_aggregate(expr) || values.iter().any(expr_has_aggregate)
@@ -449,6 +472,25 @@ fn bind_group_expr(
             negated: *negated,
         }),
         Expr::Truth { expr, threshold } => Ok(GroupExpr::Truth {
+            expr: Box::new(bind_group_expr(
+                expr,
+                schema,
+                grouped,
+                aggregate_query,
+                group_columns,
+            )?),
+            threshold: match threshold {
+                Some(threshold) => Some(Box::new(bind_group_expr(
+                    threshold,
+                    schema,
+                    grouped,
+                    aggregate_query,
+                    group_columns,
+                )?)),
+                None => None,
+            },
+        }),
+        Expr::Certainty { expr, threshold } => Ok(GroupExpr::Certainty {
             expr: Box::new(bind_group_expr(
                 expr,
                 schema,

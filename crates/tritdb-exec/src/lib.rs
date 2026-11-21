@@ -350,6 +350,14 @@ pub enum Expr {
         /// Optional `Int` threshold.
         threshold: Option<Box<Expr>>,
     },
+    /// `certainty(expr [, threshold])`: `CERTAIN` / `CONTINGENT` /
+    /// `IMPOSSIBLE` verdict, the same vocabulary as `UNDER REPAIR`.
+    Certainty {
+        /// Input annotation.
+        expr: Box<Expr>,
+        /// Optional `Int` threshold.
+        threshold: Option<Box<Expr>>,
+    },
     /// `expr IS [NOT] TRUE|FALSE|UNKNOWN`.
     IsTruth {
         /// Input expression.
@@ -596,6 +604,59 @@ pub fn truth_text(truth: TruthValue) -> &'static str {
     }
 }
 
+/// Verdict for `certainty(...)`: the same `CERTAIN` / `CONTINGENT` /
+/// `IMPOSSIBLE` vocabulary as `UNDER REPAIR`, but over a single annotation.
+pub fn certainty_of_value(
+    value: &Value,
+    threshold: Option<&Value>,
+) -> Result<crate::ann::Certainty, ExecError> {
+    let annotation = match value {
+        Value::Bool(true) => crate::ann::Annotation::K3(TruthValue::True),
+        Value::Bool(false) => crate::ann::Annotation::K3(TruthValue::False),
+        Value::Null => crate::ann::Annotation::K3(TruthValue::Unknown),
+        Value::Logic(four) => crate::ann::Annotation::Belnap(*four),
+        Value::Lukasiewicz(milli) => {
+            crate::ann::Annotation::Lukasiewicz(f64::from(*milli) / 1000.0)
+        }
+        Value::Nat(count) => crate::ann::Annotation::Nat(*count),
+        other => {
+            return Err(ExecError::NonBooleanPredicate {
+                actual: other.type_name(),
+            })
+        }
+    };
+    let threshold = match threshold {
+        None => None,
+        Some(Value::Int(raw)) => match value {
+            // Łukasiewicz thresholds are given in thousandths.
+            Value::Lukasiewicz(_) => Some(*raw as f64 / 1000.0),
+            _ => Some(*raw as f64),
+        },
+        Some(Value::Lukasiewicz(items)) => Some(f64::from(*items) / 1000.0),
+        Some(Value::Nat(items)) => Some(*items as f64),
+        Some(other) => {
+            return Err(ExecError::TypeMismatch {
+                expected: "INT",
+                actual: other.type_name(),
+            })
+        }
+    };
+    if let Some(threshold) = threshold {
+        let bounded = matches!(value, Value::Lukasiewicz(_));
+        if !threshold.is_finite() || threshold < 0.0 || (bounded && threshold > 1.0) {
+            return Err(ExecError::TypeMismatch {
+                expected: "threshold in [0, 1]",
+                actual: "out of range",
+            });
+        }
+    }
+    annotation
+        .certainty(threshold)
+        .map_err(|_| ExecError::NonBooleanPredicate {
+            actual: value.type_name(),
+        })
+}
+
 /// Compares two values. `NULL` yields `None`; mixed non-null types are an
 /// error rather than an implicit cast.
 pub fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, ExecError> {
@@ -711,6 +772,15 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
             };
             let truth = truth_projection(&value, threshold.as_ref())?;
             Ok(Value::Text(truth_text(truth).to_string()))
+        }
+        Expr::Certainty { expr, threshold } => {
+            let value = eval(expr, schema, row)?;
+            let threshold = match threshold {
+                Some(threshold) => Some(eval(threshold, schema, row)?),
+                None => None,
+            };
+            let verdict = certainty_of_value(&value, threshold.as_ref())?;
+            Ok(Value::Text(verdict.as_str().to_string()))
         }
         Expr::IsTruth {
             expr,

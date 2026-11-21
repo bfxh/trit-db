@@ -103,7 +103,7 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 | 切片 | 内容 | 可判红 |
 |---|---|---|
 | M8（本刀） | `tritvec` 内核：`TritVec` + K3 动词/归约 + `TritInt` 平衡三进制加减 | 真值表、打包往返、归一化、溢出 |
-| M9 | 查询级确定性等级：`certainty(expr)` 返回 `CERTAIN/CONTINGENT/IMPOSSIBLE`，普通查询也带答案等级 | 与 `UNDER REPAIR` 的答案对拍 |
+| M9（已落地） | 查询级确定性等级：`certainty(expr)` 返回 `CERTAIN/CONTINGENT/IMPOSSIBLE`，普通查询也带答案等级 | 与 `UNDER REPAIR` 的答案对拍（同词汇、同枚举） |
 | M10 | 向量化扫描 + asof join + 三值列存块 | 吞吐基准与正确性对拍 |
 
 ## 6. 明确不做的事
@@ -132,7 +132,7 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 
 | 层 | 方向 | 模型侧 | trit-db 侧 | 状态 |
 |---|---|---|---|---|
-| 语言层 | 模型 → 数据库 | 生成查询、读错误、重试 | 结构化错误（码 + 期望/实际 + 修复建议）、`certainty()` 答案等级 | M9 待做 |
+| 语言层 | 模型 → 数据库 | 生成查询、读错误、重试 | 结构化错误（码 + 期望/实际 + 修复建议）、`certainty()` 答案等级 | M9 已落地 |
 | 语义层 | 数据库 → 模型 | 置信度 / 冲突 / 缺失 / 计数 | Ł 注解（千分位）、Belnap `BOTH`、K3 `UNKNOWN`、ℕ 计数 | 已存在（`LOGIC` 列 + `ann`） |
 | 表示层 | 模型 ↔ 数据库 | 三值权重、嵌入、投票 | `r3` 打包（1.6 bit/weight）、平衡三进制、`tritvec` 动词 | M8 已落地 |
 
@@ -162,7 +162,11 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 - **不为「对模型友好」跳过类型检查**：严格类型是错误信号的前提；放宽检查等于把
   静默错误请回来。
 
-### 8.4 M8 已落地的接口
+### 8.4 M8/M9 已落地的接口
+
+- `certainty(expr [, threshold])`（SQL）：把注解列投影为 `CERTAIN` / `CONTINGENT` /
+  `IMPOSSIBLE`，与 `UNDER REPAIR` 共用 `Certainty` 枚举；Ł 阈值按千分位、ℕ 按计数，
+  越界与非注解值显式报错。详见 `docs/results/M9-CERTAINTY.md`。
 
 - `TernaryVec::quantize(weights, alpha)` / `dequantize(alpha)`：BitNet 风格三值量化，
   半跨度误差界 + 饱和语义；

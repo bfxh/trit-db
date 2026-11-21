@@ -1133,6 +1133,27 @@ impl Parser {
                         threshold,
                     });
                 }
+                // `certainty(x [, threshold])` reports whether the
+                // annotation forces the statement: CERTAIN / CONTINGENT /
+                // IMPOSSIBLE, matching `UNDER REPAIR`'s answer vocabulary.
+                if name.eq_ignore_ascii_case("certainty")
+                    && self
+                        .peek()
+                        .is_some_and(|token| token.kind == TokenKind::Symbol(Symbol::LParen))
+                {
+                    self.bump(); // (
+                    let inner = self.parse_expr()?;
+                    let threshold = if self.eat_symbol(Symbol::Comma) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect_symbol(Symbol::RParen)?;
+                    return Ok(Expr::Certainty {
+                        expr: Box::new(inner),
+                        threshold,
+                    });
+                }
                 if let Some(function) = window_function(&name) {
                     if self
                         .peek()

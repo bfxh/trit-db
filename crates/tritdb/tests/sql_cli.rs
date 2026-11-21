@@ -245,6 +245,103 @@ fn truth_projects_lukasiewicz_and_nat_with_thresholds() {
 }
 
 #[test]
+fn certainty_reports_verdicts_per_domain() {
+    let dir = TempDir::new("sql-certainty");
+    let db = dir.join("certainty.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, k LOGIC K3, b LOGIC BELNAP, \
+         p LOGIC LUKASIEWICZ, n LOGIC NAT); \
+         INSERT INTO t VALUES \
+         (1, TRUE, BOTH, 600, 3), \
+         (2, FALSE, NEITHER, 200, 0), \
+         (3, NULL, TRUE, 0, NULL); \
+         SELECT id, certainty(k) AS ck, certainty(b) AS cb, \
+         certainty(p) AS cp, certainty(n) AS cn FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("1\tCERTAIN\tCONTINGENT\tCERTAIN\tCERTAIN"),
+        "out: {text}"
+    );
+    assert!(
+        text.contains("2\tIMPOSSIBLE\tCONTINGENT\tCONTINGENT\tIMPOSSIBLE"),
+        "out: {text}"
+    );
+    assert!(
+        text.contains("3\tCONTINGENT\tCERTAIN\tIMPOSSIBLE\tCONTINGENT"),
+        "out: {text}"
+    );
+
+    // Explicit thresholds: Ł in thousandths, ℕ as a count.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, certainty(p, 700) AS cp, certainty(n, 5) AS cn FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\tCONTINGENT\tCONTINGENT"), "out: {text}");
+    assert!(text.contains("2\tCONTINGENT\tIMPOSSIBLE"), "out: {text}");
+    assert!(text.contains("3\tIMPOSSIBLE\tCONTINGENT"), "out: {text}");
+}
+
+#[test]
+fn certainty_agrees_with_under_repair_on_conflicts() {
+    let dir = TempDir::new("sql-certainty-repair");
+    let db = dir.join("repair.db");
+    let db = db.to_str().expect("path");
+    // No FD conflict: every row survives UNDER REPAIR and is CERTAIN.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, v LOGIC BELNAP); \
+         INSERT INTO t VALUES (1, TRUE), (2, TRUE); \
+         SELECT id, v FROM t UNDER REPAIR ON (id); \
+         SELECT certainty(v) AS c FROM t;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("1\tTRUE") && text.contains("2\tTRUE"),
+        "out: {text}"
+    );
+    assert!(
+        !text.contains("CONTINGENT") && !text.contains("IMPOSSIBLE"),
+        "out: {text}"
+    );
+
+    // Conflicting FD: UNDER REPAIR drops the whole group, and at least one
+    // certainty verdict is not CERTAIN.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE u (id INT NOT NULL, v LOGIC BELNAP); \
+         INSERT INTO u VALUES (1, TRUE), (1, FALSE); \
+         SELECT id, v FROM u UNDER REPAIR ON (id); \
+         SELECT certainty(v) AS c FROM u;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        !text.contains("1\tTRUE") && !text.contains("1\tFALSE"),
+        "out: {text}"
+    );
+    assert!(text.contains("IMPOSSIBLE"), "out: {text}");
+}
+
+#[test]
 fn logic_column_is_unknown_filterable() {
     let dir = TempDir::new("sql-logic-unknown");
     let db = dir.join("logic.db");

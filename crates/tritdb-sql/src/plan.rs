@@ -75,6 +75,10 @@ pub(crate) enum PlanExpr {
         expr: Box<PlanExpr>,
         threshold: Option<Box<PlanExpr>>,
     },
+    Certainty {
+        expr: Box<PlanExpr>,
+        threshold: Option<Box<PlanExpr>>,
+    },
     Not(Box<PlanExpr>),
     InList {
         expr: Box<PlanExpr>,
@@ -539,6 +543,13 @@ impl PlanExpr {
                     None => None,
                 },
             }),
+            ExecExpr::Certainty { expr, threshold } => Ok(Self::Certainty {
+                expr: Box::new(Self::from_exec(expr, schema)?),
+                threshold: match threshold {
+                    Some(threshold) => Some(Box::new(Self::from_exec(threshold, schema)?)),
+                    None => None,
+                },
+            }),
             ExecExpr::Not(expr) => Ok(Self::Not(Box::new(Self::from_exec(expr, schema)?))),
             ExecExpr::InList {
                 expr,
@@ -623,6 +634,13 @@ impl PlanExpr {
                 negated: *negated,
             }),
             GroupExpr::Truth { expr, threshold } => Ok(Self::Truth {
+                expr: Box::new(Self::from_group_expr(expr, schema)?),
+                threshold: match threshold {
+                    Some(threshold) => Some(Box::new(Self::from_group_expr(threshold, schema)?)),
+                    None => None,
+                },
+            }),
+            GroupExpr::Certainty { expr, threshold } => Ok(Self::Certainty {
                 expr: Box::new(Self::from_group_expr(expr, schema)?),
                 threshold: match threshold {
                     Some(threshold) => Some(Box::new(Self::from_group_expr(threshold, schema)?)),
@@ -745,6 +763,15 @@ impl PlanExpr {
             }
             Self::Truth { expr, threshold } => {
                 out.push_str("(truth ");
+                expr.write_sexpr(out);
+                if let Some(threshold) = threshold {
+                    out.push(' ');
+                    threshold.write_sexpr(out);
+                }
+                out.push(')');
+            }
+            Self::Certainty { expr, threshold } => {
+                out.push_str("(certainty ");
                 expr.write_sexpr(out);
                 if let Some(threshold) = threshold {
                     out.push(' ');

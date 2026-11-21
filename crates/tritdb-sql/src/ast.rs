@@ -174,6 +174,14 @@ pub enum Expr {
         /// Optional `Int` threshold (thousandths for Ł, a count for ℕ).
         threshold: Option<Box<Expr>>,
     },
+    /// `certainty(expr [, threshold])`: `CERTAIN` / `CONTINGENT` /
+    /// `IMPOSSIBLE` verdict, the same vocabulary as `UNDER REPAIR`.
+    Certainty {
+        /// Input annotation.
+        expr: Box<Expr>,
+        /// Optional threshold (thousandths for Ł, a count for ℕ).
+        threshold: Option<Box<Expr>>,
+    },
     /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`.
     Case {
         /// Simple-case operand; `None` for a searched case.

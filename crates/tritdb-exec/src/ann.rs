@@ -224,6 +224,47 @@ impl Annotation {
             _ => self.neg()?.join(other),
         }
     }
+
+    /// Verdict on whether this annotation forces a statement.
+    ///
+    /// K3 / Belnap map their truth tables directly. Łukasiewicz and ℕ keep a
+    /// `Contingent` middle band: a value below the threshold is not "false",
+    /// it is "partly true", so only `0` is `Impossible`.
+    pub fn certainty(self, threshold: Option<f64>) -> Result<Certainty, AnnError> {
+        match self {
+            Annotation::K3(TruthValue::True) => Ok(Certainty::Certain),
+            Annotation::K3(TruthValue::False) => Ok(Certainty::Impossible),
+            Annotation::K3(TruthValue::Unknown) => Ok(Certainty::Contingent),
+            Annotation::Belnap(B4::True) => Ok(Certainty::Certain),
+            Annotation::Belnap(B4::False) => Ok(Certainty::Impossible),
+            Annotation::Belnap(B4::Both | B4::Neither) => Ok(Certainty::Contingent),
+            Annotation::Lukasiewicz(value) => {
+                let threshold = threshold.unwrap_or(0.5);
+                if !(0.0..=1.0).contains(&threshold) {
+                    return Err(AnnError::LukasiewiczOutOfRange);
+                }
+                if value >= threshold {
+                    Ok(Certainty::Certain)
+                } else if value <= 0.0 {
+                    Ok(Certainty::Impossible)
+                } else {
+                    Ok(Certainty::Contingent)
+                }
+            }
+            Annotation::Nat(value) => {
+                let threshold = threshold.unwrap_or(1.0).max(0.0);
+                #[allow(clippy::cast_precision_loss)]
+                let scaled = value as f64;
+                if scaled >= threshold {
+                    Ok(Certainty::Certain)
+                } else if value == 0 {
+                    Ok(Certainty::Impossible)
+                } else {
+                    Ok(Certainty::Contingent)
+                }
+            }
+        }
+    }
 }
 
 /// A triangular norm family over `[0, 1]`.
@@ -503,6 +544,43 @@ pub enum RepairAnswer {
     Impossible,
     /// True in some repairs and false in others (Belnap `Both`).
     Contingent,
+}
+
+impl RepairAnswer {
+    /// Same verdict vocabulary as [`Annotation::certainty`].
+    pub const fn certainty(self) -> Certainty {
+        match self {
+            RepairAnswer::Certain => Certainty::Certain,
+            RepairAnswer::Contingent => Certainty::Contingent,
+            RepairAnswer::Impossible => Certainty::Impossible,
+        }
+    }
+}
+
+/// Verdict on whether a statement is forced by the data.
+///
+/// This is the shared vocabulary of [`Annotation::certainty`] and
+/// [`RepairAnswer::certainty`]: both answer the same question, "does this
+/// hold in every model / repair?", so callers (and models) see one word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Certainty {
+    /// Holds in every model or repair.
+    Certain,
+    /// Holds in some but not all.
+    Contingent,
+    /// Holds in none.
+    Impossible,
+}
+
+impl Certainty {
+    /// Stable uppercase name used by SQL output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Certainty::Certain => "CERTAIN",
+            Certainty::Contingent => "CONTINGENT",
+            Certainty::Impossible => "IMPOSSIBLE",
+        }
+    }
 }
 
 /// Consistent query answering over minimal repairs.
@@ -1340,6 +1418,94 @@ mod tests {
         let either = BoolExpr::Or(vec![BoolExpr::Var(0), BoolExpr::Var(1)]);
         // Satisfying assignments: 2^25 - 2^23 = 3 * 2^23.
         assert_eq!(count_models(&either, vars).unwrap(), 3 << 23);
+    }
+
+    #[test]
+    fn certainty_maps_each_domain() {
+        assert_eq!(
+            Annotation::K3(TruthValue::True).certainty(None).unwrap(),
+            Certainty::Certain
+        );
+        assert_eq!(
+            Annotation::K3(TruthValue::False).certainty(None).unwrap(),
+            Certainty::Impossible
+        );
+        assert_eq!(
+            Annotation::K3(TruthValue::Unknown).certainty(None).unwrap(),
+            Certainty::Contingent
+        );
+        assert_eq!(
+            Annotation::Belnap(B4::True).certainty(None).unwrap(),
+            Certainty::Certain
+        );
+        assert_eq!(
+            Annotation::Belnap(B4::False).certainty(None).unwrap(),
+            Certainty::Impossible
+        );
+        assert_eq!(
+            Annotation::Belnap(B4::Both).certainty(None).unwrap(),
+            Certainty::Contingent
+        );
+        assert_eq!(
+            Annotation::Belnap(B4::Neither).certainty(None).unwrap(),
+            Certainty::Contingent
+        );
+        // Ł: 0 is impossible, partial truth is contingent, >= threshold certain.
+        assert_eq!(
+            Annotation::Lukasiewicz(0.0).certainty(None).unwrap(),
+            Certainty::Impossible
+        );
+        assert_eq!(
+            Annotation::Lukasiewicz(0.2).certainty(None).unwrap(),
+            Certainty::Contingent
+        );
+        assert_eq!(
+            Annotation::Lukasiewicz(0.5).certainty(None).unwrap(),
+            Certainty::Certain
+        );
+        assert_eq!(
+            Annotation::Lukasiewicz(0.6).certainty(Some(0.7)).unwrap(),
+            Certainty::Contingent
+        );
+        assert_eq!(
+            Annotation::Lukasiewicz(0.8).certainty(Some(0.7)).unwrap(),
+            Certainty::Certain
+        );
+        assert!(Annotation::Lukasiewicz(0.5).certainty(Some(1.5)).is_err());
+        // ℕ: 0 is impossible, a positive count below the threshold contingent.
+        assert_eq!(
+            Annotation::Nat(0).certainty(None).unwrap(),
+            Certainty::Impossible
+        );
+        assert_eq!(
+            Annotation::Nat(1).certainty(None).unwrap(),
+            Certainty::Certain
+        );
+        assert_eq!(
+            Annotation::Nat(3).certainty(Some(5.0)).unwrap(),
+            Certainty::Contingent
+        );
+        assert_eq!(
+            Annotation::Nat(5).certainty(Some(5.0)).unwrap(),
+            Certainty::Certain
+        );
+    }
+
+    #[test]
+    fn repair_answers_share_the_certainty_vocabulary() {
+        assert_eq!(RepairAnswer::Certain.certainty(), Certainty::Certain);
+        assert_eq!(RepairAnswer::Contingent.certainty(), Certainty::Contingent);
+        assert_eq!(RepairAnswer::Impossible.certainty(), Certainty::Impossible);
+        assert_eq!(Certainty::Certain.as_str(), "CERTAIN");
+        assert_eq!(Certainty::Contingent.as_str(), "CONTINGENT");
+        assert_eq!(Certainty::Impossible.as_str(), "IMPOSSIBLE");
+        // Cross-check the two producers on the same conflict instance.
+        let answer = under_repair(2, &[vec![0, 1]], &[0]).unwrap();
+        assert_eq!(answer.certainty(), Certainty::Contingent);
+        let answer = under_repair(2, &[vec![0, 1]], &[0, 1]).unwrap();
+        assert_eq!(answer.certainty(), Certainty::Impossible);
+        let answer = under_repair(2, &[], &[0]).unwrap();
+        assert_eq!(answer.certainty(), Certainty::Certain);
     }
 
     #[test]
