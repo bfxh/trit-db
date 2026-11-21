@@ -85,6 +85,10 @@ fn lock_engine(engine: &Arc<Mutex<SqlEngine>>) -> std::sync::MutexGuard<'_, SqlE
 }
 
 fn handle_connection(engine: Arc<Mutex<SqlEngine>>, mut stream: TcpStream) -> Result<(), PgError> {
+    // Postgres-style clients send one small message per round trip; leaving
+    // Nagle on makes every response wait for the peer's delayed ACK (~40 ms on
+    // Linux). Disable it per connection.
+    stream.set_nodelay(true)?;
     if !read_startup(&mut stream)? {
         return Ok(());
     }

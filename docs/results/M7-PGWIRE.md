@@ -1,6 +1,6 @@
 # M7 第一刀：最小 PostgreSQL wire protocol
 
-状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射已实现；TLS、认证未做
+状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射 / `TCP_NODELAY` 已实现；TLS、认证未做
 
 日期：2026-11-21
 

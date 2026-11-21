@@ -2008,6 +2008,9 @@ fn run_pgwire_roundtrip(args: &[String]) {
     });
 
     let mut stream = TcpStream::connect(addr).expect("connect pgwire");
+    stream
+        .set_nodelay(true)
+        .expect("disable Nagle on the bench client");
     pg_write_startup(&mut stream);
     let startup_kinds = pg_read_until_ready(&mut stream);
     assert!(
