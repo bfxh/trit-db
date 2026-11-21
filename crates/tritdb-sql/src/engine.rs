@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tritdb_exec::{
     ann::B4,
-    batch::{asof_join, eval_predicate, filter_indices, TriPredicate, TritVec, K3},
+    batch::{eval_predicate, filter_indices, TriPredicate, TritVec, K3},
     certainty_of_value, compare_values, eval, truth_of, truth_projection, truth_text, BinaryOp,
     Column, DataType, ExecError, Expr as ExecExpr, Row, Schema, Table, TruthValue, Value,
 };
@@ -4902,45 +4902,42 @@ fn asof_join_tables(
     condition: &JoinCondition,
     kind: JoinKind,
 ) -> Result<(Table, Vec<JoinSource>, bool), SqlError> {
-    let (left_time, right_time) = asof_time_columns(left, right, condition)?;
+    let (equi_pairs, (left_time, right_time)) = asof_keys(left, right, condition)?;
     let (schema, sources) = build_join_layout(left, right, &[], kind);
 
-    // Right rows with a time, sorted by time (stable: equal times keep their
-    // original order, so the last one wins).
-    let mut order: Vec<usize> = (0..right.rows.len())
-        .filter(|&index| !right.rows[index][right_time].is_null())
-        .collect();
-    order.sort_by_key(|&index| asof_time(&right.rows[index][right_time]).unwrap_or(i64::MIN));
-    let right_times: Vec<i64> = order
-        .iter()
-        .map(|&index| asof_time(&right.rows[index][right_time]).expect("non-null filtered"))
-        .collect();
-
-    // Left rows with a time participate in the search; `NULL` times never
-    // match.
-    let left_indices: Vec<usize> = (0..left.rows.len())
-        .filter(|&index| !left.rows[index][left_time].is_null())
-        .collect();
-    let left_times: Vec<i64> = left_indices
-        .iter()
-        .map(|&index| asof_time(&left.rows[index][left_time]).expect("non-null filtered"))
-        .collect();
-    let matches = asof_join(&left_times, &right_times).map_err(|error| {
-        SqlError::Exec(ExecError::TypeMismatch {
-            expected: "INT",
-            actual: error.to_string().leak(),
-        })
-    })?;
-
-    let mut matched: Vec<Option<usize>> = vec![None; left.rows.len()];
-    for (position, &left_index) in left_indices.iter().enumerate() {
-        matched[left_index] = matches[position].map(|position| order[position]);
+    // Group the right side by the equality keys, then sort each group by time
+    // (stable: equal times keep their original order, so the last one wins).
+    // Rows with a NULL key or NULL time never match.
+    let mut groups: std::collections::BTreeMap<Vec<String>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, row) in right.rows.iter().enumerate() {
+        if row[right_time].is_null() {
+            continue;
+        }
+        let Some(key) = asof_key(row, &equi_pairs, true) else {
+            continue;
+        };
+        groups.entry(key).or_default().push(index);
     }
+    let groups: std::collections::BTreeMap<Vec<String>, (Vec<usize>, Vec<i64>)> = groups
+        .into_iter()
+        .map(|(key, mut indices)| {
+            indices.sort_by_key(|&index| {
+                asof_time(&right.rows[index][right_time]).unwrap_or(i64::MIN)
+            });
+            let times = indices
+                .iter()
+                .map(|&index| asof_time(&right.rows[index][right_time]).expect("non-null filtered"))
+                .collect();
+            (key, (indices, times))
+        })
+        .collect();
 
     let null_right = vec![Value::Null; right.schema.len()];
     let mut rows = Vec::with_capacity(left.rows.len());
-    for (index, left_row) in left.rows.iter().enumerate() {
-        let right_row = matched[index]
+    for left_row in &left.rows {
+        let matched = asof_match(left_row, &equi_pairs, left_time, &groups);
+        let right_row = matched
             .map(|right_index| right.rows[right_index].as_slice())
             .unwrap_or(null_right.as_slice());
         let mut row = left_row.clone();
@@ -4959,53 +4956,167 @@ fn asof_join_tables(
     ))
 }
 
-/// Extracts the `left.ts >= right.ts` time columns from an as-of `ON` clause.
-fn asof_time_columns(
-    left: &Table,
-    right: &Table,
-    condition: &JoinCondition,
-) -> Result<(usize, usize), SqlError> {
+/// Equality key pairs and the single time pair of an ASOF JOIN.
+type AsofKeys = (Vec<(usize, usize)>, (usize, usize));
+
+/// Parses `ON <left>.k = <right>.k [AND ...] AND <left>.ts >= <right>.ts`.
+///
+/// Returns the equality key pairs and the single time pair. Anything else is
+/// rejected with `Unsupported`; a non-`INT` time column is a `TypeMismatch`.
+fn asof_keys(left: &Table, right: &Table, condition: &JoinCondition) -> Result<AsofKeys, SqlError> {
     let unsupported = || {
         SqlError::Unsupported(
-            "ASOF JOIN needs `ON <left>.ts >= <right>.ts` (single INT time column)".to_string(),
+            "ASOF JOIN needs `ON <left>.k = <right>.k [AND ...] AND <left>.ts >= <right>.ts`"
+                .to_string(),
         )
     };
     let JoinCondition::On(expr) = condition else {
         return Err(unsupported());
     };
-    let Expr::Binary {
-        op: BinaryOp::Ge,
-        left: left_expr,
-        right: right_expr,
-    } = expr
-    else {
-        return Err(unsupported());
-    };
-    let (
-        Expr::Column {
-            table: left_table,
-            name: left_name,
-        },
-        Expr::Column {
-            table: right_table,
-            name: right_name,
-        },
-    ) = (&**left_expr, &**right_expr)
-    else {
-        return Err(unsupported());
-    };
-    let left_index = asof_column(left, left_table.as_deref(), left_name)?;
-    let right_index = asof_column(right, right_table.as_deref(), right_name)?;
-    for (table, index) in [(left, left_index), (right, right_index)] {
-        let column = &table.schema.columns[index];
-        if column.data_type != DataType::Int {
-            return Err(SqlError::Exec(ExecError::TypeMismatch {
-                expected: "INT",
-                actual: column.data_type.name(),
-            }));
+    let mut terms = Vec::new();
+    flatten_and(expr, &mut terms);
+
+    let mut equi_pairs = Vec::new();
+    let mut time_pair = None;
+    for term in terms {
+        let Expr::Binary {
+            op,
+            left: left_expr,
+            right: right_expr,
+        } = term
+        else {
+            return Err(unsupported());
+        };
+        let (
+            Expr::Column {
+                table: left_table,
+                name: left_name,
+            },
+            Expr::Column {
+                table: right_table,
+                name: right_name,
+            },
+        ) = (&**left_expr, &**right_expr)
+        else {
+            return Err(unsupported());
+        };
+        match op {
+            BinaryOp::Eq => {
+                equi_pairs.push(asof_pair(
+                    left,
+                    right,
+                    left_table.as_deref(),
+                    left_name,
+                    right_table.as_deref(),
+                    right_name,
+                )?);
+            }
+            BinaryOp::Ge => {
+                if time_pair.is_some() {
+                    return Err(unsupported());
+                }
+                let pair = asof_pair(
+                    left,
+                    right,
+                    left_table.as_deref(),
+                    left_name,
+                    right_table.as_deref(),
+                    right_name,
+                )?;
+                let column = &left.schema.columns[pair.0];
+                if column.data_type != DataType::Int {
+                    return Err(SqlError::Exec(ExecError::TypeMismatch {
+                        expected: "INT",
+                        actual: column.data_type.name(),
+                    }));
+                }
+                let column = &right.schema.columns[pair.1];
+                if column.data_type != DataType::Int {
+                    return Err(SqlError::Exec(ExecError::TypeMismatch {
+                        expected: "INT",
+                        actual: column.data_type.name(),
+                    }));
+                }
+                time_pair = Some(pair);
+            }
+            _ => return Err(unsupported()),
         }
     }
+    let Some(time_pair) = time_pair else {
+        return Err(SqlError::Unsupported(
+            "ASOF JOIN needs a time key `ON ... <left>.ts >= <right>.ts`".to_string(),
+        ));
+    };
+    Ok((equi_pairs, time_pair))
+}
+
+fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            flatten_and(left, out);
+            flatten_and(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+/// Resolves a `left.col op right.col` pair, tolerating the swapped spelling.
+fn asof_pair(
+    left: &Table,
+    right: &Table,
+    left_table: Option<&str>,
+    left_name: &str,
+    right_table: Option<&str>,
+    right_name: &str,
+) -> Result<(usize, usize), SqlError> {
+    if let (Ok(left_index), Ok(right_index)) = (
+        asof_column(left, left_table, left_name),
+        asof_column(right, right_table, right_name),
+    ) {
+        return Ok((left_index, right_index));
+    }
+    let left_index = asof_column(left, right_table, right_name)?;
+    let right_index = asof_column(right, left_table, left_name)?;
     Ok((left_index, right_index))
+}
+
+/// Equality-key for one row; `None` when any key is `NULL` (they never match).
+fn asof_key(row: &Row, pairs: &[(usize, usize)], right_side: bool) -> Option<Vec<String>> {
+    pairs
+        .iter()
+        .map(|&(left_index, right_index)| {
+            let value = &row[if right_side { right_index } else { left_index }];
+            if value.is_null() {
+                None
+            } else {
+                Some(format!("{value:?}"))
+            }
+        })
+        .collect()
+}
+
+fn asof_match(
+    left_row: &Row,
+    pairs: &[(usize, usize)],
+    left_time: usize,
+    groups: &std::collections::BTreeMap<Vec<String>, (Vec<usize>, Vec<i64>)>,
+) -> Option<usize> {
+    if left_row[left_time].is_null() {
+        return None;
+    }
+    let key = asof_key(left_row, pairs, false)?;
+    let (order, times) = groups.get(&key)?;
+    let timestamp = asof_time(&left_row[left_time])?;
+    let count = times.partition_point(|value| *value <= timestamp);
+    if count == 0 {
+        None
+    } else {
+        Some(order[count - 1])
+    }
 }
 
 fn asof_column(schema_table: &Table, table: Option<&str>, name: &str) -> Result<usize, SqlError> {

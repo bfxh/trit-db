@@ -18,19 +18,23 @@ M10 第一刀已在 `tritdb-exec::batch` 提供 `asof_join(left, right)` 库原�
 SELECT ... FROM left ASOF JOIN right ON left.ts >= right.ts;
 ```
 
-- 只支持单时间键（`ON <left_col> >= <right_col>`）；
+- 支持「等值键 + 单时间键」：`ON <left>.k = <right>.k [AND ...] AND <left>.ts >= <right>.ts`；
+  等值键可选（`ON <left>.ts >= <right>.ts` 仍然可用）；
 - `NATURAL ASOF`、`ASOF ... USING`、`ASOF JOIN` 无 `ON` 都是错误；
-- `ON` 只接受 `>=`，且两侧都是列引用；其他形式报 `0A000`（feature_not_supported）。
+- `ON` 只接受 `=` 与 `>=`，且两侧都是列引用；其他形式、或出现两个 `>=`，报
+  `0A000`（feature_not_supported）。
 
 ### 语义
 
-1. **相等时间取最后一条**（q 的 `aj` 约定）；
-2. **右表在执行时按时间列做稳定排序**——trit-db 的表没有排序保证，SQL 里也无法表达
-   「FROM 有序」，因此由执行器排序（O(n log n)），并在计划里体现；
-3. **时间列为 `NULL` 的行不参与匹配**：右表 NULL 行不进时间序列；左表 NULL 行匹配不到
+1. **先按等值键分组，再在组内做 asof**：`ON a.sym = b.sym AND a.ts >= b.ts` 里每个左行
+   只匹配同一个 `sym` 的右行；等值键为 `NULL` 时不匹配（SQL `=` 的语义）；
+2. **相等时间取最后一条**（q 的 `aj` 约定）；
+3. **右表在执行时按时间列做稳定排序**——trit-db 的表没有排序保证，SQL 里也无法表达
+   「FROM 有序」，因此由执行器按组排序（O(n log n)），并在计划里体现；
+4. **时间为 `NULL` 的行不参与匹配**：右表 NULL 行不进时间序列；左表 NULL 行匹配不到
    任何右行（右列全 `NULL`）；
-4. **左外语义**：每个左行都保留；无匹配时右列填 `NULL`（与 `LEFT JOIN` 的可空规则一致）；
-5. 时间列必须是 `INT`（Unix 毫秒/秒由调用方约定）；类型不符报 `42804`，
+5. **左外语义**：每个左行都保留；无匹配时右列填 `NULL`（与 `LEFT JOIN` 的可空规则一致）；
+6. 时间列必须是 `INT`（Unix 毫秒/秒由调用方约定）；类型不符报 `42804`，
    列不存在报 `42703`。
 
 ### SQLSTATE
@@ -60,7 +64,7 @@ SELECT ... FROM left ASOF JOIN right ON left.ts >= right.ts;
 
 负面 / 未做：
 
-- 不支持多时间键、不支持 `symbol` 分组内 asof（外层 `GROUP BY` 可用，但不是同一语义）；
+- 不支持多时间键（只能有一个 `>=`）；等值键必须成对写在 `ON` 里（不支持 `USING`）；
 - 不做右表「已排序」假设，因此每次执行都排序；
 - `ASOF JOIN` 只能作为 `JOIN` 的一种，不能与 `NATURAL` 组合。
 

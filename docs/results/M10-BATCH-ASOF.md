@@ -61,8 +61,9 @@ pub fn asof_join(left: &[i64], right: &[i64]) -> Result<Vec<Option<usize>>, Batc
   组合与混合谓词回退；
 - `DELETE` 与 `UPDATE` 的 `WHERE` 复用同一 `batch_filter_indices`（同一 debug 对拍），
   集成测试 `batch_where_drives_update_and_delete` 覆盖更新/删除与混合谓词回退；
-- `ASOF JOIN` 语法已接入（`ON <left>.ts >= <right>.ts`）：单 `INT` 时间键、右表执行时稳定排序、
-  `NULL` 时间不匹配、左外语义；语义与 SQLSTATE 见 `docs/ADR/046-asof-join.md`。
+- `ASOF JOIN` 语法已接入（`ON <left>.k = <right>.k [AND ...] AND <left>.ts >= <right>.ts`）：
+  等值键分组 + 单 `INT` 时间键、右表按组稳定排序、`NULL` 键/时间不匹配、左外语义；
+  语义与 SQLSTATE 见 `docs/ADR/046-asof-join.md`。
 
 ### 5.1 还没做
 

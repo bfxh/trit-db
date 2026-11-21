@@ -3475,6 +3475,42 @@ fn asof_join_rejects_unsupported_conditions() {
 }
 
 #[test]
+fn asof_join_groups_by_equality_keys() {
+    let dir = TempDir::new("sql-asof-multikey");
+    let db = dir.join("sql.db");
+    let mut engine = SqlEngine::open(&db).expect("open");
+    engine
+        .execute_script(
+            "CREATE TABLE trades (id INT NOT NULL, sym TEXT, ts INT NOT NULL, px INT);              CREATE TABLE quotes (sym TEXT, ts INT NOT NULL, bid INT);              INSERT INTO trades VALUES (1, 'AAA', 10, 100), (2, 'BBB', 10, 200),              (3, 'AAA', 25, 300), (4, 'CCC', 10, 400), (5, NULL, 10, 500);              INSERT INTO quotes VALUES ('AAA', 5, 50), ('BBB', 5, 60), ('AAA', 20, 70),              ('AAA', 20, 71), ('BBB', 20, 80), (NULL, 5, 99);",
+        )
+        .expect("seed");
+    let results = engine
+        .execute_script(
+            "SELECT trades.id, quotes.bid FROM trades              ASOF JOIN quotes ON trades.sym = quotes.sym AND trades.ts >= quotes.ts              ORDER BY trades.id;",
+        )
+        .expect("multi-key asof");
+    assert_eq!(
+        as_rows(&results[0]).1,
+        [
+            vec![Value::Int(1), Value::Int(50)],
+            vec![Value::Int(2), Value::Int(60)],
+            vec![Value::Int(3), Value::Int(71)],
+            vec![Value::Int(4), Value::Null],
+            vec![Value::Int(5), Value::Null],
+        ]
+    );
+
+    // Without a time key the ON clause is rejected.
+    let error = engine
+        .execute_script("SELECT * FROM trades ASOF JOIN quotes ON trades.sym = quotes.sym;")
+        .expect_err("missing time key");
+    assert!(
+        matches!(error, SqlError::Unsupported(_)),
+        "unexpected {error:?}"
+    );
+}
+
+#[test]
 fn join_projection_prunes_unused_source_columns() {
     let dir = TempDir::new("sql-projection");
     let db = dir.join("sql.db");
