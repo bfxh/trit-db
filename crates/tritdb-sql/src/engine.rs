@@ -102,6 +102,36 @@ fn tuple_in_expr(exprs: Vec<Expr>, rows: Vec<Vec<Value>>, negated: bool) -> Expr
     }
 }
 
+fn convert_column_value(value: Value, target: DataType) -> Result<Value, SqlError> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    match (target, value) {
+        (DataType::Text, Value::Int(value)) => Ok(Value::Text(value.to_string())),
+        (DataType::Text, Value::Bool(value)) => Ok(Value::Text(value.to_string())),
+        (DataType::Int, Value::Text(value)) => value
+            .parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| SqlError::Unsupported(format!("cannot cast {value:?} to INT"))),
+        (DataType::Int, Value::Bool(value)) => Ok(Value::Int(if value { 1 } else { 0 })),
+        (DataType::Bool, Value::Int(value)) => match value {
+            0 => Ok(Value::Bool(false)),
+            1 => Ok(Value::Bool(true)),
+            _ => Err(SqlError::Unsupported(format!(
+                "cannot cast {value} to BOOL"
+            ))),
+        },
+        (DataType::Bool, Value::Text(value)) => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(Value::Bool(true)),
+            "false" | "0" => Ok(Value::Bool(false)),
+            _ => Err(SqlError::Unsupported(format!(
+                "cannot cast {value:?} to BOOL"
+            ))),
+        },
+        (target, value) => target.coerce(value).map_err(SqlError::Exec),
+    }
+}
+
 fn compare_window_keys(left: &[Value], right: &[Value], order_by: &[OrderBy]) -> Ordering {
     for (index, order) in order_by.iter().enumerate() {
         let ordering = match (&left[index], &right[index]) {
@@ -588,6 +618,12 @@ impl SqlEngine {
             Statement::AlterTableRenameColumn { name, from, to } => {
                 self.alter_table_rename_column(name, from, to)
             }
+            Statement::RenameTable { from, to } => self.rename_table(from, to),
+            Statement::AlterColumnType {
+                table,
+                column,
+                data_type,
+            } => self.alter_column_type(table, column, *data_type),
             Statement::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
             Statement::Insert {
                 table,
@@ -829,6 +865,64 @@ impl SqlEngine {
         self.stats.remove(name);
         Ok(QueryResult::Message(format!(
             "renamed column {from} to {to} in table {name}"
+        )))
+    }
+
+    fn rename_table(&mut self, from: &str, to: &str) -> Result<QueryResult, SqlError> {
+        let Some(existing) = self.tables.get(from) else {
+            return Err(SqlError::UnknownTable(from.to_string()));
+        };
+        if self.tables.contains_key(to) {
+            return Err(SqlError::TableExists(to.to_string()));
+        }
+        let mut table = existing.clone();
+        table.name = to.to_string();
+        let value = encode_table(&table)?;
+        let mut txn = self.store.begin()?;
+        txn.delete(&table_key(from))?;
+        txn.delete(&stats_key(from))?;
+        txn.put(&table_key(to), &value)?;
+        txn.commit()?;
+        self.tables.remove(from);
+        self.stats.remove(from);
+        self.tables.insert(to.to_string(), table);
+        Ok(QueryResult::Message(format!(
+            "renamed table {from} to {to}"
+        )))
+    }
+
+    fn alter_column_type(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        data_type: DataType,
+    ) -> Result<QueryResult, SqlError> {
+        let Some(existing) = self.tables.get(table_name) else {
+            return Err(SqlError::UnknownTable(table_name.to_string()));
+        };
+        let Some(index) = existing.schema.index_of(column_name) else {
+            return Err(SqlError::UnknownColumn(column_name.to_string()));
+        };
+        let mut table = existing.clone();
+        let mut schema = table.schema.clone();
+        if schema.columns[index].data_type == data_type {
+            return Ok(QueryResult::Message(format!(
+                "column {column_name} already has type {}",
+                data_type.name()
+            )));
+        }
+        let mut rows = table.rows.clone();
+        for row in &mut rows {
+            let value = std::mem::replace(&mut row[index], Value::Null);
+            row[index] = convert_column_value(value, data_type)?;
+        }
+        schema.columns[index].data_type = data_type;
+        table.schema = schema;
+        table.rows = rows;
+        self.put_table(table)?;
+        Ok(QueryResult::Message(format!(
+            "altered column {column_name} to type {}",
+            data_type.name()
         )))
     }
 

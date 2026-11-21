@@ -425,11 +425,26 @@ impl Parser {
             });
         }
         if self.eat_word("rename") {
+            if self.eat_word("to") {
+                let to = self.parse_ident()?;
+                return Ok(Statement::RenameTable { from: name, to });
+            }
             self.eat_word("column");
             let from = self.parse_ident()?;
             self.expect_word("to")?;
             let to = self.parse_ident()?;
             return Ok(Statement::AlterTableRenameColumn { name, from, to });
+        }
+        if self.eat_keyword(Keyword::Alter) {
+            self.eat_word("column");
+            let column = self.parse_ident()?;
+            self.eat_word("type");
+            let data_type = self.parse_type()?;
+            return Ok(Statement::AlterColumnType {
+                table: name,
+                column,
+                data_type,
+            });
         }
         self.expect_keyword(Keyword::Add)?;
         self.eat_word("column");

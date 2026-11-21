@@ -394,6 +394,22 @@ pub enum Statement {
         /// Column to remove.
         column: String,
     },
+    /// `ALTER TABLE ... RENAME TO ...` (table rename).
+    RenameTable {
+        /// Old table name.
+        from: String,
+        /// New table name.
+        to: String,
+    },
+    /// `ALTER TABLE ... ALTER [COLUMN] c TYPE ...`.
+    AlterColumnType {
+        /// Table name.
+        table: String,
+        /// Column name.
+        column: String,
+        /// New type.
+        data_type: DataType,
+    },
     /// `ALTER TABLE ... RENAME [COLUMN] a TO b`.
     AlterTableRenameColumn {
         /// Table name.
