@@ -14,7 +14,9 @@ use crate::ast::{
     AggregateKind, Assignment, Cte, Expr, Join, JoinCondition, JoinKind, Quantifier, Query, Select,
     SelectItem, Statement, With,
 };
-use crate::bind::{bind_expr, bind_select, eval_constant, BoundSelect, GroupExpr};
+use crate::bind::{
+    bind_expr, bind_select, eval_constant, select_has_aggregate, BoundSelect, GroupExpr,
+};
 use crate::error::SqlError;
 use crate::parser::parse_script;
 use crate::plan::{
@@ -1249,15 +1251,21 @@ impl SqlEngine {
 
     fn select(&mut self, select: &Select) -> Result<QueryResult, SqlError> {
         let folded = fold_select(select);
-        if let Some(filter) = &folded.filter {
-            let outer = folded
-                .table_alias
-                .as_deref()
-                .unwrap_or(&folded.table)
-                .to_string();
-            if expr_has_outer_subquery(filter, &outer) {
-                return self.select_with_correlated_filter(select, &folded, &outer);
-            }
+        let outer = folded
+            .table_alias
+            .as_deref()
+            .unwrap_or(&folded.table)
+            .to_string();
+        let has_correlated = folded
+            .filter
+            .as_ref()
+            .is_some_and(|filter| expr_has_outer_subquery(filter, &outer))
+            || folded.items.iter().any(|item| match item {
+                SelectItem::Wildcard => false,
+                SelectItem::Expr { expr, .. } => expr_has_outer_subquery(expr, &outer),
+            });
+        if has_correlated {
+            return self.select_with_correlated(select, &folded, &outer);
         }
         let pushdown = plan_filter_pushdown(&folded);
         let projection = self.plan_scan_projection(&folded)?;
@@ -1271,37 +1279,96 @@ impl SqlEngine {
         }
     }
 
-    /// Evaluates a `WHERE` filter that contains correlated subqueries.
+    /// Evaluates correlated subqueries in `WHERE` and in the select list.
     ///
     /// Every outer row is substituted into the subquery's outer-column
-    /// references, the subquery runs once for that row, and the resulting
-    /// filter is evaluated. The surviving rows then go through the ordinary
-    /// projection/group/sort path.
-    fn select_with_correlated_filter(
+    /// references. A correlated `WHERE` item keeps or drops the row; a
+    /// correlated select-list expression is evaluated per row into a hidden
+    /// `__corrN` column, and the item becomes a reference to that column.
+    /// The rewritten query then goes through the ordinary projection/sort path.
+    fn select_with_correlated(
         &mut self,
         original: &Select,
         folded: &Select,
         outer: &str,
     ) -> Result<QueryResult, SqlError> {
+        if !folded.group_by.is_empty() || select_has_aggregate(folded) {
+            return Err(SqlError::Unsupported(
+                "correlated subqueries with GROUP BY or aggregates are not supported".to_string(),
+            ));
+        }
+        if folded.having.is_some() {
+            return Err(SqlError::Unsupported(
+                "correlated subqueries with HAVING are not supported".to_string(),
+            ));
+        }
+        if folded
+            .order_by
+            .iter()
+            .any(|order| expr_has_outer_subquery(&order.expr, outer))
+        {
+            return Err(SqlError::Unsupported(
+                "correlated subqueries in ORDER BY are not supported".to_string(),
+            ));
+        }
+
         let pushdown = plan_filter_pushdown(folded);
         let projection = self.plan_scan_projection(folded)?;
         let mut table = self.build_from(folded, &pushdown, &projection)?;
-        let filter = folded
-            .filter
-            .clone()
-            .expect("correlated path requires a filter");
-        let mut kept = Vec::with_capacity(table.rows.len());
-        for row in table.rows.drain(..) {
-            let mut row_filter = filter.clone();
-            self.bind_correlated_expr(&mut row_filter, &table.schema, &row, outer)?;
-            let bound = bind_expr(&row_filter, &table.schema)?;
-            if truth_of(&eval(&bound, &table.schema, &row)?)? == TruthValue::True {
-                kept.push(row);
+
+        let mut planned = folded.clone();
+        if let Some(filter) = &folded.filter {
+            if expr_has_outer_subquery(filter, outer) {
+                let filter = filter.clone();
+                let mut kept = Vec::with_capacity(table.rows.len());
+                for row in table.rows.drain(..) {
+                    let mut row_filter = filter.clone();
+                    self.bind_correlated_expr(&mut row_filter, &table.schema, &row, outer)?;
+                    let bound = bind_expr(&row_filter, &table.schema)?;
+                    if truth_of(&eval(&bound, &table.schema, &row)?)? == TruthValue::True {
+                        kept.push(row);
+                    }
+                }
+                table.rows = kept;
+                planned.filter = None;
             }
         }
-        table.rows = kept;
-        let filtered_select = select_with_filter(folded, None);
-        let plan = bind_select(&filtered_select, &table)?;
+        for (index, item) in folded.items.iter().enumerate() {
+            let SelectItem::Expr { expr, alias } = item else {
+                continue;
+            };
+            if !expr_has_outer_subquery(expr, outer) {
+                continue;
+            }
+            let name = format!("__corr{index}");
+            let mut values = Vec::with_capacity(table.rows.len());
+            for row in &table.rows {
+                let mut row_expr = expr.clone();
+                self.bind_correlated_expr(&mut row_expr, &table.schema, row, outer)?;
+                let bound = bind_expr(&row_expr, &table.schema)?;
+                values.push(eval(&bound, &table.schema, row)?);
+            }
+            let data_type = values
+                .iter()
+                .find_map(|value| match value {
+                    Value::Null => None,
+                    other => Some(value_data_type(other)),
+                })
+                .unwrap_or(DataType::Text);
+            table
+                .schema
+                .columns
+                .push(Column::new(name.clone(), data_type));
+            for (row, value) in table.rows.iter_mut().zip(values) {
+                row.push(value);
+            }
+            planned.items[index] = SelectItem::Expr {
+                expr: Expr::Column { table: None, name },
+                alias: alias.clone(),
+            };
+        }
+
+        let plan = bind_select(&planned, &table)?;
         let result = execute_select(&table, &plan)?;
         match &original.under_repair {
             Some(keys) => filter_under_repair(result, keys),
