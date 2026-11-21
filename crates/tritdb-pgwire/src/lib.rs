@@ -1765,33 +1765,43 @@ fn copy_encoding_supported(encoding: &str) -> bool {
 }
 
 /// Decodes one COPY line using the declared encoding.
-fn decode_copy_line(bytes: &[u8], encoding: &str) -> String {
+///
+/// Invalid or incomplete byte sequences are an error, not a silent
+/// replacement: a truncated UTF-16 unit or a broken multi-byte character used
+/// to be dropped, quietly corrupting the row and shifting later fields.
+fn decode_copy_line(bytes: &[u8], encoding: &str) -> Result<String, String> {
     let normalized = encoding.to_ascii_uppercase().replace(['-', '_'], "");
     match normalized.as_str() {
-        "LATIN1" | "ISO88591" => bytes.iter().map(|byte| *byte as char).collect(),
-        "ASCII" => bytes
-            .iter()
-            .map(|byte| {
-                if *byte < 0x80 {
-                    *byte as char
-                } else {
-                    '\u{FFFD}'
-                }
-            })
-            .collect(),
+        "LATIN1" | "ISO88591" => Ok(bytes.iter().map(|byte| *byte as char).collect()),
+        "ASCII" => {
+            if bytes.iter().any(|byte| *byte >= 0x80) {
+                return Err("COPY data is not valid ASCII".to_string());
+            }
+            Ok(bytes.iter().map(|byte| *byte as char).collect())
+        }
         "UTF16LE" => decode_utf16(bytes, true),
         "UTF16BE" => decode_utf16(bytes, false),
         _ => match copy_encoding_codec(encoding) {
-            Some(codec) => codec.decode_without_bom_handling(bytes).0.into_owned(),
-            None => String::from_utf8_lossy(bytes).to_string(),
+            Some(codec) => {
+                let (text, had_errors) = codec.decode_without_bom_handling(bytes);
+                if had_errors {
+                    Err(format!("COPY data is not valid {encoding}"))
+                } else {
+                    Ok(text.into_owned())
+                }
+            }
+            None => String::from_utf8(bytes.to_vec())
+                .map_err(|_| format!("COPY data is not valid {encoding}")),
         },
     }
 }
 
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let units: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err("COPY data has an incomplete UTF-16 code unit".to_string());
+    }
+    let units: Vec<u16> = chunks
         .iter()
         .map(|chunk| {
             if little_endian {
@@ -1801,7 +1811,7 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
             }
         })
         .collect();
-    String::from_utf16_lossy(&units)
+    String::from_utf16(&units).map_err(|_| "COPY data has an unpaired UTF-16 surrogate".to_string())
 }
 
 /// Encodes one COPY line as UTF-8 into the declared encoding.
@@ -2242,7 +2252,10 @@ fn copy_in_csv(
                     header_pending = false;
                     continue;
                 }
-                let line = decode_copy_line(&payload, &options.encoding);
+                let line = match decode_copy_line(&payload, &options.encoding) {
+                    Ok(line) => line,
+                    Err(message) => return copy_failed(stream, &message),
+                };
                 let line = line.trim_end_matches(['\r', '\n']);
                 let (parsed, unterminated) = parse_csv_line(line, options);
                 if unterminated {
@@ -2698,7 +2711,10 @@ fn copy_in(
                     header_pending = false;
                     continue;
                 }
-                let line = decode_copy_line(&payload, &options.encoding);
+                let line = match decode_copy_line(&payload, &options.encoding) {
+                    Ok(line) => line,
+                    Err(message) => return copy_failed(stream, &message),
+                };
                 let line = line.trim_end_matches(['\r', '\n']);
                 let values: Vec<&str> = line.split(options.delimiter as char).collect();
                 if values.len() != columns.len() {
@@ -3705,6 +3721,20 @@ fn command_tag(message: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn copy_decoding_rejects_incomplete_sequences() {
+        assert!(decode_copy_line(&[0x41, 0x00, 0x42], "UTF16LE").is_err());
+        assert!(decode_copy_line(&[0x00, 0xD8], "UTF16LE").is_err());
+        assert_eq!(
+            decode_copy_line(&[0x41, 0x00], "UTF16LE").expect("utf16"),
+            "A"
+        );
+        assert!(decode_copy_line(&[0xFF], "ASCII").is_err());
+        assert!(decode_copy_line(&[0xFF], "GBK").is_err());
+        assert!(decode_copy_line(&[0xFF], "UTF8").is_err());
+        assert_eq!(decode_copy_line(b"ok", "UTF8").expect("utf8"), "ok");
+    }
 
     #[test]
     fn copy_literal_quotes_hostile_text() {

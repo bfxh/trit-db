@@ -1884,6 +1884,31 @@ mod tests {
     }
 
     #[test]
+    fn tiny_segment_limit_still_recovers_every_record() {
+        let dir = TempDir::new();
+        let path = dir.wal();
+        // The writer clamps the limit to MIN_SEGMENT_LIMIT, so a 1-byte
+        // request must not spin forever or drop records at a segment boundary.
+        let store = TxnStore::open_with_wal_limit(&path, 1).expect("open");
+        for index in 0..50u64 {
+            let mut txn = store.begin().expect("begin");
+            txn.put(format!("k{index}").as_bytes(), b"v").expect("put");
+            txn.commit().expect("commit");
+        }
+        drop(store);
+
+        let reopened = TxnStore::open_with_wal_limit(&path, 1).expect("reopen");
+        for index in 0..50u64 {
+            let key = format!("k{index}");
+            assert_eq!(
+                reopened.get(key.as_bytes()).expect("get"),
+                Some(b"v".to_vec()),
+                "record {key} lost across rotated segments"
+            );
+        }
+    }
+
+    #[test]
     fn pitr_recovers_across_wal_segments() {
         let dir = TempDir::new();
         let path = dir.wal();
