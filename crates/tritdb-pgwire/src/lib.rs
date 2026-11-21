@@ -15,7 +15,10 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -27,6 +30,10 @@ use tritdb_sql::{parse_script, QueryResult, SqlEngine, SqlError, Statement};
 use x509_cert::ext::pkix::CrlReason;
 
 const PROTOCOL_V3: i32 = 196_608;
+/// Default limit on concurrently served connections (`0` disables the limit).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+/// Default milliseconds a connection waits for the shared engine lock.
+pub const DEFAULT_ENGINE_LOCK_TIMEOUT_MS: u64 = 30_000;
 /// SCRAM-SHA-256 iteration count used for new challenges.
 const SCRAM_ITERATIONS: u32 = 4_096;
 const SSL_REQUEST: i32 = 80_877_103;
@@ -171,7 +178,7 @@ pub enum AuthMode {
 
 /// Server-side options. `Default` is trust auth with plain text connections,
 /// matching the original behaviour.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ServerOptions {
     /// Authentication mode.
     pub auth: AuthMode,
@@ -200,6 +207,31 @@ pub struct ServerOptions {
     pub require_tls: bool,
     /// Permit cleartext password authentication over a plaintext connection.
     pub allow_plaintext_password: bool,
+    /// Maximum number of connections served at once; `0` means unlimited.
+    pub max_connections: usize,
+    /// How long a connection waits for the shared engine lock before it
+    /// reports a timeout; `None` waits forever.
+    pub engine_lock_timeout: Option<Duration>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            auth: AuthMode::default(),
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
+            tls_client_revoked: None,
+            tls_client_ocsp: None,
+            tls_client_ocsp_url: None,
+            tls_client_ocsp_ca: None,
+            tls_client_ocsp_allow_hold: false,
+            require_tls: false,
+            allow_plaintext_password: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            engine_lock_timeout: Some(Duration::from_millis(DEFAULT_ENGINE_LOCK_TIMEOUT_MS)),
+        }
+    }
 }
 
 impl ServerOptions {
@@ -234,13 +266,15 @@ fn parse_startup_user(body: &[u8]) -> Option<String> {
     None
 }
 
+/// Compares two byte strings without short-circuiting on the first mismatch.
+///
+/// The length difference is folded into the accumulator and the loop runs
+/// over the shorter input, so a wrong-length guess takes the same path as a
+/// wrong value instead of returning early.
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
+    let mut diff = left.len() ^ right.len();
     for (a, b) in left.iter().zip(right) {
-        diff |= a ^ b;
+        diff |= usize::from(a ^ b);
     }
     diff == 0
 }
@@ -1208,18 +1242,32 @@ pub fn serve_with_options(
     let engine = Arc::new(Mutex::new(
         SqlEngine::open(&db).map_err(|error| PgError::Sql(error.to_string()))?,
     ));
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let stream = match stream {
+        let mut stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("pgwire: accept failed: {error}");
                 continue;
             }
         };
+        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+        if options.max_connections != 0 && current > options.max_connections {
+            active.fetch_sub(1, Ordering::AcqRel);
+            eprintln!(
+                "pgwire: refusing a connection: {} of {} slots are in use",
+                current - 1,
+                options.max_connections
+            );
+            let _ = write_error(&mut stream, "too many connections");
+            continue;
+        }
+        let slot = ConnectionSlot(Arc::clone(&active));
         let engine = Arc::clone(&engine);
         let options = Arc::clone(&options);
         let tls = tls.clone();
         std::thread::spawn(move || {
+            let _slot = slot;
             if let Err(error) = handle_connection(engine, stream, options, tls) {
                 eprintln!("pgwire: {error}");
             }
@@ -1228,10 +1276,58 @@ pub fn serve_with_options(
     Ok(())
 }
 
-fn lock_engine(engine: &Arc<Mutex<SqlEngine>>) -> std::sync::MutexGuard<'_, SqlEngine> {
-    engine
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Releases a connection slot when its handler thread ends.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn lock_engine(
+    engine: &Arc<Mutex<SqlEngine>>,
+    timeout: Option<Duration>,
+) -> Result<std::sync::MutexGuard<'_, SqlEngine>, PgError> {
+    let Some(timeout) = timeout else {
+        return Ok(engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match engine.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(PgError::Protocol(format!(
+                        "timed out after {} ms waiting for the query engine",
+                        timeout.as_millis()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// Acquires the shared engine lock, reporting a timeout to the client instead
+/// of blocking this connection behind a long-running query.
+fn acquire_engine<'a>(
+    stream: &mut dyn ReadWrite,
+    engine: &'a Arc<Mutex<SqlEngine>>,
+    options: &ServerOptions,
+    tx_status: TxStatus,
+) -> Result<Option<std::sync::MutexGuard<'a, SqlEngine>>, PgError> {
+    match lock_engine(engine, options.engine_lock_timeout) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(error) => {
+            write_error(stream, &error.to_string())?;
+            write_message(stream, b'Z', &[tx_status.byte()])?;
+            Ok(None)
+        }
+    }
 }
 
 fn handle_connection(
@@ -1323,7 +1419,9 @@ fn handle_connection(
                 let sql = String::from_utf8_lossy(&payload)
                     .trim_end_matches('\0')
                     .to_string();
-                let mut guard = lock_engine(&engine);
+                let Some(mut guard) = acquire_engine(stream, &engine, &options, tx_status)? else {
+                    continue;
+                };
                 handle_query(stream, &mut guard, &sql, &mut tx_status)?;
             }
             b'S' => write_message(stream, b'Z', &[tx_status.byte()])?,
@@ -1331,11 +1429,15 @@ fn handle_connection(
             b'P' => parse_prepared(stream, &mut prepared, &payload)?,
             b'B' => bind_portal(stream, &prepared, &mut portals, &payload)?,
             b'D' => {
-                let mut guard = lock_engine(&engine);
+                let Some(mut guard) = acquire_engine(stream, &engine, &options, tx_status)? else {
+                    continue;
+                };
                 describe(stream, &mut guard, &prepared, &portals, &payload)?;
             }
             b'E' => {
-                let mut guard = lock_engine(&engine);
+                let Some(mut guard) = acquire_engine(stream, &engine, &options, tx_status)? else {
+                    continue;
+                };
                 execute_portal(stream, &mut guard, &portals, &payload, &mut tx_status)?;
             }
             b'C' => close_portal(stream, &mut prepared, &mut portals, &payload)?,
@@ -3508,6 +3610,45 @@ fn command_tag(message: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn engine_lock_wait_times_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "tritdb-pgwire-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let engine = Arc::new(Mutex::new(
+            SqlEngine::open(&dir.join("lock.db")).expect("open"),
+        ));
+        let held = Arc::clone(&engine);
+        let guard = held.lock().expect("lock");
+
+        let start = Instant::now();
+        let error = match lock_engine(&engine, Some(Duration::from_millis(50))) {
+            Ok(_) => panic!("the lock is held, so the wait must time out"),
+            Err(error) => error,
+        };
+        assert!(
+            start.elapsed() >= Duration::from_millis(50),
+            "returned before the timeout elapsed"
+        );
+        assert!(error.to_string().contains("timed out"), "{error}");
+
+        drop(guard);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_and_value_mismatches() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
 
     #[test]
     fn integer_parameter_values_must_be_numbers() {

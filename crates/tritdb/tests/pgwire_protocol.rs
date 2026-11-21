@@ -2798,3 +2798,109 @@ fn sql_errors_report_sqlstate_and_hint() {
         "{messages:?}"
     );
 }
+
+#[test]
+fn concurrent_connections_keep_unique_constraints() {
+    let dir = TempDir::new("pgwire-race-unique");
+    let db = dir.join("race.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let connect = || -> TcpStream {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        write_startup(&mut stream);
+        let messages = read_until_ready(&mut stream);
+        assert!(!has_error(&messages), "startup rejected: {messages:?}");
+        stream
+    };
+
+    let mut setup = connect();
+    query(
+        &mut setup,
+        "CREATE TABLE wire_race (id INT NOT NULL UNIQUE);",
+    );
+    let messages = read_until_ready(&mut setup);
+    assert!(!has_error(&messages), "create failed: {messages:?}");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let mut stream = connect();
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            query(&mut stream, "INSERT INTO wire_race VALUES (1);");
+            let messages = read_until_ready(&mut stream);
+            has_error(&messages)
+        }));
+    }
+    let failures = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join"))
+        .filter(|failed| *failed)
+        .count();
+    assert_eq!(
+        failures, 7,
+        "all but one of eight concurrent connections must lose the unique key"
+    );
+
+    query(&mut setup, "SELECT COUNT(*) FROM wire_race;");
+    let messages = read_until_ready(&mut setup);
+    assert!(!has_error(&messages), "count failed: {messages:?}");
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("a DataRow");
+    assert_eq!(row, vec![Some("1".to_string())]);
+}
+
+#[test]
+fn connection_limit_refuses_extra_clients() {
+    let dir = TempDir::new("pgwire-max-conn");
+    let db = dir.join("conn.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        max_connections: 1,
+        ..Default::default()
+    });
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db_path, listener, options);
+    });
+
+    let mut first = TcpStream::connect(addr).expect("connect");
+    first
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    write_startup(&mut first);
+    let messages = read_until_ready(&mut first);
+    assert!(
+        !has_error(&messages),
+        "the first connection must be accepted: {messages:?}"
+    );
+
+    let mut second = TcpStream::connect(addr).expect("connect");
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let (kind, payload) = read_message(&mut second).expect("refusal message");
+    assert_eq!(
+        kind, b'E',
+        "the second connection must be refused, got {kind:?} {payload:?}"
+    );
+    assert!(
+        error_fields(&payload)
+            .iter()
+            .any(|(_, text)| text.contains("too many connections")),
+        "refusal should say why: {payload:?}"
+    );
+}

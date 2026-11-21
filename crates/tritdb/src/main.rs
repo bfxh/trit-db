@@ -102,6 +102,7 @@ fn print_help() {
     println!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
     println!("        [--tls-client-ca <ca.pem> [--tls-client-revoked <file>] [--tls-client-ocsp <der>] [--tls-client-ocsp-url <http(s)://...>] [--tls-client-ocsp-ca <pem>] [--tls-client-ocsp-allow-hold]]");
     println!("        [--allow-plaintext-password]");
+    println!("        [--max-connections 64] [--lock-timeout-ms 30000]");
     println!("        [--scram-verifier-file <file>]");
     println!("  scram-verifier --password <pwd> [--iterations 4096] --out <file>");
     println!("  sql --db sql.db --file script.sql");
@@ -1818,6 +1819,26 @@ fn run_serve(args: &[String]) -> Result<(), String> {
     let allow_plaintext_password = args
         .iter()
         .any(|argument| argument == "--allow-plaintext-password");
+    let max_connections = match arg_value(args, "--max-connections") {
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            format!("bad --max-connections {value}: expected a non-negative integer")
+        })?,
+        None => tritdb_pgwire::DEFAULT_MAX_CONNECTIONS,
+    };
+    let engine_lock_timeout = match arg_value(args, "--lock-timeout-ms") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(millis) => Some(std::time::Duration::from_millis(millis)),
+            Err(_) => {
+                return Err(format!(
+                    "bad --lock-timeout-ms {value}: expected milliseconds (0 waits forever)"
+                ))
+            }
+        },
+        None => Some(std::time::Duration::from_millis(
+            tritdb_pgwire::DEFAULT_ENGINE_LOCK_TIMEOUT_MS,
+        )),
+    };
     if matches!(auth, tritdb_pgwire::AuthMode::Password(_))
         && tls_cert.is_none()
         && !allow_plaintext_password
@@ -1841,6 +1862,8 @@ fn run_serve(args: &[String]) -> Result<(), String> {
         tls_client_ocsp_allow_hold,
         require_tls,
         allow_plaintext_password,
+        max_connections,
+        engine_lock_timeout,
     };
     let listener =
         std::net::TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;

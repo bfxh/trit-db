@@ -16,7 +16,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
-use tritdb_exec::graph::{annotated_knn, AnnotatedGraph, Point, MAX_DIMENSIONS};
+use tritdb_exec::graph::{
+    annotated_knn, AnnotatedGraph, Point, MAX_DIMENSIONS, MAX_EDGES, MAX_NODES, MAX_POINTS,
+};
 use tritdb_exec::TruthValue;
 use tritdb_exec::Value;
 use tritdb_format::Block;
@@ -2058,6 +2060,10 @@ fn run_ann_knn(args: &[String]) {
         eprintln!("--points must be greater than 0");
         std::process::exit(2);
     }
+    if count > MAX_POINTS {
+        eprintln!("--points must be at most {MAX_POINTS}");
+        std::process::exit(2);
+    }
 
     let mut rng = Rng::new(0xabcd_0001);
     let mut points = Vec::with_capacity(count);
@@ -2125,6 +2131,14 @@ fn run_graph_reach(args: &[String]) {
     }
     if fanout >= nodes {
         eprintln!("--fanout must be smaller than --nodes");
+        std::process::exit(2);
+    }
+    if nodes > MAX_NODES {
+        eprintln!("--nodes must be at most {MAX_NODES}");
+        std::process::exit(2);
+    }
+    if nodes.saturating_mul(fanout) > MAX_EDGES {
+        eprintln!("--nodes * --fanout must be at most {MAX_EDGES}");
         std::process::exit(2);
     }
 

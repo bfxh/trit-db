@@ -997,4 +997,159 @@ mod tests {
             Err(GraphError::BadEncoding(_))
         ));
     }
+
+    #[test]
+    fn annotated_knn_handles_negative_coordinates_and_bucket_limits() {
+        let points = vec![
+            Point {
+                id: 3,
+                vector: vec![-2, 1],
+                label: TruthValue::True,
+            },
+            Point {
+                id: 1,
+                vector: vec![2, -1],
+                label: TruthValue::True,
+            },
+            Point {
+                id: 2,
+                vector: vec![-2, 1],
+                label: TruthValue::Unknown,
+            },
+        ];
+        let answer = annotated_knn(&points, &[0, 0], 2).expect("knn");
+        // Both true points are 5 away; ties break on the smaller id.
+        assert_eq!(
+            answer
+                .certain
+                .iter()
+                .map(|neighbor| (neighbor.id, neighbor.distance))
+                .collect::<Vec<_>>(),
+            vec![(1, 5), (3, 5)]
+        );
+        assert_eq!(
+            answer
+                .uncertain
+                .iter()
+                .map(|neighbor| neighbor.id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let none = annotated_knn(&points, &[0, 0], 0).expect("k = 0");
+        assert!(none.certain.is_empty());
+        assert!(none.uncertain.is_empty());
+        assert!(none.excluded.is_empty());
+
+        let all = annotated_knn(&points, &[0, 0], 99).expect("k beyond the point count");
+        assert_eq!(all.certain.len(), 2);
+        assert_eq!(all.uncertain.len(), 1);
+    }
+
+    #[test]
+    fn annotated_knn_rejects_oversized_queries_and_mismatched_points() {
+        let too_wide = vec![0i64; MAX_DIMENSIONS + 1];
+        let error = annotated_knn(&[], &too_wide, 1).expect_err("query too wide");
+        assert!(matches!(error, GraphError::TooManyDimensions { .. }));
+
+        let points = vec![Point {
+            id: 0,
+            vector: vec![1, 2, 3],
+            label: TruthValue::True,
+        }];
+        let error = annotated_knn(&points, &[0, 0], 1).expect_err("point too wide");
+        assert!(matches!(
+            error,
+            GraphError::DimensionMismatch {
+                expected: 2,
+                actual: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn graph_construction_enforces_node_and_edge_limits() {
+        let error = AnnotatedGraph::from_edges(MAX_NODES + 1, &[]).expect_err("too many nodes");
+        assert!(matches!(error, GraphError::TooManyNodes { .. }));
+        let error = Csr::from_edges(MAX_NODES + 1, &[]).expect_err("too many csr nodes");
+        assert!(matches!(error, GraphError::TooManyNodes { .. }));
+
+        // Five source rows over MAX_NODES targets exceed MAX_EDGES.
+        let mut plain = Vec::new();
+        for from in 0..5u32 {
+            for to in 0..MAX_NODES as u32 {
+                plain.push((from, to));
+            }
+        }
+        assert!(plain.len() > MAX_EDGES);
+        let error = Csr::from_edges(MAX_NODES, &plain).expect_err("too many edges");
+        assert!(matches!(error, GraphError::TooManyEdges { .. }));
+
+        let labelled = plain
+            .iter()
+            .map(|&(from, to)| (from, to, TruthValue::True))
+            .collect::<Vec<_>>();
+        let error =
+            AnnotatedGraph::from_edges(MAX_NODES, &labelled).expect_err("too many annotated edges");
+        assert!(matches!(error, GraphError::TooManyEdges { .. }));
+    }
+
+    #[test]
+    fn encoded_headers_reject_oversized_counts() {
+        let mut graph_bytes = Vec::new();
+        graph_bytes.extend_from_slice(TRGR_MAGIC);
+        graph_bytes.push(TRGR_VERSION);
+        graph_bytes.extend_from_slice(&((MAX_NODES + 1) as u32).to_le_bytes());
+        graph_bytes.extend_from_slice(&0u32.to_le_bytes());
+        let error = AnnotatedGraph::decode(&graph_bytes).expect_err("too many nodes");
+        assert!(matches!(error, GraphError::TooManyNodes { .. }));
+
+        let mut point_bytes = Vec::new();
+        point_bytes.extend_from_slice(TRPN_MAGIC);
+        point_bytes.push(TRPN_VERSION);
+        point_bytes.extend_from_slice(&((MAX_POINTS + 1) as u32).to_le_bytes());
+        let error = decode_points(&point_bytes).expect_err("too many points");
+        assert!(matches!(error, GraphError::TooManyPoints { .. }));
+    }
+
+    #[test]
+    fn trpn_roundtrips_empty_sets_and_coordinate_extremes() {
+        assert_eq!(
+            decode_points(&encode_points(&[])).expect("empty set"),
+            Vec::new()
+        );
+        let points = vec![
+            Point {
+                id: 0,
+                vector: vec![i64::MIN, i64::MAX],
+                label: TruthValue::False,
+            },
+            Point {
+                id: u32::MAX,
+                vector: Vec::new(),
+                label: TruthValue::True,
+            },
+        ];
+        assert_eq!(
+            decode_points(&encode_points(&points)).expect("extremes"),
+            points
+        );
+    }
+
+    #[test]
+    fn reach_handles_huge_hop_bounds_and_out_of_range_nodes() {
+        let graph = build(&[(0, 1, TruthValue::True), (1, 2, TruthValue::True)]);
+        let reach = graph.reach(0, 2, usize::MAX).expect("huge hop bound");
+        assert_eq!(reach.answer, RepairAnswer::Certain);
+        assert_eq!(reach.hops, Some(2));
+
+        let error = graph.reach(9, 0, 1).expect_err("start out of range");
+        assert!(matches!(error, GraphError::NodeOutOfRange { .. }));
+        let error = graph.reach(0, 9, 1).expect_err("target out of range");
+        assert!(matches!(error, GraphError::NodeOutOfRange { .. }));
+        let error = graph
+            .reachable_within(9, 1)
+            .expect_err("start out of range");
+        assert!(matches!(error, GraphError::NodeOutOfRange { .. }));
+    }
 }
