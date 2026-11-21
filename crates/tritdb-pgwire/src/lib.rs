@@ -34,6 +34,16 @@ const PROTOCOL_V3: i32 = 196_608;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// Default milliseconds a connection waits for the shared engine lock.
 pub const DEFAULT_ENGINE_LOCK_TIMEOUT_MS: u64 = 30_000;
+/// Upper bound on the SQL text produced by `Bind` parameter substitution.
+const MAX_SUBSTITUTED_SQL: usize = 16 * 1024 * 1024;
+/// Upper bound on prepared statements kept per connection.
+const MAX_PREPARED_STATEMENTS: usize = 1024;
+/// Upper bound on SQL bytes held by prepared statements per connection.
+const MAX_PREPARED_BYTES: usize = 16 * 1024 * 1024;
+/// Upper bound on bound portals kept per connection.
+const MAX_PORTALS: usize = 1024;
+/// Upper bound on rows one `COPY` may insert.
+const MAX_COPY_ROWS: usize = 1 << 20;
 /// SCRAM-SHA-256 iteration count used for new challenges.
 const SCRAM_ITERATIONS: u32 = 4_096;
 const SSL_REQUEST: i32 = 80_877_103;
@@ -2232,6 +2242,12 @@ fn copy_in_csv(
                 }
                 batch.push(')');
                 batched += 1;
+                if inserted + batched > MAX_COPY_ROWS {
+                    return copy_failed(
+                        stream,
+                        &format!("COPY inserts more than {MAX_COPY_ROWS} rows"),
+                    );
+                }
                 if batched >= 1024 {
                     batch.push(';');
                     if let Err(error) = engine.execute_script(&batch) {
@@ -2527,6 +2543,12 @@ fn copy_in_binary(
             }
             batch.push(')');
             batched += 1;
+            if inserted + batched > MAX_COPY_ROWS {
+                return copy_failed(
+                    stream,
+                    &format!("COPY inserts more than {MAX_COPY_ROWS} rows"),
+                );
+            }
             if batched >= 1024 {
                 batch.push(';');
                 if let Err(error) = engine.execute_script(&batch) {
@@ -2672,6 +2694,12 @@ fn copy_in(
                 }
                 batch.push(')');
                 batched += 1;
+                if inserted + batched > MAX_COPY_ROWS {
+                    return copy_failed(
+                        stream,
+                        &format!("COPY inserts more than {MAX_COPY_ROWS} rows"),
+                    );
+                }
                 if batched >= 1024 {
                     batch.push(';');
                     if let Err(error) = engine.execute_script(&batch) {
@@ -2922,6 +2950,15 @@ fn parse_prepared(
         param_types.push(read_i32(payload, cursor)?);
         cursor += 4;
     }
+    let held: usize = prepared.values().map(|item| item.sql.len()).sum();
+    if !prepared.contains_key(&name)
+        && (prepared.len() >= MAX_PREPARED_STATEMENTS
+            || held.saturating_add(sql.len()) > MAX_PREPARED_BYTES)
+    {
+        return Err(PgError::Protocol(format!(
+            "too many prepared statements (limit {MAX_PREPARED_STATEMENTS})"
+        )));
+    }
     prepared.insert(name, Prepared { sql, param_types });
     write_message(stream, b'1', &[])
 }
@@ -2983,6 +3020,11 @@ fn bind_portal(
     for _ in 0..result_format_count.max(0) {
         result_formats.push(read_i16(payload, cursor)?);
         cursor += 2;
+    }
+    if !portals.contains_key(&portal) && portals.len() >= MAX_PORTALS {
+        return Err(PgError::Protocol(format!(
+            "too many portals (limit {MAX_PORTALS})"
+        )));
     }
     portals.insert(
         portal,
@@ -3394,7 +3436,13 @@ fn substitute_params(
                 )));
             }
             let oid = param_types.get(index - 1).copied().unwrap_or(0);
-            output.push_str(&param_literal(&params[index - 1], oid)?);
+            let literal = param_literal(&params[index - 1], oid)?;
+            if output.len().saturating_add(literal.len()) > MAX_SUBSTITUTED_SQL {
+                return Err(PgError::Protocol(format!(
+                    "substituted SQL exceeds {MAX_SUBSTITUTED_SQL} bytes"
+                )));
+            }
+            output.push_str(&literal);
             continue;
         }
         output.push(character);
@@ -3610,6 +3658,63 @@ fn command_tag(message: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    struct Sink(Vec<u8>);
+
+    impl Read for Sink {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn substitution_amplification_is_capped() {
+        // 20k copies of $1 times a 1 KB literal used to build a 20 MB string
+        // from a 40 KB statement; the cap rejects it mid-substitution.
+        let sql = "$1".repeat(20_000);
+        let params = vec![Some("x".repeat(1000))];
+        let error =
+            substitute_params(&sql, &[25], &params).expect_err("amplified SQL must be rejected");
+        assert!(error.to_string().contains("substituted SQL"), "{error}");
+    }
+
+    #[test]
+    fn prepared_statement_count_is_capped() {
+        let mut stream = Sink(Vec::new());
+        let mut prepared = BTreeMap::new();
+        for index in 0..MAX_PREPARED_STATEMENTS {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(format!("s{index}").as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(b"SELECT 1");
+            payload.push(0);
+            payload.extend_from_slice(&0i16.to_be_bytes());
+            parse_prepared(&mut stream, &mut prepared, &payload).expect("parse");
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"overflow");
+        payload.push(0);
+        payload.extend_from_slice(b"SELECT 1");
+        payload.push(0);
+        payload.extend_from_slice(&0i16.to_be_bytes());
+        let error = parse_prepared(&mut stream, &mut prepared, &payload)
+            .expect_err("the statement cap must reject this Parse");
+        assert!(
+            error.to_string().contains("too many prepared statements"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn engine_lock_wait_times_out() {

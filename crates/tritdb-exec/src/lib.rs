@@ -522,6 +522,13 @@ pub enum ExecError {
         /// Actual type.
         actual: &'static str,
     },
+    /// `LIKE` pattern exceeds the safety limit.
+    LikePatternTooLong {
+        /// Maximum accepted pattern length in characters.
+        max: usize,
+    },
+    /// `LIKE` matching exceeded its comparison budget.
+    LikeTooComplex,
 }
 
 impl fmt::Display for ExecError {
@@ -543,6 +550,12 @@ impl fmt::Display for ExecError {
             ExecError::IntegerOverflow => write!(f, "integer overflow"),
             ExecError::NonBooleanPredicate { actual } => {
                 write!(f, "predicate must be BOOLEAN, got {actual}")
+            }
+            ExecError::LikePatternTooLong { max } => {
+                write!(f, "LIKE pattern is longer than {max} characters")
+            }
+            ExecError::LikeTooComplex => {
+                write!(f, "LIKE comparison exceeded its budget")
             }
         }
     }
@@ -717,28 +730,58 @@ fn comparison_truth(op: CmpOp, ordering: Option<Ordering>) -> TruthValue {
     }
 }
 
+/// Maximum `LIKE` pattern length in characters.
+const MAX_LIKE_PATTERN: usize = 64 * 1024;
+/// Maximum character comparisons one `LIKE` evaluation may perform, so a
+/// hostile pattern cannot burn CPU indefinitely.
+const MAX_LIKE_STEPS: usize = 10_000_000;
+
 /// SQLite-style `LIKE`: `%` matches any sequence, `_` matches one character,
 /// and ASCII letters compare case-insensitively.
-fn like_matches(text: &str, pattern: &str) -> bool {
-    let text: Vec<char> = text.chars().collect();
+///
+/// Greedy wildcard matching that backtracks on the last `%`: constant extra
+/// space instead of the `text x pattern` boolean matrix this used to allocate
+/// (which let one query reserve terabytes).
+fn like_matches(text: &str, pattern: &str) -> Result<bool, ExecError> {
     let pattern: Vec<char> = pattern.chars().collect();
-    let mut table = vec![vec![false; pattern.len() + 1]; text.len() + 1];
-    table[0][0] = true;
-    for column in 1..=pattern.len() {
-        table[0][column] = pattern[column - 1] == '%' && table[0][column - 1];
+    if pattern.len() > MAX_LIKE_PATTERN {
+        return Err(ExecError::LikePatternTooLong {
+            max: MAX_LIKE_PATTERN,
+        });
     }
-    for row in 1..=text.len() {
-        for column in 1..=pattern.len() {
-            table[row][column] = match pattern[column - 1] {
-                '%' => table[row][column - 1] || table[row - 1][column],
-                '_' => table[row - 1][column - 1],
-                expected => {
-                    table[row - 1][column - 1] && expected.eq_ignore_ascii_case(&text[row - 1])
-                }
-            };
+    let text: Vec<char> = text.chars().collect();
+    let mut text_at = 0usize;
+    let mut pattern_at = 0usize;
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    let mut steps = 0usize;
+    while text_at < text.len() {
+        steps += 1;
+        if steps > MAX_LIKE_STEPS {
+            return Err(ExecError::LikeTooComplex);
+        }
+        if pattern_at < pattern.len()
+            && (pattern[pattern_at] == '_'
+                || pattern[pattern_at].eq_ignore_ascii_case(&text[text_at]))
+        {
+            text_at += 1;
+            pattern_at += 1;
+        } else if pattern_at < pattern.len() && pattern[pattern_at] == '%' {
+            star = Some(pattern_at + 1);
+            mark = text_at;
+            pattern_at += 1;
+        } else if let Some(after_star) = star {
+            mark += 1;
+            text_at = mark;
+            pattern_at = after_star;
+        } else {
+            return Ok(false);
         }
     }
-    table[text.len()][pattern.len()]
+    while pattern_at < pattern.len() && pattern[pattern_at] == '%' {
+        pattern_at += 1;
+    }
+    Ok(pattern_at == pattern.len())
 }
 
 fn eval_arith(op: ArithOp, left: i64, right: i64) -> Result<Value, ExecError> {
@@ -873,7 +916,7 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value, ExecEr
             match (&value, &pattern) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(text), Value::Text(pattern)) => {
-                    let matched = like_matches(text, pattern);
+                    let matched = like_matches(text, pattern)?;
                     Ok(Value::Bool(if *negated { !matched } else { matched }))
                 }
                 (value, _) => Err(ExecError::TypeMismatch {
@@ -1223,15 +1266,41 @@ mod tests {
 
     #[test]
     fn like_matches_wildcards_and_ascii_case() {
-        assert!(like_matches("abc", "a%"));
-        assert!(like_matches("abc", "A%"));
-        assert!(like_matches("abc", "a_c"));
-        assert!(!like_matches("abc", "a_"));
-        assert!(like_matches("", "%"));
-        assert!(like_matches("abc", "%b%"));
-        assert!(!like_matches("abc", "abd"));
-        assert!(like_matches("中", "_"));
-        assert!(!like_matches("中文", "_"));
+        assert!(like_matches("abc", "a%").expect("like"));
+        assert!(like_matches("abc", "A%").expect("like"));
+        assert!(like_matches("abc", "a_c").expect("like"));
+        assert!(!like_matches("abc", "a_").expect("like"));
+        assert!(like_matches("", "%").expect("like"));
+        assert!(like_matches("abc", "%b%").expect("like"));
+        assert!(!like_matches("abc", "abd").expect("like"));
+        assert!(like_matches("中", "_").expect("like"));
+        assert!(!like_matches("中文", "_").expect("like"));
+    }
+
+    #[test]
+    fn like_rejects_oversized_patterns_and_runaway_backtracking() {
+        let oversized = "%".repeat(MAX_LIKE_PATTERN + 1);
+        assert!(matches!(
+            like_matches("abc", &oversized),
+            Err(ExecError::LikePatternTooLong { .. })
+        ));
+
+        // `%a...ab` against a long run of `a` forces quadratic backtracking;
+        // the step budget turns that into an error instead of a hang.
+        let text = "a".repeat(8000);
+        let mut pattern = String::from("%");
+        pattern.push_str(&"a".repeat(3000));
+        pattern.push('b');
+        assert!(matches!(
+            like_matches(&text, &pattern),
+            Err(ExecError::LikeTooComplex)
+        ));
+
+        // The greedy matcher still agrees with the old table on real patterns.
+        assert!(like_matches("aab", "%a%a%b").expect("like"));
+        assert!(!like_matches("aab", "%a%a%c").expect("like"));
+        assert!(like_matches("", "%").expect("like"));
+        assert!(!like_matches("abc", "").expect("like"));
 
         let schema = Schema::new(vec![Column::new("a", DataType::Text)]);
         let row = vec![Value::Null];

@@ -64,6 +64,9 @@ pub const RECORD_VERSION: u8 = 0;
 pub const RECORD_HEADER_SIZE: usize = 32;
 /// Maximum record payload in bytes.
 pub const MAX_RECORD_PAYLOAD: usize = 64 * 1024 * 1024;
+/// Upper bound on the time index file size; a hostile file must not be
+/// slurped into memory.
+pub const MAX_TIME_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Logical record type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,6 +378,19 @@ impl TimeIndex {
             });
         }
 
+        if len > MAX_TIME_INDEX_BYTES {
+            // A corrupt or hostile index is rebuilt from the WAL instead of
+            // being read into memory.
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            write_time_index_header(&mut file)?;
+            file.sync_all()?;
+            return Ok(Self {
+                file,
+                last_lsn: 0,
+                last_ts_ms: 0,
+            });
+        }
         file.seek(SeekFrom::Start(TIME_INDEX_HEADER_SIZE as u64))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -466,6 +482,9 @@ pub fn lookup_time(wal_path: &Path, ts_ms: u64) -> Result<Option<u64>, WalError>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    if file.metadata()?.len() > MAX_TIME_INDEX_BYTES {
+        return Ok(None);
+    }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     if bytes.len() < TIME_INDEX_HEADER_SIZE

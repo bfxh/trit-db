@@ -63,6 +63,9 @@ pub enum JoinStrategy {
 const MAX_RECURSIVE_ITERATIONS: usize = 1000;
 /// Hard cap on the materialized size of one recursive CTE.
 const MAX_RECURSIVE_ROWS: usize = 100_000;
+/// Hard cap on rows materialized by one join, so a cartesian product cannot
+/// exhaust memory.
+const MAX_JOIN_ROWS: usize = 1 << 20;
 
 fn tuple_in_expr(exprs: Vec<Expr>, rows: Vec<Vec<Value>>, negated: bool) -> Expr {
     if rows.is_empty() {
@@ -4347,6 +4350,17 @@ fn hash_key(row: &Row, keys: &[usize]) -> Option<Vec<Value>> {
     Some(key)
 }
 
+/// Appends one join row, refusing to grow past [`MAX_JOIN_ROWS`].
+fn push_join_row(rows: &mut Vec<Row>, row: Row) -> Result<(), SqlError> {
+    if rows.len() >= MAX_JOIN_ROWS {
+        return Err(SqlError::Unsupported(format!(
+            "join produces more than {MAX_JOIN_ROWS} rows"
+        )));
+    }
+    rows.push(row);
+    Ok(())
+}
+
 fn hash_join_rows(
     left: &Table,
     right: &Table,
@@ -4380,12 +4394,12 @@ fn hash_join_rows(
                 if passes_filter(predicate, pair_schema, &pair)? {
                     matched = true;
                     right_matched[index] = true;
-                    rows.push(project_join_row(left_row, right_row, sources));
+                    push_join_row(&mut rows, project_join_row(left_row, right_row, sources))?;
                 }
             }
         }
         if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
-            rows.push(project_join_row(left_row, &null_right, sources));
+            push_join_row(&mut rows, project_join_row(left_row, &null_right, sources))?;
         }
     }
     if matches!(kind, JoinKind::Right | JoinKind::Full) {
@@ -4393,7 +4407,7 @@ fn hash_join_rows(
             if right_matched[index] {
                 continue;
             }
-            rows.push(project_join_row(&null_left, right_row, sources));
+            push_join_row(&mut rows, project_join_row(&null_left, right_row, sources))?;
         }
     }
     Ok(rows)
@@ -4419,11 +4433,11 @@ fn nested_loop_join_rows(
             if passes_filter(predicate, pair_schema, &pair)? {
                 matched = true;
                 right_matched[index] = true;
-                rows.push(project_join_row(left_row, right_row, sources));
+                push_join_row(&mut rows, project_join_row(left_row, right_row, sources))?;
             }
         }
         if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
-            rows.push(project_join_row(left_row, &null_right, sources));
+            push_join_row(&mut rows, project_join_row(left_row, &null_right, sources))?;
         }
     }
     if matches!(kind, JoinKind::Right | JoinKind::Full) {
@@ -4431,7 +4445,7 @@ fn nested_loop_join_rows(
             if right_matched[index] {
                 continue;
             }
-            rows.push(project_join_row(&null_left, right_row, sources));
+            push_join_row(&mut rows, project_join_row(&null_left, right_row, sources))?;
         }
     }
     Ok(rows)
@@ -5835,6 +5849,34 @@ fn eval_aggregate(
 mod tests {
     use super::*;
     use crate::parser::parse_script;
+
+    #[test]
+    fn cross_join_stops_at_the_row_cap() {
+        let dir = tritdb_testkit::TempDir::new("engine-join-cap");
+        let db = dir.join("join.db");
+        let mut engine = SqlEngine::open(&db).expect("open");
+        engine
+            .execute_script("CREATE TABLE a (x INT NOT NULL); CREATE TABLE b (y INT NOT NULL);")
+            .expect("create");
+        let values: String = (0..2000)
+            .map(|value| format!("({value}),"))
+            .collect::<String>();
+        let values = values.trim_end_matches(',');
+        engine
+            .execute_script(&format!(
+                "INSERT INTO a VALUES {values}; INSERT INTO b VALUES {values};"
+            ))
+            .expect("seed");
+
+        let error = match engine.execute_script("SELECT * FROM a, b;") {
+            Ok(_) => panic!("a 2000 x 2000 cross join must hit the row cap"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SqlError::Unsupported(ref message) if message.contains("join produces")),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn folds_projection_constants_and_preserves_column_items() {

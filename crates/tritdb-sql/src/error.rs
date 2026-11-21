@@ -153,6 +153,7 @@ impl SqlError {
                 ExecError::DivisionByZero => "22012", // division_by_zero
                 ExecError::IntegerOverflow => "22003", // numeric_value_out_of_range
                 ExecError::RowShape { .. } | ExecError::ColumnIndex { .. } => "XX000",
+                ExecError::LikePatternTooLong { .. } | ExecError::LikeTooComplex => "22023", // invalid_parameter_value
             },
             SqlError::Txn(_) => "40000", // transaction_rollback
             SqlError::Io(_) => "58030",  // io_error
@@ -252,6 +253,10 @@ impl SqlError {
             SqlError::Exec(ExecError::RowShape { .. }) | SqlError::Exec(ExecError::ColumnIndex { .. }) => {
                 Some("internal row/schema shape mismatch; retry once and report the query".to_string())
             }
+            SqlError::Exec(ExecError::LikePatternTooLong { .. })
+            | SqlError::Exec(ExecError::LikeTooComplex) => Some(
+                "shorten the LIKE pattern or split the match into simpler patterns".to_string(),
+            ),
             SqlError::Txn(_) => Some("retry the statement or ROLLBACK the transaction".to_string()),
             SqlError::Io(_) => None,
         }

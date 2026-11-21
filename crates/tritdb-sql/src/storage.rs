@@ -95,6 +95,14 @@ fn encode_table_versioned(table: &Table, version: u8) -> Result<Vec<u8>, SqlErro
             table.name
         )));
     }
+    if table.rows.len() as u64 > MAX_ROWS {
+        // Writing more rows than `decode_table` accepts would leave a table
+        // that can never be read back.
+        return Err(SqlError::Unsupported(format!(
+            "table {} has more than {MAX_ROWS} rows",
+            table.name
+        )));
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&TABLE_MAGIC);
     out.push(version);
@@ -752,6 +760,24 @@ mod tests {
     use crate::stats::analyze_table;
 
     use super::*;
+
+    #[test]
+    fn encode_rejects_more_rows_than_decode_accepts() {
+        // Writing past MAX_ROWS used to succeed and produce a table value that
+        // decode_table then rejected, making the table unreadable.
+        let table = Table {
+            name: "too_many".to_string(),
+            schema: Schema::new(vec![Column::new("x", DataType::Int)]),
+            rows: (0..MAX_ROWS as usize + 1)
+                .map(|index| vec![Value::Int(index as i64)])
+                .collect(),
+        };
+        let error = encode_table(&table).expect_err("the row cap must reject this table");
+        assert!(
+            matches!(error, SqlError::Unsupported(ref message) if message.contains("rows")),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn table_v6_round_trips_k3_packed_segments() {
