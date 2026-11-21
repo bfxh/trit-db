@@ -6,14 +6,16 @@
 //! (`Parse`/`Bind`/`Execute`) is not implemented; clients must use the simple
 //! query protocol (most `psql`/driver defaults do).
 //!
-//! Connections are handled one at a time; each connection opens its own
-//! [`SqlEngine`] over the same database path.
+//! Connections are handled on their own threads and share one [`SqlEngine`]
+//! behind a mutex, so statements from different clients serialize on the
+//! engine.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tritdb_exec::Value;
 use tritdb_sql::{parse_script, QueryResult, SqlEngine, Statement};
@@ -55,6 +57,9 @@ impl From<std::io::Error> for PgError {
 /// Connections are accepted and handled serially; each one opens its own
 /// [`SqlEngine`] on `db`.
 pub fn serve(db: PathBuf, listener: TcpListener) -> Result<(), PgError> {
+    let engine = Arc::new(Mutex::new(
+        SqlEngine::open(&db).map_err(|error| PgError::Sql(error.to_string()))?,
+    ));
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -63,14 +68,23 @@ pub fn serve(db: PathBuf, listener: TcpListener) -> Result<(), PgError> {
                 continue;
             }
         };
-        if let Err(error) = handle_connection(&db, stream) {
-            eprintln!("pgwire: {error}");
-        }
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            if let Err(error) = handle_connection(engine, stream) {
+                eprintln!("pgwire: {error}");
+            }
+        });
     }
     Ok(())
 }
 
-fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
+fn lock_engine(engine: &Arc<Mutex<SqlEngine>>) -> std::sync::MutexGuard<'_, SqlEngine> {
+    engine
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn handle_connection(engine: Arc<Mutex<SqlEngine>>, mut stream: TcpStream) -> Result<(), PgError> {
     if !read_startup(&mut stream)? {
         return Ok(());
     }
@@ -89,7 +103,6 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
     write_message(&mut stream, b'K', &key)?;
     write_message(&mut stream, b'Z', b"I")?;
 
-    let mut engine = SqlEngine::open(db).map_err(|error| PgError::Sql(error.to_string()))?;
     let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
     let mut portals: BTreeMap<String, Bound> = BTreeMap::new();
     let mut tx_status = TxStatus::Idle;
@@ -103,14 +116,21 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
                 let sql = String::from_utf8_lossy(&payload)
                     .trim_end_matches('\0')
                     .to_string();
-                handle_query(&mut stream, &mut engine, &sql, &mut tx_status)?;
+                let mut guard = lock_engine(&engine);
+                handle_query(&mut stream, &mut guard, &sql, &mut tx_status)?;
             }
             b'S' => write_message(&mut stream, b'Z', &[tx_status.byte()])?,
             b'X' => return Ok(()),
             b'P' => parse_prepared(&mut stream, &mut prepared, &payload)?,
             b'B' => bind_portal(&mut stream, &prepared, &mut portals, &payload)?,
-            b'D' => describe(&mut stream, &mut engine, &prepared, &portals, &payload)?,
-            b'E' => execute_portal(&mut stream, &mut engine, &portals, &payload, &mut tx_status)?,
+            b'D' => {
+                let mut guard = lock_engine(&engine);
+                describe(&mut stream, &mut guard, &prepared, &portals, &payload)?;
+            }
+            b'E' => {
+                let mut guard = lock_engine(&engine);
+                execute_portal(&mut stream, &mut guard, &portals, &payload, &mut tx_status)?;
+            }
             b'C' => close_portal(&mut stream, &mut prepared, &mut portals, &payload)?,
             b'H' => {}
             other => {

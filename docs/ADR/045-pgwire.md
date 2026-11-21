@@ -11,7 +11,7 @@
 ## 决策
 
 1. **新 crate `tritdb-pgwire`**（零外部依赖，`std::net`）：
-   - `serve(db: PathBuf, listener: TcpListener)`：串行 accept，每个连接打开自己的 `SqlEngine`。
+   - `serve(db: PathBuf, listener: TcpListener)`：打开一个共享 `SqlEngine`（`Arc<Mutex<...>>`），accept 后为每个连接 spawn 一个线程；语句在引擎锁上串行化。
    - `handle_connection`：startup → `AuthenticationOk` + 若干 `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 2. **协议子集**
    - StartupMessage v3（196608）；`SSLRequest`（80877103）回复 `N` 并要求重新 startup。
@@ -30,14 +30,14 @@
 
 - **零依赖**：wire protocol 的 simple query 子集足够小，用 `std::net` 直接实现。
 - **文本格式**：避免二进制类型映射；所有值都能用文本表示，客户端解析简单。
-- **串行连接**：`TxnStore` 有跨进程写锁，多连接并发写会冲突；先串行，后续再做连接池/只读副本。
+- **共享引擎锁**：多连接可以同时握手/等待，但执行语句时串行；避免多连接同时写 `TxnStore` 的锁冲突。
 
 ## 后果 / 限制
 
 - **无 TLS**：`SSLRequest` 直接拒绝；只适合本地/受信网络。
 - **扩展查询只覆盖最小子集**：`Describe` 对 SELECT 返回列名/类型（全部 TEXT），非 SELECT 返回 `NoData`；`Execute` 忽略 row limit，参数只按文本格式处理。
 - **无认证**：任何能连上端口的客户端都可读写。
-- **串行 + 每连接独立引擎**：同一时刻只有一个连接在处理；连接数多时排队。
+- **执行串行化**：连接并发，但语句在共享引擎锁上排队；不是多写者并发。
 - 所有列都是 TEXT，客户端看到的类型信息不精确。
 - **事务状态只是协议层**：`BEGIN`/`COMMIT`/`ROLLBACK` 不改变引擎的单语句提交模型，不会把多条语句合成一个原子事务；`E` 状态只是拒绝后续语句。
 
