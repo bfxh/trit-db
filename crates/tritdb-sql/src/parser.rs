@@ -2,7 +2,7 @@ use tritdb_exec::{BinaryOp, DataType, TruthValue, Value};
 
 use crate::ast::{
     AggregateKind, Assignment, ColumnDef, Cte, Expr, Join, JoinCondition, JoinKind, OrderBy,
-    Quantifier, Query, Select, SelectItem, Statement, With,
+    Quantifier, Query, Select, SelectItem, Statement, WindowFunction, With,
 };
 use crate::error::SqlError;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -1101,6 +1101,14 @@ impl Parser {
                         else_expr: Some(Box::new(Expr::Literal(Value::Text("FALSE".to_string())))),
                     });
                 }
+                if let Some(function) = window_function(&name) {
+                    if self
+                        .peek()
+                        .is_some_and(|token| token.kind == TokenKind::Symbol(Symbol::LParen))
+                    {
+                        return self.parse_window(function);
+                    }
+                }
                 if self.eat_symbol(Symbol::Dot) {
                     let column = self.parse_ident()?;
                     Ok(Expr::Column {
@@ -1198,6 +1206,48 @@ impl Parser {
         })
     }
 
+    fn parse_window(&mut self, function: WindowFunction) -> Result<Expr, SqlError> {
+        self.expect_symbol(Symbol::LParen)?;
+        self.expect_symbol(Symbol::RParen)?;
+        self.expect_word("over")?;
+        self.expect_symbol(Symbol::LParen)?;
+        let mut partition_by = Vec::new();
+        if self.eat_word("partition") {
+            self.expect_keyword(Keyword::By)?;
+            loop {
+                partition_by.push(self.parse_expr()?);
+                if self.eat_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let mut order_by = Vec::new();
+        if self.eat_keyword(Keyword::Order) {
+            self.expect_keyword(Keyword::By)?;
+            loop {
+                let expr = self.parse_expr()?;
+                let ascending = if self.eat_keyword(Keyword::Desc) {
+                    false
+                } else {
+                    self.eat_keyword(Keyword::Asc);
+                    true
+                };
+                order_by.push(OrderBy { expr, ascending });
+                if self.eat_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_symbol(Symbol::RParen)?;
+        Ok(Expr::Window {
+            function,
+            partition_by,
+            order_by,
+        })
+    }
+
     fn parse_aggregate(&mut self, kind: AggregateKind) -> Result<Expr, SqlError> {
         self.expect_symbol(Symbol::LParen)?;
         let input = if kind == AggregateKind::Count && self.eat_symbol(Symbol::Star) {
@@ -1207,6 +1257,18 @@ impl Parser {
         };
         self.expect_symbol(Symbol::RParen)?;
         Ok(Expr::Aggregate { kind, input })
+    }
+}
+
+fn window_function(name: &str) -> Option<WindowFunction> {
+    if name.eq_ignore_ascii_case("row_number") {
+        Some(WindowFunction::RowNumber)
+    } else if name.eq_ignore_ascii_case("rank") {
+        Some(WindowFunction::Rank)
+    } else if name.eq_ignore_ascii_case("dense_rank") {
+        Some(WindowFunction::DenseRank)
+    } else {
+        None
     }
 }
 

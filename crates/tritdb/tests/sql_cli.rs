@@ -1201,3 +1201,75 @@ fn tuple_in_and_correlated_having() {
     );
     assert!(stderr(&output).contains("only scalar correlated subqueries"));
 }
+
+#[test]
+fn window_functions_row_number_rank_dense_rank() {
+    let dir = TempDir::new("sql-window");
+    let db = dir.join("win.db");
+    let db = db.to_str().expect("path");
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "CREATE TABLE t (id INT NOT NULL, dept TEXT NOT NULL); \
+         INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b'),(5,'b'); \
+         CREATE TABLE s (id INT NOT NULL, score INT NOT NULL); \
+         INSERT INTO s VALUES (1,10),(2,10),(3,20);",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY id) AS rn \
+         FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\t1", "2\t2", "3\t1", "4\t2", "5\t3"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY id DESC) AS rn \
+         FROM t ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    for expected in ["1\t2", "2\t1", "3\t3", "4\t2", "5\t1"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT id, RANK() OVER (ORDER BY score) AS r, \
+         DENSE_RANK() OVER (ORDER BY score) AS d FROM s ORDER BY id;",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1\t1\t1"), "out: {text}");
+    assert!(text.contains("2\t1\t1"), "out: {text}");
+    assert!(text.contains("3\t3\t2"), "out: {text}");
+
+    // Window functions plus GROUP BY are outside the supported subset.
+    let output = run([
+        "sql",
+        "--db",
+        db,
+        "--sql",
+        "SELECT dept, COUNT(*) AS n, ROW_NUMBER() OVER (ORDER BY dept) AS rn \
+         FROM t GROUP BY dept;",
+    ]);
+    assert!(!output.status.success(), "window + GROUP BY must fail");
+    assert!(stderr(&output).contains("window functions with GROUP BY"));
+}
