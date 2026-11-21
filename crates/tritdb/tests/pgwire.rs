@@ -196,6 +196,13 @@ fn write_bind(stream: &mut TcpStream, portal: &str, statement: &str, params: &[O
     write_framed(stream, b'B', &payload);
 }
 
+fn write_describe_statement(stream: &mut TcpStream, statement: &str) {
+    let mut payload = vec![b'S'];
+    payload.extend_from_slice(statement.as_bytes());
+    payload.push(0);
+    write_framed(stream, b'D', &payload);
+}
+
 fn write_describe_portal(stream: &mut TcpStream, portal: &str) {
     let mut payload = vec![b'P'];
     payload.extend_from_slice(portal.as_bytes());
@@ -243,6 +250,7 @@ fn extended_query_roundtrip() {
         &[20],
     );
     write_bind(&mut stream, "", "", &[Some(b"1")]);
+    write_describe_statement(&mut stream, "");
     write_describe_portal(&mut stream, "");
     write_execute(&mut stream, "");
     write_sync(&mut stream);
@@ -251,7 +259,19 @@ fn extended_query_roundtrip() {
     let kinds: Vec<u8> = messages.iter().map(|(kind, _)| *kind).collect();
     assert!(kinds.contains(&b'1'), "missing ParseComplete: {kinds:?}");
     assert!(kinds.contains(&b'2'), "missing BindComplete: {kinds:?}");
-    assert!(kinds.contains(&b'n'), "missing NoData: {kinds:?}");
+    assert!(
+        kinds.contains(&b't'),
+        "missing ParameterDescription: {kinds:?}"
+    );
+    let descriptions: Vec<Vec<String>> = messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'T')
+        .map(|(_, payload)| parse_fields(payload))
+        .collect();
+    assert!(
+        descriptions.iter().any(|fields| fields == &["id", "name"]),
+        "missing RowDescription for id/name: {descriptions:?}"
+    );
 
     let rows: Vec<Vec<Option<String>>> = messages
         .iter()
@@ -344,6 +364,43 @@ fn transaction_status_roundtrip() {
     let messages = read_until_ready(&mut stream);
     assert_eq!(ready_status(&messages), b'I');
     assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+
+    stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
+}
+
+#[test]
+fn describe_non_select_returns_no_data() {
+    let dir = TempDir::new("pgwire-describe");
+    let db = dir.join("pg.db");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    startup(&mut stream);
+    let _ = read_until_ready(&mut stream);
+
+    query(&mut stream, "CREATE TABLE t (id INT NOT NULL);");
+    let _ = read_until_ready(&mut stream);
+
+    write_parse(&mut stream, "", "INSERT INTO t VALUES ($1);", &[20]);
+    write_describe_statement(&mut stream, "");
+    write_sync(&mut stream);
+
+    let messages = read_until_ready(&mut stream);
+    let kinds: Vec<u8> = messages.iter().map(|(kind, _)| *kind).collect();
+    assert!(
+        kinds.contains(&b't'),
+        "missing ParameterDescription: {kinds:?}"
+    );
+    assert!(kinds.contains(&b'n'), "missing NoData: {kinds:?}");
+    assert!(
+        !kinds.contains(&b'T'),
+        "INSERT must not have RowDescription: {kinds:?}"
+    );
 
     stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
 }
