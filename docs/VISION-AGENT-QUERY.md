@@ -173,6 +173,7 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
   `H`（hint）字段。模型可以按码分支、按 hint 改查询，不必解析散文。
   列/表名拼错时还会用 Levenshtein 给出 `did you mean `status`?` 候选
   （`UnknownName { kind, name, candidates }`），模型可以直接改拼写。
+  端到端闭环（6 个典型错误按 hint 一次修正成功）见 `docs/results/M9-AGENT-RETRY.md`。
   详见 `docs/results/M9-STRUCTURED-ERRORS.md`。
 
 - `TernaryVec::quantize(weights, alpha)` / `dequantize(alpha)`：BitNet 风格三值量化，

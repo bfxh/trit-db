@@ -105,3 +105,4 @@ Levenshtein 距离找最近的已知名字（预算随名字长度增长、最�
 - CLI `--error-format text|json`：json 模式在 stderr 输出
   `{"sqlstate":"42P01","message":"...","hint":"..."|null}`；未知格式在运行前直接报错；
 - CLI 与 pgwire 现在共享同一套码与 hint（`docs/ERRORS.md` 的三种消费方式）。
+- 端到端闭环验证见 `docs/results/M9-AGENT-RETRY.md`：6 个典型错误首轮失败、按 hint 一次修正成功。
