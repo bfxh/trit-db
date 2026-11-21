@@ -40,6 +40,8 @@ pub enum WindowFunction {
     Rank,
     /// `DENSE_RANK()`.
     DenseRank,
+    /// `SUM/AVG/COUNT/MIN/MAX(...)` aggregate window.
+    Aggregate(AggregateKind),
 }
 
 impl WindowFunction {
@@ -49,6 +51,7 @@ impl WindowFunction {
             WindowFunction::RowNumber => "ROW_NUMBER",
             WindowFunction::Rank => "RANK",
             WindowFunction::DenseRank => "DENSE_RANK",
+            WindowFunction::Aggregate(kind) => kind.name(),
         }
     }
 }
@@ -182,6 +185,8 @@ pub enum Expr {
     Window {
         /// Function.
         function: WindowFunction,
+        /// Aggregate argument; `None` for rank functions and `COUNT(*)`.
+        input: Option<Box<Expr>>,
         /// `PARTITION BY` expressions.
         partition_by: Vec<Expr>,
         /// `ORDER BY` keys inside `OVER (...)`.

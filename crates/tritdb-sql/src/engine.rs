@@ -1494,6 +1494,7 @@ impl SqlEngine {
             };
             let Expr::Window {
                 function,
+                input,
                 partition_by,
                 order_by,
             } = expr
@@ -1505,14 +1506,22 @@ impl SqlEngine {
                 }
                 continue;
             };
-            let values = self.window_values(&table, *function, partition_by, order_by)?;
+            let values =
+                self.window_values(&table, *function, input.as_deref(), partition_by, order_by)?;
             let name = format!("__win{index}");
+            let data_type = values
+                .iter()
+                .find_map(|value| match value {
+                    Value::Null => None,
+                    other => Some(value_data_type(other)),
+                })
+                .unwrap_or(DataType::Text);
             table
                 .schema
                 .columns
-                .push(Column::new(name.clone(), DataType::Int));
+                .push(Column::new(name.clone(), data_type));
             for (row, value) in table.rows.iter_mut().zip(values) {
-                row.push(Value::Int(value as i64));
+                row.push(value);
             }
             planned.items[index] = SelectItem::Expr {
                 expr: Expr::Column { table: None, name },
@@ -1533,9 +1542,10 @@ impl SqlEngine {
         &self,
         table: &Table,
         function: WindowFunction,
+        input: Option<&Expr>,
         partition_by: &[Expr],
         order_by: &[OrderBy],
-    ) -> Result<Vec<usize>, SqlError> {
+    ) -> Result<Vec<Value>, SqlError> {
         let mut groups: Vec<(Vec<Value>, Vec<(Vec<Value>, usize)>)> = Vec::new();
         for (index, row) in table.rows.iter().enumerate() {
             let mut partition = Vec::with_capacity(partition_by.len());
@@ -1555,7 +1565,10 @@ impl SqlEngine {
             }
         }
 
-        let mut values = vec![0usize; table.rows.len()];
+        let bound_input = input
+            .map(|expr| bind_expr(expr, &table.schema))
+            .transpose()?;
+        let mut values = vec![Value::Null; table.rows.len()];
         for (_, mut group) in groups {
             group.sort_by(|(left, _), (right, _)| compare_window_keys(left, right, order_by));
             let mut rank = 1usize;
@@ -1569,9 +1582,23 @@ impl SqlEngine {
                     }
                 }
                 values[*index] = match function {
-                    WindowFunction::RowNumber => position + 1,
-                    WindowFunction::Rank => rank,
-                    WindowFunction::DenseRank => dense,
+                    WindowFunction::RowNumber => Value::Int((position + 1) as i64),
+                    WindowFunction::Rank => Value::Int(rank as i64),
+                    WindowFunction::DenseRank => Value::Int(dense as i64),
+                    WindowFunction::Aggregate(kind) => {
+                        // Without ORDER BY the frame is the whole partition; with
+                        // ORDER BY it is a running frame up to the current row.
+                        let frame_end = if order_by.is_empty() {
+                            group.len()
+                        } else {
+                            position + 1
+                        };
+                        let rows: Vec<&Row> = group[..frame_end]
+                            .iter()
+                            .map(|(_, index)| &table.rows[*index])
+                            .collect();
+                        eval_aggregate(kind, bound_input.as_ref(), &table.schema, &rows)?
+                    }
                 };
             }
         }

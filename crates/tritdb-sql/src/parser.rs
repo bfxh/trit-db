@@ -1106,7 +1106,9 @@ impl Parser {
                         .peek()
                         .is_some_and(|token| token.kind == TokenKind::Symbol(Symbol::LParen))
                     {
-                        return self.parse_window(function);
+                        self.expect_symbol(Symbol::LParen)?;
+                        self.expect_symbol(Symbol::RParen)?;
+                        return self.parse_window(function, None);
                     }
                 }
                 if self.eat_symbol(Symbol::Dot) {
@@ -1206,9 +1208,11 @@ impl Parser {
         })
     }
 
-    fn parse_window(&mut self, function: WindowFunction) -> Result<Expr, SqlError> {
-        self.expect_symbol(Symbol::LParen)?;
-        self.expect_symbol(Symbol::RParen)?;
+    fn parse_window(
+        &mut self,
+        function: WindowFunction,
+        input: Option<Box<Expr>>,
+    ) -> Result<Expr, SqlError> {
         self.expect_word("over")?;
         self.expect_symbol(Symbol::LParen)?;
         let mut partition_by = Vec::new();
@@ -1243,6 +1247,7 @@ impl Parser {
         self.expect_symbol(Symbol::RParen)?;
         Ok(Expr::Window {
             function,
+            input,
             partition_by,
             order_by,
         })
@@ -1256,6 +1261,9 @@ impl Parser {
             Some(Box::new(self.parse_expr()?))
         };
         self.expect_symbol(Symbol::RParen)?;
+        if self.peek_word("over") {
+            return self.parse_window(WindowFunction::Aggregate(kind), input);
+        }
         Ok(Expr::Aggregate { kind, input })
     }
 }
