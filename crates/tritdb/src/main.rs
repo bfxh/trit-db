@@ -25,9 +25,23 @@ use tritdb_txn::TxnStore;
 use tritdb_wal::{TailState, WalReader};
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("error: {error}");
-        exit(1);
+    // Windows gives the main thread a 1 MiB stack. Deeply nested SQL
+    // expressions recurse through the parser before the depth limit trips, so
+    // run on a worker with enough headroom.
+    let worker = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn tritdb worker");
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+        Err(_) => {
+            eprintln!("error: tritdb worker panicked");
+            exit(1);
+        }
     }
 }
 
