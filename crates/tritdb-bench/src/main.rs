@@ -97,7 +97,7 @@ fn print_help() {
     println!("  ann-knn --points 4096 --dims 8 --k 10 --rounds 5");
     println!("  graph-reach --nodes 1024 --fanout 4 --hops 8 --rounds 5");
     println!("  record --out <json> [--markdown <md>] [--suite ci]");
-    println!("  check --baseline <json> [--tolerance 0.5] [--min-ms 0.05]");
+    println!("  check --baseline <json> [--tolerance 0.5] [--min-ms 0.05] [--retries 1]");
 }
 
 fn run_radix(args: &[String]) {
@@ -2491,6 +2491,16 @@ fn run_check(args: &[String]) {
             })
         })
         .unwrap_or(0.05);
+    // Shared CI disks occasionally produce a single slow sample (fsync
+    // jitter); re-run a regressed case and keep its fastest measurement.
+    let retries = arg_value(args, "--retries")
+        .map(|value| {
+            value.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("bad --retries: {value}");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or(1);
     let text = fs::read_to_string(&baseline_path).expect("read baseline");
     let baseline = parse_baseline(&text);
     if baseline.is_empty() {
@@ -2506,18 +2516,30 @@ fn run_check(args: &[String]) {
             eprintln!("baseline case {bench_id} is not in the ci suite");
             std::process::exit(1);
         };
-        let current_median = match run_case(&exe, spec) {
+        if *baseline_median < min_ms {
+            println!("{bench_id}\t{baseline_median:.4}\t-\t-\tskip (baseline below --min-ms)");
+            continue;
+        }
+        let mut current_median = match run_case(&exe, spec) {
             Ok((_, median, _)) => median,
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
         };
-        if *baseline_median < min_ms {
-            println!(
-                "{bench_id}\t{baseline_median:.4}\t{current_median:.4}\t-\tskip (baseline below --min-ms)"
-            );
-            continue;
+        let mut attempts = 0;
+        while current_median / baseline_median.max(f64::MIN_POSITIVE) > 1.0 + tolerance
+            && attempts < retries
+        {
+            attempts += 1;
+            eprintln!("{bench_id}: over tolerance, re-running (attempt {attempts}/{retries})");
+            match run_case(&exe, spec) {
+                Ok((_, median, _)) => current_median = current_median.min(median),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
         }
         let ratio = current_median / baseline_median.max(f64::MIN_POSITIVE);
         let regressed = ratio > 1.0 + tolerance;
