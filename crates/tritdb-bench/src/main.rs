@@ -8,11 +8,16 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Instant;
 
+use tritdb_exec::graph::{annotated_knn, AnnotatedGraph, Point, MAX_DIMENSIONS};
+use tritdb_exec::TruthValue;
 use tritdb_exec::Value;
 use tritdb_format::Block;
 use tritdb_page::{Page, PageKind, MAX_PAYLOAD, PAGE_SIZE};
@@ -37,6 +42,20 @@ fn main() {
         Some("sql-join") => run_sql_join(&args),
         Some("sql-plan") => run_sql_plan(&args),
         Some("sql-exec") => run_sql_exec(&args),
+        Some("sql-scan") => run_sql_scan(&args),
+        Some("sql-point") => run_sql_point(&args),
+        Some("sql-group") => run_sql_group(&args),
+        Some("sql-sort") => run_sql_sort(&args),
+        Some("sql-insert") => run_sql_insert(&args),
+        Some("sql-update") => run_sql_update(&args),
+        Some("sql-delete") => run_sql_delete(&args),
+        Some("sql-subquery") => run_sql_subquery(&args),
+        Some("sql-window") => run_sql_window(&args),
+        Some("pstore-scan") => run_pstore_scan(&args),
+        Some("txn-put") => run_txn_put(&args),
+        Some("pgwire") => run_pgwire_roundtrip(&args),
+        Some("ann-knn") => run_ann_knn(&args),
+        Some("graph-reach") => run_graph_reach(&args),
         Some("help") | Some("--help") => print_help(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
@@ -60,6 +79,20 @@ fn print_help() {
     println!("  sql-join --rows 1024 --rounds 3 [--strategy auto|hash|nested]");
     println!("  sql-plan --rows 1024 --rounds 3 [--query join|filter|aggregate|all]");
     println!("  sql-exec --rows 1024 --rounds 3 [--query filter|aggregate|all]");
+    println!("  sql-scan --rows 4096 --rounds 5 [--selectivity 10]");
+    println!("  sql-point --rows 4096 --lookups 256");
+    println!("  sql-group --rows 4096 --groups 64 --rounds 5");
+    println!("  sql-sort --rows 4096 --limit 64 --rounds 5");
+    println!("  sql-insert --rows 512 --rounds 5");
+    println!("  sql-update --rows 4096 --cutoff 512 --rounds 3");
+    println!("  sql-delete --rows 4096 --cutoff 512 --rounds 3");
+    println!("  sql-subquery --rows 2048 --rounds 3 [--query in|exists|scalar|all]");
+    println!("  sql-window --rows 4096 --rounds 3 [--query rank|sum|all]");
+    println!("  pstore-scan --pages 256 --payload 4096 --rounds 5 [--cold]");
+    println!("  txn-put --txns 512 --keys-per-txn 4 --rounds 3");
+    println!("  pgwire --rows 256 --queries 200 --rounds 3");
+    println!("  ann-knn --points 4096 --dims 8 --k 10 --rounds 5");
+    println!("  graph-reach --nodes 1024 --fanout 4 --hops 8 --rounds 5");
 }
 
 fn run_radix(args: &[String]) {
@@ -1184,6 +1217,926 @@ fn plan_output_chars(result: &QueryResult) -> (usize, usize) {
         }
     }
     (rows.len(), chars)
+}
+
+/// Seeds `t (id INT NOT NULL, payload INT, grp INT)` with `rows` rows; `payload`
+/// cycles through `0..10_000` and `grp` through `0..groups`.
+fn seed_scan_table(engine: &mut SqlEngine, rows: usize, groups: usize) {
+    let groups = groups.max(1);
+    let mut setup = String::new();
+    setup.push_str("CREATE TABLE t (id INT NOT NULL, payload INT, grp INT); INSERT INTO t VALUES ");
+    for row in 0..rows {
+        let payload = row.wrapping_mul(37) % 10_000;
+        let grp = row % groups;
+        write!(&mut setup, "({row}, {payload}, {grp})").expect("write seed");
+        if row + 1 < rows {
+            setup.push(',');
+        }
+    }
+    setup.push(';');
+    engine.execute_script(&setup).expect("seed scan table");
+}
+
+fn run_sql_scan(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    let selectivity = arg_usize(args, "--selectivity", 10).clamp(1, 100);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-scan.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_scan_table(&mut engine, rows, 16);
+
+    let cutoff = (10_000 * selectivity / 100) as i64;
+    let sql = format!("SELECT COUNT(*) FROM t WHERE payload < {cutoff};");
+    let statements = parse_script(&sql).expect("parse scan query");
+    let statement = &statements[0];
+
+    let expected: i64 = (0..rows)
+        .map(|row| (row.wrapping_mul(37) % 10_000) as i64)
+        .filter(|payload| *payload < cutoff)
+        .count() as i64;
+    let warm = engine
+        .execute_statement(statement)
+        .expect("warm scan query");
+    let QueryResult::Rows {
+        rows: warm_rows, ..
+    } = &warm
+    else {
+        panic!("scan query did not return rows");
+    };
+    let Value::Int(count) = warm_rows[0][0] else {
+        panic!("COUNT did not return INT");
+    };
+    assert_eq!(count, expected, "scan count mismatch");
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let result = engine
+            .execute_statement(statement)
+            .expect("execute scan query");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        black_box(&result);
+    }
+
+    let stats = Stats::new(samples);
+    println!("rows\tselectivity\trounds\tscan_ms(min/med/max)\tmatches");
+    println!(
+        "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+        rows, selectivity, rounds, stats.min, stats.median, stats.max, expected
+    );
+    println!(
+        "{{\"bench_id\":\"sql_scan\",\"rows\":{},\"selectivity\":{},\"rounds\":{},\"scan_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
+        rows, selectivity, rounds, stats.min, stats.median, stats.max, expected
+    );
+}
+
+fn run_sql_point(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let lookups = arg_usize(args, "--lookups", 256);
+    if rows == 0 || lookups == 0 {
+        eprintln!("--rows and --lookups must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-point.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_scan_table(&mut engine, rows, 16);
+
+    // Parse once per key so the measurement covers execution only.
+    let mut rng = Rng::new(0x5eed_1234);
+    let mut parsed = Vec::with_capacity(lookups);
+    for _ in 0..lookups {
+        let key = (rng.next_u64() as usize) % rows;
+        let sql = format!("SELECT id, payload FROM t WHERE id = {key};");
+        parsed.push((key, parse_script(&sql).expect("parse point query")));
+    }
+    let (_, warm) = &parsed[0];
+    engine
+        .execute_statement(&warm[0])
+        .expect("warm point query");
+
+    let mut samples = Vec::with_capacity(lookups);
+    for (key, statements) in &parsed {
+        let start = Instant::now();
+        let result = engine
+            .execute_statement(&statements[0])
+            .expect("execute point query");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        let QueryResult::Rows {
+            rows: result_rows, ..
+        } = &result
+        else {
+            panic!("point query did not return rows");
+        };
+        assert_eq!(result_rows.len(), 1, "point lookup for id {key}");
+    }
+
+    let stats = Stats::new(samples);
+    println!("rows\tlookups\tpoint_ms(min/med/max)");
+    println!(
+        "{}\t{}\t{:.3}/{:.3}/{:.3}",
+        rows, lookups, stats.min, stats.median, stats.max
+    );
+    println!(
+        "{{\"bench_id\":\"sql_point\",\"rows\":{},\"lookups\":{},\"point_ms\":[{:.3},{:.3},{:.3}]}}",
+        rows, lookups, stats.min, stats.median, stats.max
+    );
+}
+
+fn run_sql_group(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let groups = arg_usize(args, "--groups", 64);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    if rows == 0 || groups == 0 {
+        eprintln!("--rows and --groups must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-group.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_scan_table(&mut engine, rows, groups);
+
+    let sql = "SELECT grp, COUNT(*), SUM(payload) FROM t GROUP BY grp ORDER BY grp;";
+    let statements = parse_script(sql).expect("parse group query");
+    let statement = &statements[0];
+    let expected = groups.min(rows);
+    let warm = engine
+        .execute_statement(statement)
+        .expect("warm group query");
+    let QueryResult::Rows {
+        rows: warm_rows, ..
+    } = &warm
+    else {
+        panic!("group query did not return rows");
+    };
+    assert_eq!(warm_rows.len(), expected, "group count mismatch");
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let result = engine
+            .execute_statement(statement)
+            .expect("execute group query");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        black_box(&result);
+    }
+
+    let stats = Stats::new(samples);
+    println!("rows\tgroups\trounds\tgroup_ms(min/med/max)\tresult_rows");
+    println!(
+        "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+        rows, groups, rounds, stats.min, stats.median, stats.max, expected
+    );
+    println!(
+        "{{\"bench_id\":\"sql_group\",\"rows\":{},\"groups\":{},\"rounds\":{},\"group_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
+        rows, groups, rounds, stats.min, stats.median, stats.max, expected
+    );
+}
+
+fn run_sql_sort(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let limit = arg_usize(args, "--limit", 64).max(1);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-sort.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_scan_table(&mut engine, rows, 16);
+
+    let sql = format!("SELECT id, payload FROM t ORDER BY payload DESC, id ASC LIMIT {limit};");
+    let statements = parse_script(&sql).expect("parse sort query");
+    let statement = &statements[0];
+    let expected = limit.min(rows);
+    let warm = engine
+        .execute_statement(statement)
+        .expect("warm sort query");
+    let QueryResult::Rows {
+        rows: warm_rows, ..
+    } = &warm
+    else {
+        panic!("sort query did not return rows");
+    };
+    assert_eq!(warm_rows.len(), expected, "sort row count mismatch");
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let result = engine
+            .execute_statement(statement)
+            .expect("execute sort query");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        black_box(&result);
+    }
+
+    let stats = Stats::new(samples);
+    println!("rows\tlimit\trounds\tsort_ms(min/med/max)\tresult_rows");
+    println!(
+        "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+        rows, limit, rounds, stats.min, stats.median, stats.max, expected
+    );
+    println!(
+        "{{\"bench_id\":\"sql_sort\",\"rows\":{},\"limit\":{},\"rounds\":{},\"sort_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
+        rows, limit, rounds, stats.min, stats.median, stats.max, expected
+    );
+}
+
+fn create_scan_table(engine: &mut SqlEngine) {
+    engine
+        .execute_script("CREATE TABLE t (id INT NOT NULL, payload INT, grp INT);")
+        .expect("create scan table");
+}
+
+/// Empties `t` and refills it with `rows` deterministic rows.
+fn reset_scan_table(engine: &mut SqlEngine, rows: usize, groups: usize) {
+    let groups = groups.max(1);
+    let mut setup = String::from("DELETE FROM t; INSERT INTO t VALUES ");
+    for row in 0..rows {
+        let payload = row.wrapping_mul(37) % 10_000;
+        let grp = row % groups;
+        write!(&mut setup, "({row}, {payload}, {grp})").expect("write seed");
+        if row + 1 < rows {
+            setup.push(',');
+        }
+    }
+    setup.push(';');
+    engine.execute_script(&setup).expect("refill scan table");
+}
+
+fn run_sql_insert(args: &[String]) {
+    let batch = arg_usize(args, "--rows", 512);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    if batch == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-insert.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    create_scan_table(&mut engine);
+
+    let mut samples = Vec::with_capacity(rounds);
+    let mut inserted = 0usize;
+    for _ in 0..rounds {
+        let mut sql = String::from("INSERT INTO t (id, payload, grp) VALUES ");
+        for offset in 0..batch {
+            let id = inserted + offset;
+            write!(
+                &mut sql,
+                "({id}, {}, {})",
+                id.wrapping_mul(37) % 10_000,
+                id % 16
+            )
+            .expect("write insert");
+            if offset + 1 < batch {
+                sql.push(',');
+            }
+        }
+        sql.push(';');
+        let statements = parse_script(&sql).expect("parse insert batch");
+        let start = Instant::now();
+        engine
+            .execute_statement(&statements[0])
+            .expect("insert batch");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        inserted += batch;
+    }
+
+    let result = engine
+        .execute_statement(&parse_script("SELECT COUNT(*) FROM t;").expect("parse count")[0])
+        .expect("count rows");
+    let QueryResult::Rows { rows, .. } = &result else {
+        panic!("count did not return rows");
+    };
+    let Value::Int(count) = rows[0][0] else {
+        panic!("COUNT did not return INT");
+    };
+    assert_eq!(count as usize, inserted, "inserted row count mismatch");
+
+    let stats = Stats::new(samples);
+    let rows_per_sec = batch as f64 / (stats.median.max(f64::MIN_POSITIVE) / 1000.0);
+    println!("batch\trounds\tinsert_ms(min/med/max)\trows_per_sec\tinserted");
+    println!(
+        "{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.0}\t{}",
+        batch, rounds, stats.min, stats.median, stats.max, rows_per_sec, inserted
+    );
+    println!(
+        "{{\"bench_id\":\"sql_insert\",\"batch\":{},\"rounds\":{},\"insert_ms\":[{:.3},{:.3},{:.3}],\"rows_per_sec\":{:.0},\"inserted\":{}}}",
+        batch, rounds, stats.min, stats.median, stats.max, rows_per_sec, inserted
+    );
+}
+
+fn run_sql_update(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let cutoff = arg_usize(args, "--cutoff", 512);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 || cutoff == 0 {
+        eprintln!("--rows and --cutoff must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-update.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    create_scan_table(&mut engine);
+
+    let sql = format!("UPDATE t SET payload = payload + 1 WHERE id < {cutoff};");
+    let statements = parse_script(&sql).expect("parse update");
+    let statement = &statements[0];
+    let expected = cutoff.min(rows);
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        reset_scan_table(&mut engine, rows, 16);
+        let start = Instant::now();
+        let result = engine.execute_statement(statement).expect("execute update");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        let QueryResult::Message(message) = &result else {
+            panic!("UPDATE did not return a message");
+        };
+        assert!(
+            message.contains(&expected.to_string()),
+            "unexpected UPDATE status: {message}"
+        );
+    }
+
+    let stats = Stats::new(samples);
+    println!("rows\tcutoff\trounds\tupdate_ms(min/med/max)\tupdated");
+    println!(
+        "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
+    );
+    println!(
+        "{{\"bench_id\":\"sql_update\",\"rows\":{},\"cutoff\":{},\"rounds\":{},\"update_ms\":[{:.3},{:.3},{:.3}],\"updated\":{}}}",
+        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
+    );
+}
+
+fn run_sql_delete(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let cutoff = arg_usize(args, "--cutoff", 512);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 || cutoff == 0 {
+        eprintln!("--rows and --cutoff must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-delete.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    create_scan_table(&mut engine);
+
+    let sql = format!("DELETE FROM t WHERE id < {cutoff};");
+    let statements = parse_script(&sql).expect("parse delete");
+    let statement = &statements[0];
+    let expected = cutoff.min(rows);
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        reset_scan_table(&mut engine, rows, 16);
+        let start = Instant::now();
+        let result = engine.execute_statement(statement).expect("execute delete");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        let QueryResult::Message(message) = &result else {
+            panic!("DELETE did not return a message");
+        };
+        assert!(
+            message.contains(&expected.to_string()),
+            "unexpected DELETE status: {message}"
+        );
+    }
+
+    let stats = Stats::new(samples);
+    println!("rows\tcutoff\trounds\tdelete_ms(min/med/max)\tdeleted");
+    println!(
+        "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
+    );
+    println!(
+        "{{\"bench_id\":\"sql_delete\",\"rows\":{},\"cutoff\":{},\"rounds\":{},\"delete_ms\":[{:.3},{:.3},{:.3}],\"deleted\":{}}}",
+        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
+    );
+}
+
+fn run_sql_subquery(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 2048);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+    let selected = arg_value(args, "--query").unwrap_or_else(|| "all".to_string());
+    let all_queries: &[(&str, &str)] = &[
+        (
+            "in",
+            "SELECT COUNT(*) FROM a WHERE id IN (SELECT id FROM b WHERE payload < 512)",
+        ),
+        (
+            "exists",
+            "SELECT COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
+        ),
+        (
+            "scalar",
+            "SELECT COUNT(*) FROM a WHERE payload < (SELECT MAX(payload) FROM b)",
+        ),
+    ];
+    let queries: Vec<_> = all_queries
+        .iter()
+        .copied()
+        .filter(|(name, _)| selected == "all" || selected == *name)
+        .collect();
+    if queries.is_empty() {
+        eprintln!("unknown --query: {selected}; expected in, exists, scalar, or all");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-subquery.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_join_tables(&mut engine, rows);
+
+    let mut results = Vec::with_capacity(queries.len());
+    for (name, sql) in queries {
+        let statements = parse_script(sql).expect("parse subquery");
+        let statement = &statements[0];
+        let warm = engine.execute_statement(statement).expect("warm subquery");
+        let QueryResult::Rows {
+            rows: warm_rows, ..
+        } = &warm
+        else {
+            panic!("subquery did not return rows");
+        };
+        let Value::Int(matches) = warm_rows[0][0] else {
+            panic!("COUNT did not return INT");
+        };
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let start = Instant::now();
+            let result = engine
+                .execute_statement(statement)
+                .expect("execute subquery");
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            black_box(&result);
+        }
+        results.push((name, Stats::new(samples), matches));
+    }
+
+    println!("rows\tquery\trounds\tsubquery_ms(min/med/max)\tmatches");
+    for (name, stats, matches) in &results {
+        println!(
+            "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+            rows, name, rounds, stats.min, stats.median, stats.max, matches
+        );
+        println!(
+            "{{\"bench_id\":\"sql_subquery\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"subquery_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
+            rows, name, rounds, stats.min, stats.median, stats.max, matches
+        );
+    }
+}
+
+fn run_sql_window(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 4096);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 {
+        eprintln!("--rows must be greater than 0");
+        std::process::exit(2);
+    }
+    let selected = arg_value(args, "--query").unwrap_or_else(|| "all".to_string());
+    let all_queries: &[(&str, &str)] = &[
+        (
+            "rank",
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY payload) AS rn FROM t ORDER BY id LIMIT 64",
+        ),
+        (
+            "sum",
+            "SELECT id, SUM(payload) OVER (ORDER BY id) AS running FROM t ORDER BY id LIMIT 64",
+        ),
+    ];
+    let queries: Vec<_> = all_queries
+        .iter()
+        .copied()
+        .filter(|(name, _)| selected == "all" || selected == *name)
+        .collect();
+    if queries.is_empty() {
+        eprintln!("unknown --query: {selected}; expected rank, sum, or all");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("sql-window.db");
+    let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+    seed_scan_table(&mut engine, rows, 16);
+
+    let mut results = Vec::with_capacity(queries.len());
+    for (name, sql) in queries {
+        let statements = parse_script(sql).expect("parse window query");
+        let statement = &statements[0];
+        let warm = engine
+            .execute_statement(statement)
+            .expect("warm window query");
+        let QueryResult::Rows {
+            rows: warm_rows, ..
+        } = &warm
+        else {
+            panic!("window query did not return rows");
+        };
+        let result_rows = warm_rows.len();
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let start = Instant::now();
+            let result = engine
+                .execute_statement(statement)
+                .expect("execute window query");
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            black_box(&result);
+        }
+        results.push((name, Stats::new(samples), result_rows));
+    }
+
+    println!("rows\tquery\trounds\twindow_ms(min/med/max)\tresult_rows");
+    for (name, stats, result_rows) in &results {
+        println!(
+            "{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{}",
+            rows, name, rounds, stats.min, stats.median, stats.max, result_rows
+        );
+        println!(
+            "{{\"bench_id\":\"sql_window\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"window_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
+            rows, name, rounds, stats.min, stats.median, stats.max, result_rows
+        );
+    }
+}
+
+fn run_pstore_scan(args: &[String]) {
+    let pages = arg_usize(args, "--pages", 256);
+    let payload_len = arg_usize(args, "--payload", 4096);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    let cold = args.iter().any(|arg| arg == "--cold");
+    if pages == 0 {
+        eprintln!("--pages must be greater than 0");
+        std::process::exit(2);
+    }
+    if payload_len > MAX_PAYLOAD {
+        eprintln!("--payload max is {MAX_PAYLOAD}");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let data = dir.data(0);
+    let wal = dir.file(0);
+    let payload = vec![0x5a_u8; payload_len];
+    let page = Page::new(PageKind::Data, &payload).expect("build page");
+    {
+        let store = PageStore::open(&data, &wal).expect("open pstore");
+        let mut txn = store.begin().expect("begin");
+        for index in 0..pages {
+            txn.write_page(PageId::new(index as u64), &page)
+                .expect("write page");
+        }
+        txn.commit().expect("commit pages");
+    }
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        // A cold round reopens the store so every read misses the page cache.
+        let store = PageStore::open(&data, &wal).expect("open pstore");
+        let start = Instant::now();
+        let mut bytes = 0usize;
+        for index in 0..pages {
+            let page = store
+                .read_page(PageId::new(index as u64))
+                .expect("read page")
+                .expect("page exists");
+            bytes += page.as_bytes().len();
+        }
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        black_box(bytes);
+    }
+
+    let stats = Stats::new(samples);
+    let pages_per_sec = pages as f64 / (stats.median.max(f64::MIN_POSITIVE) / 1000.0);
+    println!("pages\tpayload\tmode\trounds\tscan_ms(min/med/max)\tpages_per_sec");
+    println!(
+        "{}\t{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.0}",
+        pages,
+        payload_len,
+        if cold { "cold" } else { "warm" },
+        rounds,
+        stats.min,
+        stats.median,
+        stats.max,
+        pages_per_sec
+    );
+    println!(
+        "{{\"bench_id\":\"pstore_scan\",\"pages\":{},\"payload\":{},\"mode\":\"{}\",\"rounds\":{},\"scan_ms\":[{:.3},{:.3},{:.3}],\"pages_per_sec\":{:.0}}}",
+        pages, payload_len, if cold { "cold" } else { "warm" }, rounds,
+        stats.min, stats.median, stats.max, pages_per_sec
+    );
+}
+
+fn run_txn_put(args: &[String]) {
+    let txns = arg_usize(args, "--txns", 512);
+    let keys_per_txn = arg_usize(args, "--keys-per-txn", 4);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if txns == 0 || keys_per_txn == 0 {
+        eprintln!("--txns and --keys-per-txn must be greater than 0");
+        std::process::exit(2);
+    }
+    let keys = txns.checked_mul(keys_per_txn).unwrap_or_else(|| {
+        eprintln!("--txns * --keys-per-txn overflows");
+        std::process::exit(2);
+    });
+
+    let dir = TempDir::new();
+    let mut samples = Vec::with_capacity(rounds);
+    let mut syncs = Vec::with_capacity(rounds);
+    let mut wal_bytes = 0u64;
+
+    for round in 0..rounds {
+        let wal = dir.file(round);
+        let store = TxnStore::open(&wal).expect("open txn store");
+        let start = Instant::now();
+        for txn_index in 0..txns {
+            let mut txn = store.begin().expect("begin");
+            for key_index in 0..keys_per_txn {
+                let key = format!("k{txn_index}-{key_index}");
+                txn.put(key.as_bytes(), b"v").expect("put");
+            }
+            txn.commit().expect("commit");
+        }
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(store.len().expect("len"), keys);
+        syncs.push(store.sync_count());
+        wal_bytes = fs::metadata(&wal).expect("wal metadata").len();
+        drop(store);
+    }
+
+    let stats = Stats::new(samples);
+    let txns_per_sec = txns as f64 / (stats.median.max(f64::MIN_POSITIVE) / 1000.0);
+    let syncs_min = *syncs.iter().min().expect("syncs min");
+    let syncs_max = *syncs.iter().max().expect("syncs max");
+    println!("txns\tkeys_per_txn\tkeys\twal_bytes\trounds\tput_ms(min/med/max)\ttxns_per_sec\tsyncs(min/max)");
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.0}\t{}/{}",
+        txns,
+        keys_per_txn,
+        keys,
+        wal_bytes,
+        rounds,
+        stats.min,
+        stats.median,
+        stats.max,
+        txns_per_sec,
+        syncs_min,
+        syncs_max
+    );
+    println!(
+        "{{\"bench_id\":\"txn_put\",\"txns\":{},\"keys_per_txn\":{},\"keys\":{},\"wal_bytes\":{},\"rounds\":{},\"put_ms\":[{:.3},{:.3},{:.3}],\"txns_per_sec\":{:.0},\"syncs\":[{},{}]}}",
+        txns, keys_per_txn, keys, wal_bytes, rounds,
+        stats.min, stats.median, stats.max, txns_per_sec, syncs_min, syncs_max
+    );
+}
+
+fn pg_write_startup(stream: &mut TcpStream) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&196_608i32.to_be_bytes());
+    body.push(0);
+    let mut message = Vec::new();
+    message.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    message.extend_from_slice(&body);
+    stream.write_all(&message).expect("pgwire startup");
+}
+
+fn pg_write_query(stream: &mut TcpStream, sql: &str) {
+    let mut payload = sql.as_bytes().to_vec();
+    payload.push(0);
+    let mut message = vec![b'Q'];
+    message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+    message.extend_from_slice(&payload);
+    stream.write_all(&message).expect("pgwire query");
+}
+
+fn pg_read_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut kind = [0u8; 1];
+    stream.read_exact(&mut kind).expect("pgwire message type");
+    let mut length = [0u8; 4];
+    stream
+        .read_exact(&mut length)
+        .expect("pgwire message length");
+    let length = i32::from_be_bytes(length) as usize - 4;
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).expect("pgwire payload");
+    (kind[0], payload)
+}
+
+/// Reads messages until `ReadyForQuery`, returning the message kinds seen.
+fn pg_read_until_ready(stream: &mut TcpStream) -> Vec<u8> {
+    let mut kinds = Vec::new();
+    loop {
+        let (kind, _) = pg_read_message(stream);
+        kinds.push(kind);
+        if kind == b'Z' {
+            return kinds;
+        }
+    }
+}
+
+fn run_pgwire_roundtrip(args: &[String]) {
+    let rows = arg_usize(args, "--rows", 256);
+    let queries = arg_usize(args, "--queries", 200);
+    let rounds = arg_usize(args, "--rounds", 3).max(1);
+    if rows == 0 || queries == 0 {
+        eprintln!("--rows and --queries must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let dir = TempDir::new();
+    let db = dir.0.join("pgwire-bench.db");
+    {
+        let mut engine = SqlEngine::open(&db).expect("open SQL engine");
+        seed_scan_table(&mut engine, rows, 16);
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind pgwire listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let db_path = db.clone();
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve(db_path, listener);
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect pgwire");
+    pg_write_startup(&mut stream);
+    let startup_kinds = pg_read_until_ready(&mut stream);
+    assert!(
+        startup_kinds.contains(&b'Z'),
+        "startup did not reach ReadyForQuery"
+    );
+
+    let sql = "SELECT COUNT(*) FROM t WHERE payload < 1000;";
+    pg_write_query(&mut stream, sql);
+    let warm = pg_read_until_ready(&mut stream);
+    assert!(warm.contains(&b'D'), "query returned no DataRow");
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let start = Instant::now();
+        for _ in 0..queries {
+            pg_write_query(&mut stream, sql);
+            let kinds = pg_read_until_ready(&mut stream);
+            assert!(kinds.contains(&b'D'), "query returned no DataRow");
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        samples.push(elapsed_ms / queries as f64);
+    }
+
+    let _ = stream.write_all(b"X\x00\x00\x00\x04");
+    let stats = Stats::new(samples);
+    let qps = 1000.0 / stats.median.max(f64::MIN_POSITIVE);
+    println!("rows\tqueries\trounds\troundtrip_ms(min/med/max)\tqps");
+    println!(
+        "{}\t{}\t{}\t{:.4}/{:.4}/{:.4}\t{:.0}",
+        rows, queries, rounds, stats.min, stats.median, stats.max, qps
+    );
+    println!(
+        "{{\"bench_id\":\"pgwire_roundtrip\",\"rows\":{},\"queries\":{},\"rounds\":{},\"roundtrip_ms\":[{:.4},{:.4},{:.4}],\"qps\":{:.0}}}",
+        rows, queries, rounds, stats.min, stats.median, stats.max, qps
+    );
+}
+
+fn run_ann_knn(args: &[String]) {
+    let count = arg_usize(args, "--points", 4096);
+    let dims = arg_usize(args, "--dims", 8).clamp(1, MAX_DIMENSIONS);
+    let k = arg_usize(args, "--k", 10).max(1);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    if count == 0 {
+        eprintln!("--points must be greater than 0");
+        std::process::exit(2);
+    }
+
+    let mut rng = Rng::new(0xabcd_0001);
+    let mut points = Vec::with_capacity(count);
+    for id in 0..count {
+        let mut vector = Vec::with_capacity(dims);
+        for _ in 0..dims {
+            vector.push((rng.next_u64() % 1000) as i64);
+        }
+        let label = match id % 3 {
+            0 => TruthValue::True,
+            1 => TruthValue::Unknown,
+            _ => TruthValue::False,
+        };
+        points.push(Point {
+            id: id as u32,
+            vector,
+            label,
+        });
+    }
+    let query: Vec<i64> = (0..dims).map(|index| (index as i64 * 7) % 1000).collect();
+
+    let warm = annotated_knn(&points, &query, k).expect("warm knn");
+    assert!(
+        warm.certain.len() <= k,
+        "knn returned more than k neighbours"
+    );
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let answer = annotated_knn(&points, &query, k).expect("execute knn");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        black_box(&answer);
+    }
+
+    let stats = Stats::new(samples);
+    let points_per_sec = count as f64 / (stats.median.max(f64::MIN_POSITIVE) / 1000.0);
+    println!("points\tdims\tk\trounds\tknn_ms(min/med/max)\tpoints_per_sec\tcertain");
+    println!(
+        "{}\t{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.0}\t{}",
+        count,
+        dims,
+        k,
+        rounds,
+        stats.min,
+        stats.median,
+        stats.max,
+        points_per_sec,
+        warm.certain.len()
+    );
+    println!(
+        "{{\"bench_id\":\"ann_knn\",\"points\":{},\"dims\":{},\"k\":{},\"rounds\":{},\"knn_ms\":[{:.3},{:.3},{:.3}],\"points_per_sec\":{:.0},\"certain\":{}}}",
+        count, dims, k, rounds, stats.min, stats.median, stats.max, points_per_sec, warm.certain.len()
+    );
+}
+
+fn run_graph_reach(args: &[String]) {
+    let nodes = arg_usize(args, "--nodes", 1024);
+    let fanout = arg_usize(args, "--fanout", 4);
+    let hops = arg_usize(args, "--hops", 8);
+    let rounds = arg_usize(args, "--rounds", 5).max(1);
+    if nodes < 2 || fanout == 0 || hops == 0 {
+        eprintln!("--nodes must be at least 2; --fanout and --hops must be greater than 0");
+        std::process::exit(2);
+    }
+    if fanout >= nodes {
+        eprintln!("--fanout must be smaller than --nodes");
+        std::process::exit(2);
+    }
+
+    let mut edges = Vec::with_capacity(nodes * fanout);
+    for from in 0..nodes {
+        for step in 1..=fanout {
+            let to = (from + step) % nodes;
+            let label = match (from + step) % 3 {
+                0 => TruthValue::True,
+                1 => TruthValue::Unknown,
+                _ => TruthValue::False,
+            };
+            edges.push((from as u32, to as u32, label));
+        }
+    }
+    let graph = AnnotatedGraph::from_edges(nodes, &edges).expect("build annotated graph");
+    let target = (nodes - 1) as u32;
+    let warm = graph.reach(0, target, hops).expect("warm reach");
+    black_box(&warm);
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let reach = graph.reach(0, target, hops).expect("execute reach");
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        black_box(&reach);
+    }
+
+    let stats = Stats::new(samples);
+    println!("nodes\tedges\tfanout\thops\trounds\treach_ms(min/med/max)\tanswer");
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{:.3}/{:.3}/{:.3}\t{:?}",
+        nodes,
+        graph.edge_count(),
+        fanout,
+        hops,
+        rounds,
+        stats.min,
+        stats.median,
+        stats.max,
+        warm.answer
+    );
+    println!(
+        "{{\"bench_id\":\"graph_reach\",\"nodes\":{},\"edges\":{},\"fanout\":{},\"hops\":{},\"rounds\":{},\"reach_ms\":[{:.3},{:.3},{:.3}],\"answer\":\"{:?}\"}}",
+        nodes, graph.edge_count(), fanout, hops, rounds,
+        stats.min, stats.median, stats.max, warm.answer
+    );
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {

@@ -26,6 +26,7 @@ dependencies = [
  "tritdb-exec",
  "tritdb-format",
  "tritdb-page",
+ "tritdb-pgwire",
  "tritdb-radix",
  "tritdb-sql",
  "tritdb-store",
