@@ -10,7 +10,7 @@ use std::fs;
 use std::hint::black_box;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -56,6 +56,8 @@ fn main() {
         Some("pgwire") => run_pgwire_roundtrip(&args),
         Some("ann-knn") => run_ann_knn(&args),
         Some("graph-reach") => run_graph_reach(&args),
+        Some("record") => run_record(&args),
+        Some("check") => run_check(&args),
         Some("help") | Some("--help") => print_help(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
@@ -79,6 +81,7 @@ fn print_help() {
     println!("  sql-join --rows 1024 --rounds 3 [--strategy auto|hash|nested]");
     println!("  sql-plan --rows 1024 --rounds 3 [--query join|filter|aggregate|all]");
     println!("  sql-exec --rows 1024 --rounds 3 [--query filter|aggregate|all]");
+    println!("  --profile small|medium|large   presets for --rows (4096 / 65536 / 262144)");
     println!("  sql-scan --rows 4096 --rounds 5 [--selectivity 10]");
     println!("  sql-point --rows 4096 --lookups 256");
     println!("  sql-group --rows 4096 --groups 64 --rounds 5");
@@ -93,6 +96,8 @@ fn print_help() {
     println!("  pgwire --rows 256 --queries 200 --rounds 3");
     println!("  ann-knn --points 4096 --dims 8 --k 10 --rounds 5");
     println!("  graph-reach --nodes 1024 --fanout 4 --hops 8 --rounds 5");
+    println!("  record --out <json> [--markdown <md>] [--suite ci]");
+    println!("  check --baseline <json> [--tolerance 0.5] [--min-ms 0.05]");
 }
 
 fn run_radix(args: &[String]) {
@@ -910,7 +915,7 @@ fn run_txn_group(args: &[String]) {
 }
 
 fn run_sql_join(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 1024);
+    let rows = rows_or_profile(args, 1024);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 {
         eprintln!("--rows must be greater than 0");
@@ -967,27 +972,28 @@ fn run_sql_join(args: &[String]) {
 }
 
 fn seed_join_tables(engine: &mut SqlEngine, rows: usize) {
-    let mut setup = String::new();
-    setup.push_str(
-        "CREATE TABLE a (id INT NOT NULL, payload INT); \
-                    CREATE TABLE b (id INT NOT NULL, payload INT); \
-                    INSERT INTO a VALUES ",
-    );
-    for row in 0..rows {
-        write!(&mut setup, "({row}, {row})").expect("write seed");
-        if row + 1 < rows {
-            setup.push(',');
+    engine
+        .execute_script(
+            "CREATE TABLE a (id INT NOT NULL, payload INT); \
+             CREATE TABLE b (id INT NOT NULL, payload INT);",
+        )
+        .expect("create join tables");
+    for table in ["a", "b"] {
+        let mut offset = 0;
+        while offset < rows {
+            let end = (offset + SEED_BATCH).min(rows);
+            let mut sql = format!("INSERT INTO {table} VALUES ");
+            for row in offset..end {
+                write!(&mut sql, "({row}, {row})").expect("write seed");
+                if row + 1 < end {
+                    sql.push(',');
+                }
+            }
+            sql.push(';');
+            engine.execute_script(&sql).expect("seed join rows");
+            offset = end;
         }
     }
-    setup.push_str("; INSERT INTO b VALUES ");
-    for row in 0..rows {
-        write!(&mut setup, "({row}, {row})").expect("write seed");
-        if row + 1 < rows {
-            setup.push(',');
-        }
-    }
-    setup.push(';');
-    engine.execute_script(&setup).expect("seed tables");
 }
 
 struct PlanBench {
@@ -999,7 +1005,7 @@ struct PlanBench {
 }
 
 fn run_sql_plan(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 1024);
+    let rows = rows_or_profile(args, 1024);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 {
         eprintln!("--rows must be greater than 0");
@@ -1136,7 +1142,7 @@ fn query_result_rows(result: &QueryResult) -> usize {
 }
 
 fn run_sql_exec(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 1024);
+    let rows = rows_or_profile(args, 1024);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 {
         eprintln!("--rows must be greater than 0");
@@ -1221,24 +1227,58 @@ fn plan_output_chars(result: &QueryResult) -> (usize, usize) {
 
 /// Seeds `t (id INT NOT NULL, payload INT, grp INT)` with `rows` rows; `payload`
 /// cycles through `0..10_000` and `grp` through `0..groups`.
-fn seed_scan_table(engine: &mut SqlEngine, rows: usize, groups: usize) {
-    let groups = groups.max(1);
-    let mut setup = String::new();
-    setup.push_str("CREATE TABLE t (id INT NOT NULL, payload INT, grp INT); INSERT INTO t VALUES ");
-    for row in 0..rows {
-        let payload = row.wrapping_mul(37) % 10_000;
-        let grp = row % groups;
-        write!(&mut setup, "({row}, {payload}, {grp})").expect("write seed");
-        if row + 1 < rows {
-            setup.push(',');
+/// Rows per `INSERT` statement while seeding. Large profiles (hundreds of
+/// thousands of rows) would otherwise build one multi-megabyte statement.
+const SEED_BATCH: usize = 2_048;
+
+/// Resolves `--profile small|medium|large` into a row count.
+fn profile_rows(args: &[String]) -> Option<usize> {
+    match arg_value(args, "--profile").as_deref() {
+        Some("small") => Some(4_096),
+        Some("medium") => Some(65_536),
+        Some("large") => Some(262_144),
+        Some(other) => {
+            eprintln!("unknown --profile {other}; expected small, medium, or large");
+            std::process::exit(2);
         }
+        None => None,
     }
-    setup.push(';');
-    engine.execute_script(&setup).expect("seed scan table");
+}
+
+/// `--rows`, falling back to the selected profile, then to `default`.
+fn rows_or_profile(args: &[String], default: usize) -> usize {
+    arg_usize(args, "--rows", profile_rows(args).unwrap_or(default))
+}
+
+fn insert_scan_rows(engine: &mut SqlEngine, start: usize, rows: usize, groups: usize) {
+    let groups = groups.max(1);
+    let mut offset = start;
+    while offset < start + rows {
+        let end = (offset + SEED_BATCH).min(start + rows);
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        for row in offset..end {
+            let payload = row.wrapping_mul(37) % 10_000;
+            let grp = row % groups;
+            write!(&mut sql, "({row}, {payload}, {grp})").expect("write seed");
+            if row + 1 < end {
+                sql.push(',');
+            }
+        }
+        sql.push(';');
+        engine.execute_script(&sql).expect("seed scan rows");
+        offset = end;
+    }
+}
+
+fn seed_scan_table(engine: &mut SqlEngine, rows: usize, groups: usize) {
+    engine
+        .execute_script("CREATE TABLE t (id INT NOT NULL, payload INT, grp INT);")
+        .expect("create scan table");
+    insert_scan_rows(engine, 0, rows, groups);
 }
 
 fn run_sql_scan(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let rounds = arg_usize(args, "--rounds", 5).max(1);
     let selectivity = arg_usize(args, "--selectivity", 10).clamp(1, 100);
     if rows == 0 {
@@ -1297,7 +1337,7 @@ fn run_sql_scan(args: &[String]) {
 }
 
 fn run_sql_point(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let lookups = arg_usize(args, "--lookups", 256);
     if rows == 0 || lookups == 0 {
         eprintln!("--rows and --lookups must be greater than 0");
@@ -1351,7 +1391,7 @@ fn run_sql_point(args: &[String]) {
 }
 
 fn run_sql_group(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let groups = arg_usize(args, "--groups", 64);
     let rounds = arg_usize(args, "--rounds", 5).max(1);
     if rows == 0 || groups == 0 {
@@ -1402,7 +1442,7 @@ fn run_sql_group(args: &[String]) {
 }
 
 fn run_sql_sort(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let limit = arg_usize(args, "--limit", 64).max(1);
     let rounds = arg_usize(args, "--rounds", 5).max(1);
     if rows == 0 {
@@ -1460,18 +1500,10 @@ fn create_scan_table(engine: &mut SqlEngine) {
 
 /// Empties `t` and refills it with `rows` deterministic rows.
 fn reset_scan_table(engine: &mut SqlEngine, rows: usize, groups: usize) {
-    let groups = groups.max(1);
-    let mut setup = String::from("DELETE FROM t; INSERT INTO t VALUES ");
-    for row in 0..rows {
-        let payload = row.wrapping_mul(37) % 10_000;
-        let grp = row % groups;
-        write!(&mut setup, "({row}, {payload}, {grp})").expect("write seed");
-        if row + 1 < rows {
-            setup.push(',');
-        }
-    }
-    setup.push(';');
-    engine.execute_script(&setup).expect("refill scan table");
+    engine
+        .execute_script("DELETE FROM t;")
+        .expect("clear scan table");
+    insert_scan_rows(engine, 0, rows, groups);
 }
 
 fn run_sql_insert(args: &[String]) {
@@ -1539,7 +1571,7 @@ fn run_sql_insert(args: &[String]) {
 }
 
 fn run_sql_update(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let cutoff = arg_usize(args, "--cutoff", 512);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 || cutoff == 0 {
@@ -1585,7 +1617,7 @@ fn run_sql_update(args: &[String]) {
 }
 
 fn run_sql_delete(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let cutoff = arg_usize(args, "--cutoff", 512);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 || cutoff == 0 {
@@ -1631,7 +1663,7 @@ fn run_sql_delete(args: &[String]) {
 }
 
 fn run_sql_subquery(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 2048);
+    let rows = rows_or_profile(args, 2048);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 {
         eprintln!("--rows must be greater than 0");
@@ -1707,7 +1739,7 @@ fn run_sql_subquery(args: &[String]) {
 }
 
 fn run_sql_window(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 4096);
+    let rows = rows_or_profile(args, 4096);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 {
         eprintln!("--rows must be greater than 0");
@@ -1953,7 +1985,7 @@ fn pg_read_until_ready(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 fn run_pgwire_roundtrip(args: &[String]) {
-    let rows = arg_usize(args, "--rows", 256);
+    let rows = rows_or_profile(args, 256);
     let queries = arg_usize(args, "--queries", 200);
     let rounds = arg_usize(args, "--rounds", 3).max(1);
     if rows == 0 || queries == 0 {
@@ -2137,6 +2169,371 @@ fn run_graph_reach(args: &[String]) {
         nodes, graph.edge_count(), fanout, hops, rounds,
         stats.min, stats.median, stats.max, warm.answer
     );
+}
+
+/// One case of the baseline / regression suite.
+struct CaseSpec {
+    bench_id: &'static str,
+    args: &'static [&'static str],
+}
+
+/// Small, seconds-level suite shared by `record` and `check`. Keep it in sync
+/// with the `bench-smoke` CI job.
+const CI_CASES: &[CaseSpec] = &[
+    CaseSpec {
+        bench_id: "sql_scan",
+        args: &["sql-scan", "--rows", "512", "--rounds", "3"],
+    },
+    CaseSpec {
+        bench_id: "sql_point",
+        args: &["sql-point", "--rows", "512", "--lookups", "64"],
+    },
+    CaseSpec {
+        bench_id: "sql_group",
+        args: &[
+            "sql-group",
+            "--rows",
+            "512",
+            "--groups",
+            "16",
+            "--rounds",
+            "3",
+        ],
+    },
+    CaseSpec {
+        bench_id: "sql_sort",
+        args: &[
+            "sql-sort", "--rows", "512", "--limit", "16", "--rounds", "3",
+        ],
+    },
+    CaseSpec {
+        bench_id: "sql_insert",
+        args: &["sql-insert", "--rows", "128", "--rounds", "2"],
+    },
+    CaseSpec {
+        bench_id: "sql_update",
+        args: &[
+            "sql-update",
+            "--rows",
+            "512",
+            "--cutoff",
+            "64",
+            "--rounds",
+            "2",
+        ],
+    },
+    CaseSpec {
+        bench_id: "sql_delete",
+        args: &[
+            "sql-delete",
+            "--rows",
+            "512",
+            "--cutoff",
+            "64",
+            "--rounds",
+            "2",
+        ],
+    },
+    CaseSpec {
+        bench_id: "sql_subquery",
+        args: &[
+            "sql-subquery",
+            "--rows",
+            "256",
+            "--rounds",
+            "2",
+            "--query",
+            "in",
+        ],
+    },
+    CaseSpec {
+        bench_id: "sql_window",
+        args: &[
+            "sql-window",
+            "--rows",
+            "512",
+            "--rounds",
+            "2",
+            "--query",
+            "rank",
+        ],
+    },
+    CaseSpec {
+        bench_id: "sql_join",
+        args: &[
+            "sql-join",
+            "--rows",
+            "512",
+            "--rounds",
+            "2",
+            "--strategy",
+            "auto",
+        ],
+    },
+    CaseSpec {
+        bench_id: "pstore_scan",
+        args: &[
+            "pstore-scan",
+            "--pages",
+            "64",
+            "--payload",
+            "1024",
+            "--rounds",
+            "3",
+        ],
+    },
+    CaseSpec {
+        bench_id: "txn_put",
+        args: &[
+            "txn-put",
+            "--txns",
+            "64",
+            "--keys-per-txn",
+            "4",
+            "--rounds",
+            "1",
+        ],
+    },
+    CaseSpec {
+        bench_id: "pgwire_roundtrip",
+        args: &[
+            "pgwire",
+            "--rows",
+            "128",
+            "--queries",
+            "32",
+            "--rounds",
+            "2",
+        ],
+    },
+    CaseSpec {
+        bench_id: "ann_knn",
+        args: &[
+            "ann-knn", "--points", "1024", "--dims", "8", "--k", "10", "--rounds", "3",
+        ],
+    },
+    CaseSpec {
+        bench_id: "graph_reach",
+        args: &[
+            "graph-reach",
+            "--nodes",
+            "256",
+            "--fanout",
+            "4",
+            "--hops",
+            "6",
+            "--rounds",
+            "3",
+        ],
+    },
+];
+
+/// Extracts `(min, median, max)` from a benchmark JSON line such as
+/// `{"bench_id":"sql_scan","scan_ms":[0.1,0.12,0.15],...}`.
+fn find_ms_triplet(line: &str) -> Option<(f64, f64, f64)> {
+    let marker = "_ms\":[";
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find(']')?;
+    let mut parts = rest[..end].split(',');
+    let min = parts.next()?.trim().parse::<f64>().ok()?;
+    let median = parts.next()?.trim().parse::<f64>().ok()?;
+    let max = parts.next()?.trim().parse::<f64>().ok()?;
+    Some((min, median, max))
+}
+
+/// Runs one benchmark case as a child process and parses its measurement.
+fn run_case(exe: &Path, spec: &CaseSpec) -> Result<(f64, f64, f64), String> {
+    let output = std::process::Command::new(exe)
+        .args(spec.args)
+        .output()
+        .map_err(|error| format!("{}: spawn failed: {error}", spec.bench_id))?;
+    if !output.status.success() {
+        return Err(format!("{}: exited with {}", spec.bench_id, output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("\"bench_id\"") {
+            if let Some(triplet) = find_ms_triplet(line) {
+                return Ok(triplet);
+            }
+        }
+    }
+    Err(format!("{}: no *_ms triplet in output", spec.bench_id))
+}
+
+fn platform_tag() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn run_record(args: &[String]) {
+    let Some(out) = arg_value(args, "--out") else {
+        eprintln!("record requires --out <path>");
+        std::process::exit(2);
+    };
+    let markdown = arg_value(args, "--markdown");
+    let suite = arg_value(args, "--suite").unwrap_or_else(|| "ci".to_string());
+    if suite != "ci" {
+        eprintln!("unknown --suite {suite}; only \"ci\" is implemented");
+        std::process::exit(2);
+    }
+
+    let exe = std::env::current_exe().expect("current exe");
+    let platform = platform_tag();
+    let mut recorded = Vec::with_capacity(CI_CASES.len());
+    for spec in CI_CASES {
+        eprintln!("recording {}", spec.bench_id);
+        match run_case(&exe, spec) {
+            Ok(triplet) => recorded.push((spec, triplet)),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut json = String::new();
+    json.push_str("{\n  \"format\": 1,\n  \"suite\": \"ci\",\n");
+    writeln!(&mut json, "  \"platform\": \"{platform}\",").expect("write baseline");
+    json.push_str("  \"cases\": [\n");
+    for (index, (spec, (min, median, max))) in recorded.iter().enumerate() {
+        writeln!(
+            &mut json,
+            "    {{\"bench_id\":\"{}\",\"args\":\"{}\",\"min_ms\":{:.6},\"median_ms\":{:.6},\"max_ms\":{:.6}}}{}",
+            spec.bench_id,
+            spec.args.join(" "),
+            min,
+            median,
+            max,
+            if index + 1 < recorded.len() { "," } else { "" }
+        )
+        .expect("write baseline");
+    }
+    json.push_str("  ]\n}\n");
+    fs::write(&out, json).expect("write baseline json");
+    println!("wrote {out}");
+
+    if let Some(markdown_path) = markdown {
+        let mut md = String::new();
+        md.push_str("# trit-db 基准基线\n\n");
+        md.push_str("由 `tritdb-bench record` 生成；CI 用 `tritdb-bench check` 与它比较。\n\n");
+        writeln!(&mut md, "- 平台：`{platform}`").expect("write markdown");
+        md.push_str("- 套件：`ci`（小规模、秒级；不代表性能上限，只用于捕获数量级回归）\n");
+        md.push_str("- 指标：各基准 `*_ms` 的 min / median / max\n\n");
+        md.push_str(
+            "| case | 参数 | min (ms) | median (ms) | max (ms) |\n|---|---|---:|---:|---:|\n",
+        );
+        for (spec, (min, median, max)) in &recorded {
+            writeln!(
+                &mut md,
+                "| `{}` | `{}` | {:.4} | {:.4} | {:.4} |",
+                spec.bench_id,
+                spec.args.join(" "),
+                min,
+                median,
+                max
+            )
+            .expect("write markdown");
+        }
+        md.push_str("\n## 如何更新基线\n\n```bash\ncargo run -p tritdb-bench --release -- record \\\n  --out docs/results/bench-baseline.json \\\n  --markdown docs/results/BENCH.md\n```\n\n");
+        md.push_str("## CI 门限\n\n```bash\ncargo run -p tritdb-bench --release -- check \\\n  --baseline docs/results/bench-baseline.json \\\n  --tolerance 2.0 --min-ms 0.05\n```\n\n共享 runner 噪声大，CI 只拦“超过基线 3 倍”的数量级回归；本地可用更紧的 `--tolerance 0.5`。\n");
+        fs::write(&markdown_path, md).expect("write baseline markdown");
+        println!("wrote {markdown_path}");
+    }
+}
+
+/// Parses `{"bench_id":"...","median_ms":...}` lines from the baseline JSON.
+fn parse_baseline(text: &str) -> Vec<(String, f64)> {
+    let mut cases = Vec::new();
+    for line in text.lines() {
+        let Some(id_at) = line.find("\"bench_id\":\"") else {
+            continue;
+        };
+        let id_start = id_at + "\"bench_id\":\"".len();
+        let Some(id_len) = line[id_start..].find('"') else {
+            continue;
+        };
+        let bench_id = line[id_start..id_start + id_len].to_string();
+        let Some(median_at) = line.find("\"median_ms\":") else {
+            continue;
+        };
+        let rest = &line[median_at + "\"median_ms\":".len()..];
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        let Ok(median) = rest[..end].trim().parse::<f64>() else {
+            continue;
+        };
+        cases.push((bench_id, median));
+    }
+    cases
+}
+
+fn run_check(args: &[String]) {
+    let Some(baseline_path) = arg_value(args, "--baseline") else {
+        eprintln!("check requires --baseline <path>");
+        std::process::exit(2);
+    };
+    let tolerance = arg_value(args, "--tolerance")
+        .map(|value| {
+            value.parse::<f64>().unwrap_or_else(|_| {
+                eprintln!("bad --tolerance: {value}");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or(0.5);
+    let min_ms = arg_value(args, "--min-ms")
+        .map(|value| {
+            value.parse::<f64>().unwrap_or_else(|_| {
+                eprintln!("bad --min-ms: {value}");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or(0.05);
+    let text = fs::read_to_string(&baseline_path).expect("read baseline");
+    let baseline = parse_baseline(&text);
+    if baseline.is_empty() {
+        eprintln!("baseline {baseline_path} contains no cases");
+        std::process::exit(1);
+    }
+
+    let exe = std::env::current_exe().expect("current exe");
+    println!("case\tbaseline_ms\tcurrent_ms\tratio\tstatus");
+    let mut regressions = 0;
+    for (bench_id, baseline_median) in &baseline {
+        let Some(spec) = CI_CASES.iter().find(|spec| spec.bench_id == *bench_id) else {
+            eprintln!("baseline case {bench_id} is not in the ci suite");
+            std::process::exit(1);
+        };
+        let current_median = match run_case(&exe, spec) {
+            Ok((_, median, _)) => median,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        if *baseline_median < min_ms {
+            println!(
+                "{bench_id}\t{baseline_median:.4}\t{current_median:.4}\t-\tskip (baseline below --min-ms)"
+            );
+            continue;
+        }
+        let ratio = current_median / baseline_median.max(f64::MIN_POSITIVE);
+        let regressed = ratio > 1.0 + tolerance;
+        if regressed {
+            regressions += 1;
+        }
+        println!(
+            "{bench_id}\t{baseline_median:.4}\t{current_median:.4}\t{ratio:.2}\t{}",
+            if regressed { "REGRESSION" } else { "ok" }
+        );
+    }
+    if regressions > 0 {
+        eprintln!(
+            "{regressions} case(s) exceeded the {:.0}% tolerance",
+            tolerance * 100.0
+        );
+        std::process::exit(1);
+    }
+    println!("all cases within tolerance ({:.0}%)", tolerance * 100.0);
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {

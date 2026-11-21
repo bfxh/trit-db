@@ -135,3 +135,23 @@ cargo build --release --locked -p tritdb -p tritdb-bench
 - SQL 表每次写都重写整个 value；对拍只覆盖小表，不覆盖大表写放大、并发 SQL 写者或跨进程锁。
 - SQL `IS UNKNOWN` 没有进 SQLite 对拍（SQLite 不支持该语法），由 `tritdb-exec` / `tritdb-sql` 单元测试覆盖。
 - `checkpoint_commit_loop` 在 debug 下可能需要数分钟；nightly 用 release，本地调试请降低 `TRITDB_STRESS_ROUNDS`。
+
+## 基准基线与回归门限
+
+`tritdb-bench` 的 `ci` 套件（15 个 case）在 `docs/results/bench-baseline.json` 里有记录，人类可读版本在 `docs/results/BENCH.md`。
+
+```bash
+# 更新基线（在有代表性的机器上跑）
+cargo run -p tritdb-bench --release -- record \
+  --out docs/results/bench-baseline.json --markdown docs/results/BENCH.md
+
+# 手动比较（本地可用更紧的阈值）
+cargo run -p tritdb-bench --release -- check \
+  --baseline docs/results/bench-baseline.json --tolerance 0.5
+
+# 大规模 profile（不在 CI 跑）
+cargo run -p tritdb-bench --release -- sql-scan --profile medium --rounds 3
+cargo run -p tritdb-bench --release -- sql-scan --profile large --rounds 3
+```
+
+CI 的 `bench-regress` job 用 `--tolerance 2.0 --min-ms 0.05`：基线在 `windows-x86_64` 上记录、CI 在 `ubuntu-latest` 共享 runner 上重跑，所以只拦「超过基线 3 倍」的数量级回归，不做统计显著性判断。低于 0.05 ms 的 case（如 `graph_reach`）直接跳过，避免噪声误报。

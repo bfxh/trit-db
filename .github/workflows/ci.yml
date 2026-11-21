@@ -93,6 +93,16 @@ jobs:
       - run: cargo run --locked --release -p tritdb-bench -- graph-reach --nodes 64 --fanout 4 --hops 4 --rounds 1 | tee /tmp/bench-graph-reach.txt
       - run: grep -q '"bench_id":"graph_reach"' /tmp/bench-graph-reach.txt
 
+  bench-regress:
+    name: bench regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The committed baseline was recorded on windows-x86_64; shared runners
+      # are noisy, so CI only gates order-of-magnitude regressions (>3x).
+      - run: cargo run --locked --release -p tritdb-bench -- check --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05
+
   python-crosscheck:
     name: python crosscheck (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

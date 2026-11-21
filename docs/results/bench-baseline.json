@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "suite": "ci",
+  "platform": "windows-x86_64",
+  "cases": [
+    {"bench_id":"sql_scan","args":"sql-scan --rows 512 --rounds 3","min_ms":0.092000,"median_ms":0.103000,"max_ms":0.138000},
+    {"bench_id":"sql_point","args":"sql-point --rows 512 --lookups 64","min_ms":0.121000,"median_ms":0.148000,"max_ms":0.183000},
+    {"bench_id":"sql_group","args":"sql-group --rows 512 --groups 16 --rounds 3","min_ms":0.178000,"median_ms":0.180000,"max_ms":0.181000},
+    {"bench_id":"sql_sort","args":"sql-sort --rows 512 --limit 16 --rounds 3","min_ms":0.305000,"median_ms":0.307000,"max_ms":0.328000},
+    {"bench_id":"sql_insert","args":"sql-insert --rows 128 --rounds 2","min_ms":2.533000,"median_ms":2.579000,"max_ms":2.626000},
+    {"bench_id":"sql_update","args":"sql-update --rows 512 --cutoff 64 --rounds 2","min_ms":3.590000,"median_ms":3.749000,"max_ms":3.908000},
+    {"bench_id":"sql_delete","args":"sql-delete --rows 512 --cutoff 64 --rounds 2","min_ms":2.626000,"median_ms":2.634000,"max_ms":2.642000},
+    {"bench_id":"sql_subquery","args":"sql-subquery --rows 256 --rounds 2 --query in","min_ms":0.459000,"median_ms":0.464000,"max_ms":0.468000},
+    {"bench_id":"sql_window","args":"sql-window --rows 512 --rounds 2 --query rank","min_ms":0.379000,"median_ms":0.411000,"max_ms":0.443000},
+    {"bench_id":"sql_join","args":"sql-join --rows 512 --rounds 2 --strategy auto","min_ms":0.461000,"median_ms":0.555000,"max_ms":0.649000},
+    {"bench_id":"pstore_scan","args":"pstore-scan --pages 64 --payload 1024 --rounds 3","min_ms":1.251000,"median_ms":1.333000,"max_ms":1.379000},
+    {"bench_id":"txn_put","args":"txn-put --txns 64 --keys-per-txn 4 --rounds 1","min_ms":207.536000,"median_ms":207.536000,"max_ms":207.536000},
+    {"bench_id":"pgwire_roundtrip","args":"pgwire --rows 128 --queries 32 --rounds 2","min_ms":0.152800,"median_ms":0.160300,"max_ms":0.167800},
+    {"bench_id":"ann_knn","args":"ann-knn --points 1024 --dims 8 --k 10 --rounds 3","min_ms":0.065000,"median_ms":0.068000,"max_ms":0.074000},
+    {"bench_id":"graph_reach","args":"graph-reach --nodes 256 --fanout 4 --hops 6 --rounds 3","min_ms":0.001000,"median_ms":0.001000,"max_ms":0.002000}
+  ]
+}
