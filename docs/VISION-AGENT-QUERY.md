@@ -104,7 +104,7 @@ q/kdb+ 的内核只有四样东西：**列式向量**、**动词（verb）**、*
 |---|---|---|
 | M8（本刀） | `tritvec` 内核：`TritVec` + K3 动词/归约 + `TritInt` 平衡三进制加减 | 真值表、打包往返、归一化、溢出 |
 | M9（已落地） | 查询级确定性等级：`certainty(expr)` 返回 `CERTAIN/CONTINGENT/IMPOSSIBLE`，普通查询也带答案等级 | 与 `UNDER REPAIR` 的答案对拍（同词汇、同枚举） |
-| M10 | 向量化扫描 + asof join + 三值列存块 | 吞吐基准与正确性对拍 |
+| M10（第一刀已落地） | 三值批量谓词 + asof join（`tritdb-exec::batch`）；SQL 向量化扫描与三值列存块待做 | 谓词对标量真值表对拍、asof 对暴力对拍 |
 
 ## 6. 明确不做的事
 

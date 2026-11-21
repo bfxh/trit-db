@@ -741,6 +741,10 @@ version = "0.0.1"
 [[package]]
 name = "tritdb-exec"
 version = "0.0.1"
+dependencies = [
+ "tritdb-testkit",
+ "tritdb-tritvec",
+]
 
 [[package]]
 name = "tritdb-format"
