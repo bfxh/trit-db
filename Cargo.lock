@@ -10,6 +10,7 @@ dependencies = [
  "tritdb-exec",
  "tritdb-format",
  "tritdb-page",
+ "tritdb-pgwire",
  "tritdb-radix",
  "tritdb-sql",
  "tritdb-store",
@@ -54,6 +55,14 @@ name = "tritdb-page"
 version = "0.0.1"
 dependencies = [
  "tritdb-testkit",
+]
+
+[[package]]
+name = "tritdb-pgwire"
+version = "0.0.1"
+dependencies = [
+ "tritdb-exec",
+ "tritdb-sql",
 ]
 
 [[package]]
