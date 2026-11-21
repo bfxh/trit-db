@@ -92,6 +92,7 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
     let mut engine = SqlEngine::open(db).map_err(|error| PgError::Sql(error.to_string()))?;
     let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
     let mut portals: BTreeMap<String, Bound> = BTreeMap::new();
+    let mut tx_status = TxStatus::Idle;
 
     loop {
         let Some((kind, payload)) = read_message(&mut stream)? else {
@@ -102,14 +103,14 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
                 let sql = String::from_utf8_lossy(&payload)
                     .trim_end_matches('\0')
                     .to_string();
-                handle_query(&mut stream, &mut engine, &sql)?;
+                handle_query(&mut stream, &mut engine, &sql, &mut tx_status)?;
             }
-            b'S' => write_message(&mut stream, b'Z', b"I")?,
+            b'S' => write_message(&mut stream, b'Z', &[tx_status.byte()])?,
             b'X' => return Ok(()),
             b'P' => parse_prepared(&mut stream, &mut prepared, &payload)?,
             b'B' => bind_portal(&mut stream, &prepared, &mut portals, &payload)?,
             b'D' => describe(&mut stream, &prepared, &portals, &payload)?,
-            b'E' => execute_portal(&mut stream, &mut engine, &portals, &payload)?,
+            b'E' => execute_portal(&mut stream, &mut engine, &portals, &payload, &mut tx_status)?,
             b'C' => close_portal(&mut stream, &mut prepared, &mut portals, &payload)?,
             b'H' => {}
             other => {
@@ -117,7 +118,7 @@ fn handle_connection(db: &Path, mut stream: TcpStream) -> Result<(), PgError> {
                     &mut stream,
                     &format!("unsupported message type {}", other as char),
                 )?;
-                write_message(&mut stream, b'Z', b"I")?;
+                write_message(&mut stream, b'Z', &[tx_status.byte()])?;
             }
         }
     }
@@ -187,13 +188,94 @@ fn write_parameter(stream: &mut TcpStream, key: &str, value: &str) -> Result<(),
     write_message(stream, b'S', &payload)
 }
 
-fn handle_query(stream: &mut TcpStream, engine: &mut SqlEngine, sql: &str) -> Result<(), PgError> {
+/// Connection-level transaction state used by `ReadyForQuery`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxStatus {
+    Idle,
+    InTransaction,
+    Failed,
+}
+
+impl TxStatus {
+    fn byte(self) -> u8 {
+        match self {
+            TxStatus::Idle => b'I',
+            TxStatus::InTransaction => b'T',
+            TxStatus::Failed => b'E',
+        }
+    }
+}
+
+enum TxCommand {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+fn transaction_command(sql: &str) -> Option<TxCommand> {
+    let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "begin" | "start transaction" => Some(TxCommand::Begin),
+        "commit" | "end" => Some(TxCommand::Commit),
+        "rollback" | "abort" => Some(TxCommand::Rollback),
+        _ => None,
+    }
+}
+
+fn handle_query(
+    stream: &mut TcpStream,
+    engine: &mut SqlEngine,
+    sql: &str,
+    tx_status: &mut TxStatus,
+) -> Result<(), PgError> {
     if sql.trim().is_empty() {
         write_message(stream, b'I', &[])?;
-    } else {
-        execute_and_write(stream, engine, sql)?;
+        write_message(stream, b'Z', &[tx_status.byte()])?;
+        return Ok(());
     }
-    write_message(stream, b'Z', b"I")?;
+    if let Some(command) = transaction_command(sql) {
+        match command {
+            TxCommand::Begin => {
+                if *tx_status == TxStatus::Failed {
+                    write_error(
+                        stream,
+                        "current transaction is aborted, commands ignored until end of transaction block",
+                    )?;
+                } else {
+                    *tx_status = TxStatus::InTransaction;
+                    write_message(stream, b'C', b"BEGIN\0")?;
+                }
+            }
+            TxCommand::Commit => {
+                if *tx_status == TxStatus::Failed {
+                    *tx_status = TxStatus::Idle;
+                    write_message(stream, b'C', b"ROLLBACK\0")?;
+                } else {
+                    *tx_status = TxStatus::Idle;
+                    write_message(stream, b'C', b"COMMIT\0")?;
+                }
+            }
+            TxCommand::Rollback => {
+                *tx_status = TxStatus::Idle;
+                write_message(stream, b'C', b"ROLLBACK\0")?;
+            }
+        }
+        write_message(stream, b'Z', &[tx_status.byte()])?;
+        return Ok(());
+    }
+    if *tx_status == TxStatus::Failed {
+        write_error(
+            stream,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )?;
+        write_message(stream, b'Z', &[tx_status.byte()])?;
+        return Ok(());
+    }
+    let success = execute_and_write(stream, engine, sql)?;
+    if !success && *tx_status == TxStatus::InTransaction {
+        *tx_status = TxStatus::Failed;
+    }
+    write_message(stream, b'Z', &[tx_status.byte()])?;
     Ok(())
 }
 
@@ -201,7 +283,7 @@ fn execute_and_write(
     stream: &mut TcpStream,
     engine: &mut SqlEngine,
     sql: &str,
-) -> Result<(), PgError> {
+) -> Result<bool, PgError> {
     match engine.execute_script(sql) {
         Ok(results) => {
             for result in results {
@@ -220,11 +302,11 @@ fn execute_and_write(
                     }
                 }
             }
-            Ok(())
+            Ok(true)
         }
         Err(error) => {
             write_error(stream, &error.to_string())?;
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -366,13 +448,25 @@ fn execute_portal(
     engine: &mut SqlEngine,
     portals: &BTreeMap<String, Bound>,
     payload: &[u8],
+    tx_status: &mut TxStatus,
 ) -> Result<(), PgError> {
     let (portal, cursor) = read_cstring(payload, 0)?;
     let _max_rows = read_i32(payload, cursor)?;
     let bound = portals
         .get(&portal)
         .ok_or_else(|| PgError::Protocol(format!("unknown portal {portal:?}")))?;
-    execute_and_write(stream, engine, &bound.sql)
+    if *tx_status == TxStatus::Failed {
+        write_error(
+            stream,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )?;
+        return Ok(());
+    }
+    let success = execute_and_write(stream, engine, &bound.sql)?;
+    if !success && *tx_status == TxStatus::InTransaction {
+        *tx_status = TxStatus::Failed;
+    }
+    Ok(())
 }
 
 fn close_portal(

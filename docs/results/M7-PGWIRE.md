@@ -1,6 +1,6 @@
 # M7 第一刀：最小 PostgreSQL wire protocol
 
-状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync 已实现；TLS、认证、事务状态未做
+状态：startup / simple Query / 扩展查询（Parse/Bind/Describe/Execute/Close）/ Terminate / Sync / 事务状态映射已实现；TLS、认证未做
 
 日期：2026-11-21
 
@@ -31,7 +31,7 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 - 扩展查询：`Parse`（SQL + 参数 OID）、`Bind`（`$n` → 字面量）、`Describe`（`ParameterDescription` + `NoData`）、`Execute`（复用 simple query 编码）、`Close`；`Sync` 回 `ReadyForQuery`。
 - `Terminate`（`X`）断开。
 - 空查询 → `EmptyQueryResponse`；SQL 错误 → `ErrorResponse` + `ReadyForQuery`。
-- `Parse` / `Bind` / `Describe` / `Execute` / `Close` → `ErrorResponse`（提示用 simple query）。
+- 事务状态：`BEGIN`/`START TRANSACTION` → `ReadyForQuery('T')`；语句失败 → `'E'`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝；`COMMIT`/`ROLLBACK` → `'I'`。
 
 ## 4. 类型与命令标签
 
@@ -42,17 +42,16 @@ psql "host=127.0.0.1 port=5432 dbname=sql" -c "SELECT id, name FROM t;"
 ## 5. 验收
 
 ```bash
-cargo test -p tritdb --test pgwire   # 2 passed
+cargo test -p tritdb --test pgwire   # 3 passed
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`。
+端到端测试：simple query 的 startup → `CREATE TABLE` / `INSERT` → `SELECT` → 错误查询 → `Terminate`；扩展查询的 `Parse`/`Bind`/`Describe`/`Execute`/`Sync` → 参数 `$1` 替换 → `SELECT 2`；事务状态 `BEGIN`('T') → 错误('E') → `ROLLBACK`('I')。
 
 ## 6. 还没做
 
 - **TLS**：`SSLRequest` 直接拒绝；
 - **认证**：无密码，任何能连上端口的客户端都可读写；
-- **事务状态**：`BEGIN`/`COMMIT` 未映射，`ReadyForQuery` 始终 `I`；
 - **并发连接**：串行 accept，每连接独立引擎。

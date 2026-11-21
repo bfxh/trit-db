@@ -19,6 +19,7 @@
    - `Terminate`（`X`）断开；`Sync`（`S`）返回 `ReadyForQuery`。
    - 扩展查询：`Parse` 保存 SQL 与参数 OID；`Bind` 把 `$n` 替换为字面量（按 OID 区分 int/bool/text）；`Describe` 返回 `ParameterDescription` + `NoData`；`Execute` 复用 simple query 的结果编码；`Close` 删除 prepared/portal。
    - `Sync` 返回 `ReadyForQuery`，`Flush` 是 no-op。
+   - 事务状态：连接级 `TxStatus`（Idle / InTransaction / Failed）；`BEGIN`/`START TRANSACTION` → `T`，语句失败 → `E`，`COMMIT`/`ROLLBACK` → `I`；`E` 状态下除 `ROLLBACK`/`COMMIT` 外直接拒绝。
    - 空查询返回 `EmptyQueryResponse`。
 3. **类型与格式**
    - 所有列统一声明为 `TEXT`（oid 25）、文本格式；值编码：`INT` 十进制、`TEXT` 原文、`BOOL` → `t`/`f`、`Logic` → `TRUE/FALSE/BOTH/NEITHER`、`Ł` → `0.000`、`ℕ` 十进制、`NULL` → -1 长度。
@@ -38,7 +39,7 @@
 - **无认证**：任何能连上端口的客户端都可读写。
 - **串行 + 每连接独立引擎**：同一时刻只有一个连接在处理；连接数多时排队。
 - 所有列都是 TEXT，客户端看到的类型信息不精确。
-- 事务控制（`BEGIN`/`COMMIT`）未映射到 pgwire 状态；`ReadyForQuery` 始终是 `I`。
+- **事务状态只是协议层**：`BEGIN`/`COMMIT`/`ROLLBACK` 不改变引擎的单语句提交模型，不会把多条语句合成一个原子事务；`E` 状态只是拒绝后续语句。
 
 ## 验收
 
