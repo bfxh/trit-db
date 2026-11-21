@@ -10,6 +10,11 @@ description = "Minimal PostgreSQL wire protocol server for trit-db"
 [dependencies]
 tritdb-exec.workspace = true
 tritdb-sql.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+rcgen = "0.13"
 
 [lints]
 workspace = true

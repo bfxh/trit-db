@@ -21,6 +21,8 @@ tritdb-wal.workspace = true
 
 [dev-dependencies]
 tritdb-testkit.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [lints]
 workspace = true

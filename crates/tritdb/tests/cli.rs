@@ -237,3 +237,46 @@ fn pstore_cli_alloc_get_put_dump_checkpoint() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("does not exist"));
 }
+
+#[test]
+fn serve_rejects_incomplete_auth_and_tls_flags() {
+    let dir = TempDir::new("cli-serve-flags");
+    let db = dir.join("sql.db");
+    let db = db.to_str().expect("path");
+
+    // `--auth password` needs a password source.
+    let output = run(["serve", "--db", db, "--auth", "password"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("requires --password"),
+        "stderr: {}",
+        stderr(&output)
+    );
+
+    // Unknown auth mode.
+    let output = run(["serve", "--db", db, "--auth", "md5"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("unknown --auth"),
+        "stderr: {}",
+        stderr(&output)
+    );
+
+    // TLS needs both halves of the key pair.
+    let output = run(["serve", "--db", db, "--tls-cert", "cert.pem"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("must be given together"),
+        "stderr: {}",
+        stderr(&output)
+    );
+
+    // `--require-tls` without a certificate is rejected.
+    let output = run(["serve", "--db", db, "--require-tls"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--require-tls needs"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
