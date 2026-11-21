@@ -180,8 +180,11 @@ pub struct ServerOptions {
     /// PEM CA bundle used to verify client certificates (mTLS).
     pub tls_client_ca: Option<PathBuf>,
     /// File of revoked client-certificate SHA-256 fingerprints, one hex digest
-    /// per line (`#` starts a comment).
+    /// per line (`#` starts a comment), or a PEM/DER X.509 CRL.
     pub tls_client_revoked: Option<PathBuf>,
+    /// DER-encoded OCSP response (pre-fetched) used to revoke client
+    /// certificates.
+    pub tls_client_ocsp: Option<PathBuf>,
     /// Reject clients that do not request TLS.
     pub require_tls: bool,
     /// Permit cleartext password authentication over a plaintext connection.
@@ -440,7 +443,8 @@ fn authenticate(
 #[derive(Debug)]
 struct RevocationVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
-    revoked: Vec<[u8; 32]>,
+    fingerprints: Vec<[u8; 32]>,
+    serials: Vec<Vec<u8>>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
@@ -463,11 +467,20 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         let fingerprint = tritdb_cas::sha256(end_entity.as_ref());
-        if self
-            .revoked
+        let revoked = self
+            .fingerprints
             .iter()
             .any(|revoked| constant_time_eq(revoked, &fingerprint))
-        {
+            || (!self.serials.is_empty()
+                && x509_parser::parse_x509_certificate(end_entity.as_ref())
+                    .map(|(_, certificate)| {
+                        let serial = certificate.raw_serial();
+                        self.serials
+                            .iter()
+                            .any(|revoked| revoked.as_slice() == serial)
+                    })
+                    .unwrap_or(false));
+        if revoked {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::Revoked,
             ));
@@ -499,10 +512,135 @@ impl rustls::server::danger::ClientCertVerifier for RevocationVerifier {
     }
 }
 
-/// Parses a revocation list: one SHA-256 hex fingerprint per line,
-/// `#` starts a comment, `:`/`-`/spaces inside a fingerprint are ignored.
-fn load_revoked(path: &Path) -> Result<Vec<[u8; 32]>, PgError> {
-    let text = std::fs::read_to_string(path)?;
+/// Parses a pre-fetched OCSP response, verifies its signature, and returns
+/// the serial numbers the responder marked as revoked.
+fn load_ocsp(path: &Path, ca_der: Option<&[u8]>) -> Result<Vec<Vec<u8>>, PgError> {
+    use der::Decode;
+    let bytes = std::fs::read(path)?;
+    let response = x509_ocsp::OcspResponse::from_der(&bytes)
+        .map_err(|error| PgError::Protocol(format!("bad OCSP response: {error}")))?;
+    if !matches!(
+        response.response_status,
+        x509_ocsp::OcspResponseStatus::Successful
+    ) {
+        return Err(PgError::Protocol(format!(
+            "OCSP response status is {:?}",
+            response.response_status
+        )));
+    }
+    let Some(response_bytes) = response.response_bytes else {
+        return Err(PgError::Protocol(
+            "OCSP response has no responseBytes".to_string(),
+        ));
+    };
+    let basic = x509_ocsp::BasicOcspResponse::from_der(response_bytes.response.as_bytes())
+        .map_err(|error| PgError::Protocol(format!("bad OCSP basic response: {error}")))?;
+    verify_ocsp_signature(&basic, ca_der)?;
+    let mut revoked = Vec::new();
+    for single in &basic.tbs_response_data.responses {
+        if matches!(single.cert_status, x509_ocsp::CertStatus::Revoked(_)) {
+            revoked.push(single.cert_id.serial_number.as_bytes().to_vec());
+        }
+    }
+    Ok(revoked)
+}
+
+fn verify_ocsp_signature(
+    basic: &x509_ocsp::BasicOcspResponse,
+    ca_der: Option<&[u8]>,
+) -> Result<(), PgError> {
+    use der::Encode;
+    let signer_der = if let Some(certs) = &basic.certs {
+        let certificate = certs.first().ok_or_else(|| {
+            PgError::Protocol("OCSP response has no signer certificate".to_string())
+        })?;
+        certificate
+            .to_der()
+            .map_err(|error| PgError::Protocol(format!("OCSP signer encode: {error}")))?
+    } else if let Some(ca) = ca_der {
+        ca.to_vec()
+    } else {
+        return Err(PgError::Protocol(
+            "OCSP response has no signer certificate and --tls-client-ca is missing".to_string(),
+        ));
+    };
+    let (_, signer) = x509_parser::parse_x509_certificate(&signer_der)
+        .map_err(|error| PgError::Protocol(format!("bad OCSP signer: {error}")))?;
+    let signature_oid = basic.signature_algorithm.oid.to_string();
+    let algorithm_oid = <x509_parser::asn1_rs::Oid as std::str::FromStr>::from_str(&signature_oid)
+        .map_err(|error| PgError::Protocol(format!("bad OCSP signature OID: {error}")))?;
+    let signature = basic
+        .signature
+        .as_bytes()
+        .ok_or_else(|| PgError::Protocol("OCSP signature is not byte aligned".to_string()))?;
+    let signature_bits = x509_parser::asn1_rs::BitString::new(0, signature);
+    let algorithm = x509_parser::x509::AlgorithmIdentifier {
+        algorithm: algorithm_oid,
+        parameters: None,
+    };
+    let message = basic
+        .tbs_response_data
+        .to_der()
+        .map_err(|error| PgError::Protocol(format!("OCSP tbs encode: {error}")))?;
+    x509_parser::verify::verify_signature(
+        signer.public_key(),
+        &algorithm,
+        &signature_bits,
+        &message,
+    )
+    .map_err(|error| PgError::Protocol(format!("OCSP signature: {error}")))
+}
+
+/// Revocation data loaded from a fingerprint list, a CRL, or an OCSP
+/// response.
+#[derive(Default)]
+struct RevocationSource {
+    fingerprints: Vec<[u8; 32]>,
+    serials: Vec<Vec<u8>>,
+}
+
+/// Loads a revocation source: either a PEM/DER X.509 CRL or a list of
+/// SHA-256 fingerprints. CRL signatures are verified against the client CA.
+fn load_revocation(path: &Path, ca_der: Option<&[u8]>) -> Result<RevocationSource, PgError> {
+    let bytes = std::fs::read(path)?;
+    let crl_der = match std::str::from_utf8(&bytes) {
+        Ok(text) if text.contains("BEGIN X509 CRL") => {
+            let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes)
+                .map_err(|error| PgError::Protocol(format!("bad CRL PEM: {error}")))?;
+            pem.contents
+        }
+        Ok(text) => {
+            return Ok(RevocationSource {
+                fingerprints: parse_revoked_fingerprints(text)?,
+                serials: Vec::new(),
+            })
+        }
+        Err(_) => bytes,
+    };
+    let (_, crl) = x509_parser::parse_x509_crl(&crl_der)
+        .map_err(|error| PgError::Protocol(format!("bad CRL: {error}")))?;
+    let Some(ca_der) = ca_der else {
+        return Err(PgError::Protocol(
+            "CRL revocation needs --tls-client-ca to verify its signature".to_string(),
+        ));
+    };
+    let (_, ca) = x509_parser::parse_x509_certificate(ca_der)
+        .map_err(|error| PgError::Protocol(format!("bad client CA: {error}")))?;
+    crl.verify_signature(ca.public_key())
+        .map_err(|error| PgError::Protocol(format!("CRL signature: {error}")))?;
+    let serials = crl
+        .iter_revoked_certificates()
+        .map(|entry| entry.raw_serial().to_vec())
+        .collect();
+    Ok(RevocationSource {
+        fingerprints: Vec::new(),
+        serials,
+    })
+}
+
+/// Parses one SHA-256 hex fingerprint per line; `#` starts a comment,
+/// `:`/`-`/spaces inside a fingerprint are ignored.
+fn parse_revoked_fingerprints(text: &str) -> Result<Vec<[u8; 32]>, PgError> {
     let mut revoked = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -560,9 +698,9 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| PgError::Protocol(format!("bad client CA PEM: {error}")))?;
             let mut roots = rustls::RootCertStore::empty();
-            for cert in ca_certs {
+            for cert in &ca_certs {
                 roots
-                    .add(cert)
+                    .add(cert.clone())
                     .map_err(|error| PgError::Protocol(format!("client CA: {error}")))?;
             }
             let verifier_provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -572,13 +710,24 @@ fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>,
             )
             .build()
             .map_err(|error| PgError::Protocol(format!("client verifier: {error}")))?;
+            let mut revocation = match &options.tls_client_revoked {
+                Some(path) => load_revocation(path, ca_certs.first().map(|cert| cert.as_ref()))?,
+                None => RevocationSource::default(),
+            };
+            if let Some(path) = &options.tls_client_ocsp {
+                revocation
+                    .serials
+                    .extend(load_ocsp(path, ca_certs.first().map(|cert| cert.as_ref()))?);
+            }
             let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
-                match &options.tls_client_revoked {
-                    Some(path) => Arc::new(RevocationVerifier {
+                if revocation.fingerprints.is_empty() && revocation.serials.is_empty() {
+                    verifier
+                } else {
+                    Arc::new(RevocationVerifier {
                         inner: verifier,
-                        revoked: load_revoked(path)?,
-                    }),
-                    None => verifier,
+                        fingerprints: revocation.fingerprints,
+                        serials: revocation.serials,
+                    })
                 };
             builder.with_client_cert_verifier(verifier)
         }
@@ -923,15 +1072,24 @@ fn transaction_command(sql: &str) -> Option<TxCommand> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum CopyDirection {
     In,
     Out,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyFormat {
+    Text,
+    Csv,
+    Binary,
 }
 
 struct CopyPlan {
     table: String,
     columns: Option<Vec<String>>,
     direction: CopyDirection,
+    format: CopyFormat,
 }
 
 /// Recognises `COPY <table> [(<cols>)] FROM STDIN` / `TO STDOUT`.
@@ -942,11 +1100,19 @@ fn parse_copy(sql: &str) -> Option<CopyPlan> {
     }
     let rest = trimmed[4..].trim_start();
     let upper = rest.to_ascii_uppercase();
-    let (head, direction) = if let Some(at) = upper.rfind(" FROM STDIN") {
-        (&rest[..at], CopyDirection::In)
+    let (head, direction, tail) = if let Some(at) = upper.rfind(" FROM STDIN") {
+        (&rest[..at], CopyDirection::In, &rest[at..])
     } else {
         let at = upper.rfind(" TO STDOUT")?;
-        (&rest[..at], CopyDirection::Out)
+        (&rest[..at], CopyDirection::Out, &rest[at..])
+    };
+    let tail_upper = tail.to_ascii_uppercase();
+    let format = if tail_upper.contains("FORMAT CSV") {
+        CopyFormat::Csv
+    } else if tail_upper.contains("FORMAT BINARY") {
+        CopyFormat::Binary
+    } else {
+        CopyFormat::Text
     };
     let head = head.trim();
     let (table, columns) = match head.find('(') {
@@ -969,6 +1135,7 @@ fn parse_copy(sql: &str) -> Option<CopyPlan> {
         table,
         columns,
         direction,
+        format,
     })
 }
 
@@ -1015,10 +1182,14 @@ fn copy_escape(value: &str) -> String {
 }
 
 /// Builds a SQL literal for one COPY value, using the target column's type.
-fn copy_literal(value: &str, data_type: DataType) -> String {
-    if value == "\\N" {
-        return "NULL".to_string();
+fn copy_literal_value(value: Option<&str>, data_type: DataType) -> String {
+    match value {
+        None => "NULL".to_string(),
+        Some(text) => copy_literal(text, data_type),
     }
+}
+
+fn copy_literal(value: &str, data_type: DataType) -> String {
     let value = copy_unescape(value);
     match data_type {
         DataType::Int | DataType::Lukasiewicz | DataType::Nat => {
@@ -1065,10 +1236,500 @@ fn handle_copy(
         };
         types.push(*data_type);
     }
-    match plan.direction {
-        CopyDirection::In => copy_in(stream, engine, &plan.table, &columns, &types),
-        CopyDirection::Out => copy_out(stream, engine, &plan.table, &columns),
+    match (plan.direction, plan.format) {
+        (CopyDirection::In, CopyFormat::Text) => {
+            copy_in(stream, engine, &plan.table, &columns, &types)
+        }
+        (CopyDirection::In, CopyFormat::Csv) => {
+            copy_in_csv(stream, engine, &plan.table, &columns, &types)
+        }
+        (CopyDirection::In, CopyFormat::Binary) => {
+            copy_in_binary(stream, engine, &plan.table, &columns, &types)
+        }
+        (CopyDirection::Out, CopyFormat::Text) => copy_out(stream, engine, &plan.table, &columns),
+        (CopyDirection::Out, CopyFormat::Csv) => {
+            copy_out_csv(stream, engine, &plan.table, &columns)
+        }
+        (CopyDirection::Out, CopyFormat::Binary) => {
+            copy_out_binary(stream, engine, &plan.table, &columns, &types)
+        }
     }
+}
+
+/// Parses one CSV line into fields. An unquoted empty field is `NULL`.
+fn parse_csv_line(line: &str) -> Vec<Option<String>> {
+    let mut fields = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        let mut field = String::new();
+        let mut quoted = false;
+        if chars.peek() == Some(&'"') {
+            quoted = true;
+            chars.next();
+            while let Some(character) = chars.next() {
+                if character == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    field.push(character);
+                }
+            }
+            while matches!(chars.peek(), Some(' ') | Some('\t')) {
+                chars.next();
+            }
+        } else {
+            while let Some(&character) = chars.peek() {
+                if character == ',' {
+                    break;
+                }
+                field.push(character);
+                chars.next();
+            }
+        }
+        if quoted {
+            fields.push(Some(field));
+        } else if field.is_empty() {
+            fields.push(None);
+        } else {
+            fields.push(Some(field));
+        }
+        if chars.next() != Some(',') {
+            break;
+        }
+    }
+    fields
+}
+
+fn csv_field(value: Option<&str>) -> String {
+    match value {
+        None => String::new(),
+        Some(text) => {
+            if text.is_empty()
+                || text.contains(',')
+                || text.contains('"')
+                || text.contains('\n')
+                || text.contains('\r')
+            {
+                format!("\"{}\"", text.replace('"', "\"\""))
+            } else {
+                text.to_string()
+            }
+        }
+    }
+}
+
+fn copy_in_csv(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    table: &str,
+    columns: &[String],
+    types: &[DataType],
+) -> Result<bool, PgError> {
+    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    payload.push(0);
+    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for _ in columns {
+        payload.extend_from_slice(&0i16.to_be_bytes());
+    }
+    write_message(stream, b'G', &payload)?;
+
+    let mut inserted = 0usize;
+    let mut batch = String::new();
+    let mut batched = 0usize;
+    loop {
+        let Some((kind, payload)) = read_message(stream)? else {
+            return Err(PgError::Protocol(
+                "client disconnected during COPY".to_string(),
+            ));
+        };
+        match kind {
+            b'd' => {
+                let line = String::from_utf8_lossy(&payload);
+                let line = line.trim_end_matches(['\r', '\n']);
+                let values = parse_csv_line(line);
+                if values.len() != columns.len() {
+                    return copy_failed(
+                        stream,
+                        &format!(
+                            "COPY expected {} columns, got {}",
+                            columns.len(),
+                            values.len()
+                        ),
+                    );
+                }
+                if batched == 0 {
+                    batch.push_str(&format!(
+                        "INSERT INTO {table} ({}) VALUES ",
+                        columns.join(", ")
+                    ));
+                } else {
+                    batch.push(',');
+                }
+                batch.push('(');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        batch.push(',');
+                    }
+                    batch.push_str(&copy_literal_value(value.as_deref(), types[index]));
+                }
+                batch.push(')');
+                batched += 1;
+                if batched >= 1024 {
+                    batch.push(';');
+                    if let Err(error) = engine.execute_script(&batch) {
+                        return copy_failed(stream, &error.to_string());
+                    }
+                    inserted += batched;
+                    batch.clear();
+                    batched = 0;
+                }
+            }
+            b'c' => break,
+            b'f' => {
+                let message = String::from_utf8_lossy(&payload)
+                    .trim_end_matches('\0')
+                    .to_string();
+                return copy_failed(stream, &message);
+            }
+            other => {
+                return Err(PgError::Protocol(format!(
+                    "unexpected message {} during COPY",
+                    other as char
+                )));
+            }
+        }
+    }
+    if batched > 0 {
+        batch.push(';');
+        if let Err(error) = engine.execute_script(&batch) {
+            return copy_failed(stream, &error.to_string());
+        }
+        inserted += batched;
+    }
+    let tag = format!("COPY {inserted}\0");
+    write_message(stream, b'C', tag.as_bytes())?;
+    Ok(true)
+}
+
+fn copy_out_csv(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    table: &str,
+    columns: &[String],
+) -> Result<bool, PgError> {
+    let sql = format!("SELECT {} FROM {table};", columns.join(", "));
+    let results = match engine.execute_script(&sql) {
+        Ok(results) => results,
+        Err(error) => return copy_failed(stream, &error.to_string()),
+    };
+    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    payload.push(0);
+    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for _ in columns {
+        payload.extend_from_slice(&0i16.to_be_bytes());
+    }
+    write_message(stream, b'H', &payload)?;
+    let mut sent = 0usize;
+    for result in results {
+        if let QueryResult::Rows { rows, .. } = result {
+            for row in rows {
+                let mut line = String::new();
+                for (index, value) in row.iter().enumerate() {
+                    if index > 0 {
+                        line.push(',');
+                    }
+                    let text = if value.is_null() {
+                        None
+                    } else {
+                        Some(value_text(value))
+                    };
+                    line.push_str(&csv_field(text.as_deref()));
+                }
+                line.push('\n');
+                write_message(stream, b'd', line.as_bytes())?;
+                sent += 1;
+            }
+        }
+    }
+    write_message(stream, b'c', &[])?;
+    let tag = format!("COPY {sent}\0");
+    write_message(stream, b'C', tag.as_bytes())?;
+    Ok(true)
+}
+
+const COPY_BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+
+fn decode_copy_binary_value(bytes: &[u8], data_type: DataType) -> Result<String, PgError> {
+    match data_type {
+        DataType::Int | DataType::Nat => {
+            let value = match bytes.len() {
+                2 => i16::from_be_bytes([bytes[0], bytes[1]]) as i64,
+                4 => i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+                8 => i64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]),
+                _ => {
+                    return Err(PgError::Protocol(format!(
+                        "COPY binary integer has {} bytes",
+                        bytes.len()
+                    )))
+                }
+            };
+            Ok(value.to_string())
+        }
+        DataType::Bool => {
+            let [flag] = bytes else {
+                return Err(PgError::Protocol(
+                    "COPY binary bool must be 1 byte".to_string(),
+                ));
+            };
+            Ok(if *flag == 0 {
+                "f".to_string()
+            } else {
+                "t".to_string()
+            })
+        }
+        _ => Ok(String::from_utf8_lossy(bytes).to_string()),
+    }
+}
+
+fn encode_copy_binary_value(value: &Value, data_type: DataType) -> Vec<u8> {
+    match (data_type, value) {
+        (DataType::Int | DataType::Nat, Value::Int(number)) => number.to_be_bytes().to_vec(),
+        (DataType::Bool, Value::Bool(flag)) => vec![u8::from(*flag)],
+        _ => value_text(value).into_bytes(),
+    }
+}
+
+/// Pulls complete binary rows out of `buffer`, leaving a partial row behind.
+fn take_binary_rows(
+    buffer: &mut Vec<u8>,
+    header_done: &mut bool,
+    types: &[DataType],
+) -> Result<Vec<Vec<Option<String>>>, PgError> {
+    let mut rows = Vec::new();
+    loop {
+        if !*header_done {
+            if buffer.len() < 19 {
+                break;
+            }
+            if &buffer[..11] != COPY_BINARY_SIGNATURE {
+                return Err(PgError::Protocol("bad COPY binary signature".to_string()));
+            }
+            let extension = i32::from_be_bytes([buffer[15], buffer[16], buffer[17], buffer[18]]);
+            if extension < 0 {
+                return Err(PgError::Protocol(
+                    "bad COPY binary extension length".to_string(),
+                ));
+            }
+            let total = 19 + extension as usize;
+            if buffer.len() < total {
+                break;
+            }
+            buffer.drain(..total);
+            *header_done = true;
+            continue;
+        }
+        if buffer.len() < 2 {
+            break;
+        }
+        let count = i16::from_be_bytes([buffer[0], buffer[1]]);
+        if count == -1 {
+            buffer.drain(..2);
+            break;
+        }
+        if count < 0 {
+            return Err(PgError::Protocol(format!(
+                "bad COPY binary field count {count}"
+            )));
+        }
+        let count = count as usize;
+        if count != types.len() {
+            return Err(PgError::Protocol(format!(
+                "COPY binary row has {count} fields, expected {}",
+                types.len()
+            )));
+        }
+        let mut cursor = 2;
+        let mut values = Vec::with_capacity(count);
+        let mut complete = true;
+        for data_type in types {
+            if buffer.len() < cursor + 4 {
+                complete = false;
+                break;
+            }
+            let length = i32::from_be_bytes([
+                buffer[cursor],
+                buffer[cursor + 1],
+                buffer[cursor + 2],
+                buffer[cursor + 3],
+            ]);
+            cursor += 4;
+            if length < 0 {
+                values.push(None);
+                continue;
+            }
+            let length = length as usize;
+            if buffer.len() < cursor + length {
+                complete = false;
+                break;
+            }
+            let bytes = &buffer[cursor..cursor + length];
+            values.push(Some(decode_copy_binary_value(bytes, *data_type)?));
+            cursor += length;
+        }
+        if !complete {
+            break;
+        }
+        buffer.drain(..cursor);
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
+fn copy_in_binary(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    table: &str,
+    columns: &[String],
+    types: &[DataType],
+) -> Result<bool, PgError> {
+    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    payload.push(1);
+    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for _ in columns {
+        payload.extend_from_slice(&1i16.to_be_bytes());
+    }
+    write_message(stream, b'G', &payload)?;
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut header_done = false;
+    let mut inserted = 0usize;
+    let mut batch = String::new();
+    let mut batched = 0usize;
+
+    loop {
+        let Some((kind, payload)) = read_message(stream)? else {
+            return Err(PgError::Protocol(
+                "client disconnected during COPY".to_string(),
+            ));
+        };
+        match kind {
+            b'd' => buffer.extend_from_slice(&payload),
+            b'c' => {}
+            b'f' => {
+                let message = String::from_utf8_lossy(&payload)
+                    .trim_end_matches('\0')
+                    .to_string();
+                return copy_failed(stream, &message);
+            }
+            other => {
+                return Err(PgError::Protocol(format!(
+                    "unexpected message {} during COPY",
+                    other as char
+                )));
+            }
+        }
+        let rows = take_binary_rows(&mut buffer, &mut header_done, types)?;
+        for values in rows {
+            if batched == 0 {
+                batch.push_str(&format!(
+                    "INSERT INTO {table} ({}) VALUES ",
+                    columns.join(", ")
+                ));
+            } else {
+                batch.push(',');
+            }
+            batch.push('(');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    batch.push(',');
+                }
+                batch.push_str(&copy_literal_value(value.as_deref(), types[index]));
+            }
+            batch.push(')');
+            batched += 1;
+            if batched >= 1024 {
+                batch.push(';');
+                if let Err(error) = engine.execute_script(&batch) {
+                    return copy_failed(stream, &error.to_string());
+                }
+                inserted += batched;
+                batch.clear();
+                batched = 0;
+            }
+        }
+        if kind == b'c' {
+            break;
+        }
+    }
+    if batched > 0 {
+        batch.push(';');
+        if let Err(error) = engine.execute_script(&batch) {
+            return copy_failed(stream, &error.to_string());
+        }
+        inserted += batched;
+    }
+    let tag = format!("COPY {inserted}\0");
+    write_message(stream, b'C', tag.as_bytes())?;
+    Ok(true)
+}
+
+fn copy_out_binary(
+    stream: &mut dyn ReadWrite,
+    engine: &mut SqlEngine,
+    table: &str,
+    columns: &[String],
+    types: &[DataType],
+) -> Result<bool, PgError> {
+    let sql = format!("SELECT {} FROM {table};", columns.join(", "));
+    let results = match engine.execute_script(&sql) {
+        Ok(results) => results,
+        Err(error) => return copy_failed(stream, &error.to_string()),
+    };
+    let mut payload = Vec::with_capacity(3 + columns.len() * 2);
+    payload.push(1);
+    payload.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for _ in columns {
+        payload.extend_from_slice(&1i16.to_be_bytes());
+    }
+    write_message(stream, b'H', &payload)?;
+
+    let mut header = Vec::with_capacity(19);
+    header.extend_from_slice(COPY_BINARY_SIGNATURE);
+    header.extend_from_slice(&0i32.to_be_bytes());
+    header.extend_from_slice(&0i32.to_be_bytes());
+    write_message(stream, b'd', &header)?;
+
+    let mut sent = 0usize;
+    for result in results {
+        if let QueryResult::Rows { rows, .. } = result {
+            for row in rows {
+                let mut message = Vec::new();
+                message.extend_from_slice(&(row.len() as i16).to_be_bytes());
+                for (index, value) in row.iter().enumerate() {
+                    if value.is_null() {
+                        message.extend_from_slice(&(-1i32).to_be_bytes());
+                        continue;
+                    }
+                    let bytes = encode_copy_binary_value(value, types[index]);
+                    message.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    message.extend_from_slice(&bytes);
+                }
+                write_message(stream, b'd', &message)?;
+                sent += 1;
+            }
+        }
+    }
+    write_message(stream, b'd', &(-1i16).to_be_bytes())?;
+    write_message(stream, b'c', &[])?;
+    let tag = format!("COPY {sent}\0");
+    write_message(stream, b'C', tag.as_bytes())?;
+    Ok(true)
 }
 
 fn copy_in(
@@ -1123,7 +1784,11 @@ fn copy_in(
                     if index > 0 {
                         batch.push(',');
                     }
-                    batch.push_str(&copy_literal(value, types[index]));
+                    if *value == "\\N" {
+                        batch.push_str("NULL");
+                    } else {
+                        batch.push_str(&copy_literal(value, types[index]));
+                    }
                 }
                 batch.push(')');
                 batched += 1;
@@ -1370,26 +2035,46 @@ fn bind_portal(
     let (portal, cursor) = read_cstring(payload, 0)?;
     let (statement, mut cursor) = read_cstring(payload, cursor)?;
     let format_count = read_i16(payload, cursor)?;
-    cursor += 2 + format_count.max(0) as usize * 2;
+    cursor += 2;
+    let mut param_formats = Vec::with_capacity(format_count.max(0) as usize);
+    for _ in 0..format_count.max(0) {
+        param_formats.push(read_i16(payload, cursor)?);
+        cursor += 2;
+    }
     let param_count = read_i16(payload, cursor)?;
     cursor += 2;
     let prepared = prepared
         .get(&statement)
         .ok_or_else(|| PgError::Protocol(format!("unknown prepared statement {statement:?}")))?;
     let mut params = Vec::with_capacity(param_count.max(0) as usize);
-    for _ in 0..param_count.max(0) {
+    for index in 0..param_count.max(0) {
         let length = read_i32(payload, cursor)?;
         cursor += 4;
         if length < 0 {
             params.push(None);
-        } else {
-            let length = length as usize;
-            let value = payload
-                .get(cursor..cursor + length)
-                .ok_or_else(|| PgError::Protocol("truncated parameter".to_string()))?;
-            params.push(Some(String::from_utf8_lossy(value).to_string()));
-            cursor += length;
+            continue;
         }
+        let length = length as usize;
+        let value = payload
+            .get(cursor..cursor + length)
+            .ok_or_else(|| PgError::Protocol("truncated parameter".to_string()))?;
+        cursor += length;
+        let format = match param_formats.len() {
+            0 => 0,
+            1 => param_formats[0],
+            _ => param_formats.get(index as usize).copied().unwrap_or(0),
+        };
+        let oid = prepared
+            .param_types
+            .get(index as usize)
+            .copied()
+            .unwrap_or(0);
+        let text = if format == 1 {
+            decode_binary_param(value, oid)?
+        } else {
+            String::from_utf8_lossy(value).to_string()
+        };
+        params.push(Some(text));
     }
     let sql = substitute_params(&prepared.sql, &prepared.param_types, &params)?;
     let result_format_count = read_i16(payload, cursor)?;
@@ -1574,6 +2259,56 @@ fn close_portal(
         }
     }
     write_message(stream, b'3', &[])
+}
+
+/// Decodes a binary-format parameter into the text form the SQL layer uses.
+fn decode_binary_param(bytes: &[u8], oid: i32) -> Result<String, PgError> {
+    match oid {
+        16 => {
+            let [flag] = bytes else {
+                return Err(PgError::Protocol(
+                    "binary bool parameter must be 1 byte".to_string(),
+                ));
+            };
+            Ok(if *flag == 0 {
+                "f".to_string()
+            } else {
+                "t".to_string()
+            })
+        }
+        20 | 21 | 23 => {
+            let value = match bytes.len() {
+                2 => i16::from_be_bytes([bytes[0], bytes[1]]) as i64,
+                4 => i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+                8 => i64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]),
+                _ => {
+                    return Err(PgError::Protocol(format!(
+                        "binary integer parameter has {} bytes",
+                        bytes.len()
+                    )))
+                }
+            };
+            Ok(value.to_string())
+        }
+        700 => {
+            let value: [u8; 4] = bytes.try_into().map_err(|_| {
+                PgError::Protocol("binary float4 parameter must be 4 bytes".to_string())
+            })?;
+            Ok(f32::from_be_bytes(value).to_string())
+        }
+        701 => {
+            let value: [u8; 8] = bytes.try_into().map_err(|_| {
+                PgError::Protocol("binary float8 parameter must be 8 bytes".to_string())
+            })?;
+            Ok(f64::from_be_bytes(value).to_string())
+        }
+        25 | 1043 | 0 => Ok(String::from_utf8_lossy(bytes).to_string()),
+        other => Err(PgError::Protocol(format!(
+            "unsupported binary parameter type oid {other}"
+        ))),
+    }
 }
 
 fn substitute_params(
