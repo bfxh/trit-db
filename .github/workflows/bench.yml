@@ -27,5 +27,5 @@ jobs:
       # Regenerate every table/chart/badge from the committed baseline and run
       # history. If the result differs from what is checked in, the PR forgot
       # to run `python tools/bench/dashboard.py`.
-      - run: python tools/bench/dashboard.py
+      - run: python tools/bench/dashboard.py --aggregate 5
       - run: git diff --exit-code -- docs/results README.md

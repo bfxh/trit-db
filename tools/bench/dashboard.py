@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aggregate",
         type=int,
-        default=3,
-        help="how many runs of the newest commit to aggregate (median of medians, default 3)",
+        default=5,
+        help="how many runs of the newest commit to aggregate (median of medians, default 5)",
     )
     return parser.parse_args()
 
