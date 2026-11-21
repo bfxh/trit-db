@@ -52,11 +52,144 @@ impl From<std::io::Error> for PgError {
     }
 }
 
+/// Byte stream the protocol runs on: a plain `TcpStream` or a TLS stream.
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// How the server authenticates clients.
+#[derive(Clone, Debug, Default)]
+pub enum AuthMode {
+    /// Accept any client without a password (development default).
+    #[default]
+    Trust,
+    /// Ask for a cleartext password and compare it with this value.
+    Password(String),
+}
+
+/// Server-side options. `Default` is trust auth with plain text connections,
+/// matching the original behaviour.
+#[derive(Clone, Debug, Default)]
+pub struct ServerOptions {
+    /// Authentication mode.
+    pub auth: AuthMode,
+    /// PEM certificate chain; requires `tls_key` to enable TLS.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key; requires `tls_cert` to enable TLS.
+    pub tls_key: Option<PathBuf>,
+    /// Reject clients that do not request TLS.
+    pub require_tls: bool,
+}
+
+impl ServerOptions {
+    /// True when both halves of a TLS key pair are configured.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
+    }
+}
+
+/// What the client sent before the startup packet was accepted.
+enum Startup {
+    /// The client disconnected cleanly.
+    Closed,
+    /// A plain protocol-v3 startup packet.
+    Plain,
+    /// The client asked to negotiate TLS first.
+    SslRequest,
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Runs the authentication exchange configured on the server.
+fn authenticate(stream: &mut dyn ReadWrite, auth: &AuthMode) -> Result<(), PgError> {
+    match auth {
+        AuthMode::Trust => write_message(stream, b'R', &0i32.to_be_bytes()),
+        AuthMode::Password(expected) => {
+            // AuthenticationCleartextPassword (code 3).
+            write_message(stream, b'R', &3i32.to_be_bytes())?;
+            let Some((kind, payload)) = read_message(stream)? else {
+                return Err(PgError::Protocol(
+                    "client closed the connection during authentication".to_string(),
+                ));
+            };
+            if kind != b'p' {
+                write_error(stream, "expected a PasswordMessage")?;
+                return Err(PgError::Protocol(format!(
+                    "expected PasswordMessage, got {}",
+                    kind as char
+                )));
+            }
+            let supplied = String::from_utf8_lossy(&payload)
+                .trim_end_matches('\0')
+                .to_string();
+            if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+                write_message(stream, b'R', &0i32.to_be_bytes())
+            } else {
+                write_error(stream, "password authentication failed")?;
+                Err(PgError::Protocol(
+                    "password authentication failed".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+fn load_tls_config(options: &ServerOptions) -> Result<Arc<rustls::ServerConfig>, PgError> {
+    let (Some(cert_path), Some(key_path)) = (&options.tls_cert, &options.tls_key) else {
+        return Err(PgError::Protocol(
+            "TLS needs both tls_cert and tls_key".to_string(),
+        ));
+    };
+    let cert_bytes = std::fs::read(cert_path)?;
+    let key_bytes = std::fs::read(key_path)?;
+    let certs = rustls_pemfile::certs(&mut cert_bytes.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| PgError::Protocol(format!("bad certificate PEM: {error}")))?;
+    if certs.is_empty() {
+        return Err(PgError::Protocol(
+            "certificate file contains no certificates".to_string(),
+        ));
+    }
+    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())
+        .map_err(|error| PgError::Protocol(format!("bad private key PEM: {error}")))?
+        .ok_or_else(|| PgError::Protocol("private key file contains no key".to_string()))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| PgError::Protocol(format!("TLS versions: {error}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| PgError::Protocol(format!("TLS certificate: {error}")))?;
+    Ok(Arc::new(config))
+}
+
 /// Serves connections until the listener is closed or fails.
 ///
 /// Connections are accepted and handled serially; each one opens its own
 /// [`SqlEngine`] on `db`.
 pub fn serve(db: PathBuf, listener: TcpListener) -> Result<(), PgError> {
+    serve_with_options(db, listener, Arc::new(ServerOptions::default()))
+}
+
+/// Serves connections with explicit authentication and TLS options.
+pub fn serve_with_options(
+    db: PathBuf,
+    listener: TcpListener,
+    options: Arc<ServerOptions>,
+) -> Result<(), PgError> {
+    let tls = if options.tls_enabled() {
+        Some(load_tls_config(&options)?)
+    } else {
+        None
+    };
     let engine = Arc::new(Mutex::new(
         SqlEngine::open(&db).map_err(|error| PgError::Sql(error.to_string()))?,
     ));
@@ -69,8 +202,10 @@ pub fn serve(db: PathBuf, listener: TcpListener) -> Result<(), PgError> {
             }
         };
         let engine = Arc::clone(&engine);
+        let options = Arc::clone(&options);
+        let tls = tls.clone();
         std::thread::spawn(move || {
-            if let Err(error) = handle_connection(engine, stream) {
+            if let Err(error) = handle_connection(engine, stream, options, tls) {
                 eprintln!("pgwire: {error}");
             }
         });
@@ -84,35 +219,84 @@ fn lock_engine(engine: &Arc<Mutex<SqlEngine>>) -> std::sync::MutexGuard<'_, SqlE
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn handle_connection(engine: Arc<Mutex<SqlEngine>>, mut stream: TcpStream) -> Result<(), PgError> {
+fn handle_connection(
+    engine: Arc<Mutex<SqlEngine>>,
+    mut stream: TcpStream,
+    options: Arc<ServerOptions>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), PgError> {
     // Postgres-style clients send one small message per round trip; leaving
     // Nagle on makes every response wait for the peer's delayed ACK (~40 ms on
     // Linux). Disable it per connection.
     stream.set_nodelay(true)?;
-    if !read_startup(&mut stream)? {
-        return Ok(());
-    }
 
-    // AuthenticationOk
-    write_message(&mut stream, b'R', &0i32.to_be_bytes())?;
+    let mut conn: Box<dyn ReadWrite> = match read_startup(&mut stream)? {
+        Startup::Closed => return Ok(()),
+        Startup::Plain => {
+            if options.require_tls {
+                write_error(&mut stream, "TLS is required by this server")?;
+                return Err(PgError::Protocol("TLS is required".to_string()));
+            }
+            Box::new(stream)
+        }
+        Startup::SslRequest => match tls.as_ref() {
+            Some(config) => {
+                stream.write_all(b"S")?;
+                let server = rustls::ServerConnection::new(Arc::clone(config))
+                    .map_err(|error| PgError::Protocol(format!("TLS handshake: {error}")))?;
+                let mut tls_stream = rustls::StreamOwned::new(server, stream);
+                match read_startup(&mut tls_stream)? {
+                    Startup::Plain => {}
+                    Startup::Closed => return Ok(()),
+                    Startup::SslRequest => {
+                        return Err(PgError::Protocol(
+                            "client repeated SSLRequest inside TLS".to_string(),
+                        ))
+                    }
+                }
+                Box::new(tls_stream)
+            }
+            None => {
+                stream.write_all(b"N")?;
+                match read_startup(&mut stream)? {
+                    Startup::Plain => {
+                        if options.require_tls {
+                            write_error(&mut stream, "TLS is required by this server")?;
+                            return Err(PgError::Protocol("TLS is required".to_string()));
+                        }
+                        Box::new(stream)
+                    }
+                    Startup::Closed => return Ok(()),
+                    Startup::SslRequest => {
+                        return Err(PgError::Protocol(
+                            "client repeated SSLRequest after it was refused".to_string(),
+                        ))
+                    }
+                }
+            }
+        },
+    };
+
+    let stream: &mut dyn ReadWrite = conn.as_mut();
+    authenticate(stream, &options.auth)?;
     // A few ParameterStatus values that clients expect.
-    write_parameter(&mut stream, "server_version", "14.0")?;
-    write_parameter(&mut stream, "server_encoding", "UTF8")?;
-    write_parameter(&mut stream, "client_encoding", "UTF8")?;
-    write_parameter(&mut stream, "DateStyle", "ISO, MDY")?;
+    write_parameter(stream, "server_version", "14.0")?;
+    write_parameter(stream, "server_encoding", "UTF8")?;
+    write_parameter(stream, "client_encoding", "UTF8")?;
+    write_parameter(stream, "DateStyle", "ISO, MDY")?;
     // BackendKeyData
     let mut key = Vec::with_capacity(8);
     key.extend_from_slice(&1i32.to_be_bytes());
     key.extend_from_slice(&0i32.to_be_bytes());
-    write_message(&mut stream, b'K', &key)?;
-    write_message(&mut stream, b'Z', b"I")?;
+    write_message(stream, b'K', &key)?;
+    write_message(stream, b'Z', b"I")?;
 
     let mut prepared: BTreeMap<String, Prepared> = BTreeMap::new();
     let mut portals: BTreeMap<String, Bound> = BTreeMap::new();
     let mut tx_status = TxStatus::Idle;
 
     loop {
-        let Some((kind, payload)) = read_message(&mut stream)? else {
+        let Some((kind, payload)) = read_message(stream)? else {
             return Ok(());
         };
         match kind {
@@ -121,28 +305,28 @@ fn handle_connection(engine: Arc<Mutex<SqlEngine>>, mut stream: TcpStream) -> Re
                     .trim_end_matches('\0')
                     .to_string();
                 let mut guard = lock_engine(&engine);
-                handle_query(&mut stream, &mut guard, &sql, &mut tx_status)?;
+                handle_query(stream, &mut guard, &sql, &mut tx_status)?;
             }
-            b'S' => write_message(&mut stream, b'Z', &[tx_status.byte()])?,
+            b'S' => write_message(stream, b'Z', &[tx_status.byte()])?,
             b'X' => return Ok(()),
-            b'P' => parse_prepared(&mut stream, &mut prepared, &payload)?,
-            b'B' => bind_portal(&mut stream, &prepared, &mut portals, &payload)?,
+            b'P' => parse_prepared(stream, &mut prepared, &payload)?,
+            b'B' => bind_portal(stream, &prepared, &mut portals, &payload)?,
             b'D' => {
                 let mut guard = lock_engine(&engine);
-                describe(&mut stream, &mut guard, &prepared, &portals, &payload)?;
+                describe(stream, &mut guard, &prepared, &portals, &payload)?;
             }
             b'E' => {
                 let mut guard = lock_engine(&engine);
-                execute_portal(&mut stream, &mut guard, &portals, &payload, &mut tx_status)?;
+                execute_portal(stream, &mut guard, &portals, &payload, &mut tx_status)?;
             }
-            b'C' => close_portal(&mut stream, &mut prepared, &mut portals, &payload)?,
+            b'C' => close_portal(stream, &mut prepared, &mut portals, &payload)?,
             b'H' => {}
             other => {
                 write_error(
-                    &mut stream,
+                    stream,
                     &format!("unsupported message type {}", other as char),
                 )?;
-                write_message(&mut stream, b'Z', &[tx_status.byte()])?;
+                write_message(stream, b'Z', &[tx_status.byte()])?;
             }
         }
     }
@@ -150,36 +334,32 @@ fn handle_connection(engine: Arc<Mutex<SqlEngine>>, mut stream: TcpStream) -> Re
 
 /// Reads the startup message (handling `SSLRequest`), returning `false` when
 /// the client disconnected cleanly.
-fn read_startup(stream: &mut TcpStream) -> Result<bool, PgError> {
-    loop {
-        let mut length = [0u8; 4];
-        if stream.read_exact(&mut length).is_err() {
-            return Ok(false);
-        }
-        let length = i32::from_be_bytes(length);
-        if !(8..=1_000_000).contains(&length) {
-            return Err(PgError::Protocol(format!("bad startup length {length}")));
-        }
-        let mut body = vec![0u8; (length - 4) as usize];
-        stream.read_exact(&mut body)?;
-        let protocol = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-        if protocol == SSL_REQUEST {
-            // Refuse TLS; the client retries with a plain startup message.
-            stream.write_all(b"N")?;
-            continue;
-        }
-        if protocol != PROTOCOL_V3 {
-            return Err(PgError::Protocol(format!(
-                "unsupported protocol version {protocol}"
-            )));
-        }
-        // The rest is key\0value\0...\0; we accept and ignore parameters.
-        return Ok(true);
+fn read_startup(stream: &mut dyn ReadWrite) -> Result<Startup, PgError> {
+    let mut length = [0u8; 4];
+    if stream.read_exact(&mut length).is_err() {
+        return Ok(Startup::Closed);
     }
+    let length = i32::from_be_bytes(length);
+    if !(8..=1_000_000).contains(&length) {
+        return Err(PgError::Protocol(format!("bad startup length {length}")));
+    }
+    let mut body = vec![0u8; (length - 4) as usize];
+    stream.read_exact(&mut body)?;
+    let protocol = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if protocol == SSL_REQUEST {
+        return Ok(Startup::SslRequest);
+    }
+    if protocol != PROTOCOL_V3 {
+        return Err(PgError::Protocol(format!(
+            "unsupported protocol version {protocol}"
+        )));
+    }
+    // The rest is key\0value\0...\0; we accept and ignore parameters.
+    Ok(Startup::Plain)
 }
 
 /// Reads one backend message, returning `None` on clean EOF.
-fn read_message(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, PgError> {
+fn read_message(stream: &mut dyn ReadWrite) -> Result<Option<(u8, Vec<u8>)>, PgError> {
     let mut kind = [0u8; 1];
     if stream.read_exact(&mut kind).is_err() {
         return Ok(None);
@@ -195,7 +375,7 @@ fn read_message(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, PgError
     Ok(Some((kind[0], payload)))
 }
 
-fn write_message(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> Result<(), PgError> {
+fn write_message(stream: &mut dyn ReadWrite, kind: u8, payload: &[u8]) -> Result<(), PgError> {
     let length = (payload.len() as i32) + 4;
     stream.write_all(&[kind])?;
     stream.write_all(&length.to_be_bytes())?;
@@ -203,7 +383,7 @@ fn write_message(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> Result<(),
     Ok(())
 }
 
-fn write_parameter(stream: &mut TcpStream, key: &str, value: &str) -> Result<(), PgError> {
+fn write_parameter(stream: &mut dyn ReadWrite, key: &str, value: &str) -> Result<(), PgError> {
     let mut payload = Vec::with_capacity(key.len() + value.len() + 2);
     payload.extend_from_slice(key.as_bytes());
     payload.push(0);
@@ -247,7 +427,7 @@ fn transaction_command(sql: &str) -> Option<TxCommand> {
 }
 
 fn handle_query(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
     sql: &str,
     tx_status: &mut TxStatus,
@@ -304,7 +484,7 @@ fn handle_query(
 }
 
 fn execute_and_write(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
     sql: &str,
 ) -> Result<bool, PgError> {
@@ -376,7 +556,7 @@ fn read_i32(payload: &[u8], offset: usize) -> Result<i32, PgError> {
 }
 
 fn parse_prepared(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     prepared: &mut BTreeMap<String, Prepared>,
     payload: &[u8],
 ) -> Result<(), PgError> {
@@ -394,7 +574,7 @@ fn parse_prepared(
 }
 
 fn bind_portal(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     prepared: &BTreeMap<String, Prepared>,
     portals: &mut BTreeMap<String, Bound>,
     payload: &[u8],
@@ -429,7 +609,7 @@ fn bind_portal(
 }
 
 fn describe(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
     prepared: &BTreeMap<String, Prepared>,
     portals: &BTreeMap<String, Bound>,
@@ -472,7 +652,7 @@ fn describe(
 /// Writes a `RowDescription` when the statement is a `SELECT`; otherwise
 /// `NoData`.
 fn describe_result(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
     sql: &str,
     param_types: &[i32],
@@ -541,7 +721,7 @@ fn column_oids(rows: &[Vec<Value>], column_count: usize) -> Vec<i32> {
 }
 
 fn execute_portal(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     engine: &mut SqlEngine,
     portals: &BTreeMap<String, Bound>,
     payload: &[u8],
@@ -567,7 +747,7 @@ fn execute_portal(
 }
 
 fn close_portal(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     prepared: &mut BTreeMap<String, Prepared>,
     portals: &mut BTreeMap<String, Bound>,
     payload: &[u8],
@@ -669,7 +849,7 @@ fn param_literal(value: &Option<String>, oid: i32) -> String {
 }
 
 fn write_row_description(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     columns: &[String],
     oids: &[i32],
 ) -> Result<(), PgError> {
@@ -694,7 +874,7 @@ fn write_row_description(
     write_message(stream, b'T', &payload)
 }
 
-fn write_data_row(stream: &mut TcpStream, row: &[Value]) -> Result<(), PgError> {
+fn write_data_row(stream: &mut dyn ReadWrite, row: &[Value]) -> Result<(), PgError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(row.len() as i16).to_be_bytes());
     for value in row {
@@ -727,7 +907,7 @@ fn value_text(value: &Value) -> String {
     }
 }
 
-fn write_error(stream: &mut TcpStream, message: &str) -> Result<(), PgError> {
+fn write_error(stream: &mut dyn ReadWrite, message: &str) -> Result<(), PgError> {
     let mut payload = Vec::new();
     payload.push(b'S');
     payload.extend_from_slice(b"ERROR\0");

@@ -15,7 +15,7 @@
    - 每个连接都设置 `TCP_NODELAY`：协议是「一条小消息一次往返」，Nagle + delayed ACK 会让 Linux 上每次往返多等约 40 ms。
    - `handle_connection`：startup → `AuthenticationOk` + 若干 `ParameterStatus` + `BackendKeyData` + `ReadyForQuery`。
 2. **协议子集**
-   - StartupMessage v3（196608）；`SSLRequest`（80877103）回复 `N` 并要求重新 startup。
+   - StartupMessage v3（196608）；`SSLRequest`（80877103）：配置了证书就回 `S` 并进入 rustls 握手，否则回 `N` 并要求重新 startup。
    - `Query`（`Q`）：执行 `SqlEngine::execute_script`，逐条返回 `RowDescription` / `DataRow` / `CommandComplete`，最后 `ReadyForQuery`。
    - `Terminate`（`X`）断开；`Sync`（`S`）返回 `ReadyForQuery`。
    - 扩展查询：`Parse` 保存 SQL 与参数 OID；`Bind` 把 `$n` 替换为字面量（按 OID 区分 int/bool/text）；`Describe` 返回 `ParameterDescription` + 真实 `RowDescription`（对 SELECT 用 `LIMIT 1` 取样列名与类型，参数用 `NULL` 占位；非 SELECT 返回 `NoData`）；`Execute` 复用 simple query 的结果编码；`Close` 删除 prepared/portal。
@@ -35,9 +35,9 @@
 
 ## 后果 / 限制
 
-- **无 TLS**：`SSLRequest` 直接拒绝；只适合本地/受信网络。
+- **TLS 可选、非强制**：`--tls-cert` / `--tls-key`（PEM）启用 rustls + ring；`--require-tls` 拒绝明文客户端。证书轮换需要重启。
 - **扩展查询只覆盖最小子集**：`Describe` 对 SELECT 返回列名与取样推断的类型，非 SELECT 返回 `NoData`；`Execute` 忽略 row limit，参数只按文本格式处理。
-- **无认证**：任何能连上端口的客户端都可读写。
+- **认证只有 trust / cleartext password**：`--auth password` 用 `AuthenticationCleartextPassword` 校验 `--password` / `--password-file`；没有 SCRAM/MD5、没有客户端证书，明文连接下密码是明文。
 - **执行串行化**：连接并发，但语句在共享引擎锁上排队；不是多写者并发。
 - 类型只按取样值推断：全 `NULL` 列、空结果回落成 `text`；`Logic`/`Ł`/`ℕ` 等非 `INT`/`BOOL` 值也报 `text`。
 - **事务状态只是协议层**：`BEGIN`/`COMMIT`/`ROLLBACK` 不改变引擎的单语句提交模型，不会把多条语句合成一个原子事务；`E` 状态只是拒绝后续语句。

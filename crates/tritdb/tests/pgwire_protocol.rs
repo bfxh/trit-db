@@ -10,13 +10,18 @@ use std::time::Duration;
 use tritdb_testkit::TempDir;
 
 fn start_server(name: &str) -> (TempDir, TcpStream) {
+    start_server_with(name, tritdb_pgwire::ServerOptions::default())
+}
+
+fn start_server_with(name: &str, options: tritdb_pgwire::ServerOptions) -> (TempDir, TcpStream) {
     let dir = TempDir::new(name);
     let db = dir.join("protocol.db");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let db_path = db.clone();
+    let options = std::sync::Arc::new(options);
     thread::spawn(move || {
-        let _ = tritdb_pgwire::serve(db_path, listener);
+        let _ = tritdb_pgwire::serve_with_options(db_path, listener, options);
     });
     let stream = TcpStream::connect(addr).expect("connect");
     stream
@@ -25,7 +30,7 @@ fn start_server(name: &str) -> (TempDir, TcpStream) {
     (dir, stream)
 }
 
-fn write_startup(stream: &mut TcpStream) {
+fn write_startup<S: Write>(stream: &mut S) {
     let mut body = Vec::new();
     body.extend_from_slice(&196_608i32.to_be_bytes());
     body.push(0);
@@ -35,20 +40,20 @@ fn write_startup(stream: &mut TcpStream) {
     stream.write_all(&message).expect("startup");
 }
 
-fn write_message(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
+fn write_message<S: Write>(stream: &mut S, kind: u8, payload: &[u8]) {
     let mut message = vec![kind];
     message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
     message.extend_from_slice(payload);
     stream.write_all(&message).expect("message");
 }
 
-fn query(stream: &mut TcpStream, sql: &str) {
+fn query<S: Write>(stream: &mut S, sql: &str) {
     let mut payload = sql.as_bytes().to_vec();
     payload.push(0);
     write_message(stream, b'Q', &payload);
 }
 
-fn read_message(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+fn read_message<S: Read>(stream: &mut S) -> Option<(u8, Vec<u8>)> {
     let mut kind = [0u8; 1];
     if stream.read_exact(&mut kind).is_err() {
         return None;
@@ -61,7 +66,7 @@ fn read_message(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     Some((kind[0], payload))
 }
 
-fn read_until_ready(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+fn read_until_ready<S: Read>(stream: &mut S) -> Vec<(u8, Vec<u8>)> {
     let mut messages = Vec::new();
     loop {
         let Some((kind, payload)) = read_message(stream) else {
@@ -111,7 +116,7 @@ fn has_error(messages: &[(u8, Vec<u8>)]) -> bool {
 }
 
 /// Returns true when the server has closed the connection.
-fn connection_closed(stream: &mut TcpStream) -> bool {
+fn connection_closed<S: Read>(stream: &mut S) -> bool {
     let mut buffer = [0u8; 16];
     match stream.read(&mut buffer) {
         Ok(0) => true,
@@ -217,7 +222,7 @@ fn close_unknown_statement_and_portal_completes() {
     assert!(messages.iter().any(|(kind, _)| *kind == b'3'));
 }
 
-fn read_until_ready_with_sync(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+fn read_until_ready_with_sync<S: Read + Write>(stream: &mut S) -> Vec<(u8, Vec<u8>)> {
     write_message(stream, b'S', b"");
     read_until_ready(stream)
 }
@@ -382,4 +387,195 @@ fn terminate_closes_connection_cleanly() {
 
     stream.write_all(b"X\x00\x00\x00\x04").expect("terminate");
     assert!(connection_closed(&mut stream));
+}
+
+#[test]
+fn password_auth_accepts_correct_password() {
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::Password("s3cret".to_string()),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-auth-ok", options);
+    write_startup(&mut stream);
+
+    let (kind, payload) = read_message(&mut stream).expect("auth request");
+    assert_eq!(kind, b'R', "expected AuthenticationCleartextPassword");
+    assert_eq!(
+        i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        3
+    );
+
+    write_message(&mut stream, b'p', b"s3cret\0");
+    let messages = read_until_ready(&mut stream);
+    assert!(!has_error(&messages), "unexpected error: {messages:?}");
+    assert_eq!(ready_status(&messages), Some(b'I'));
+
+    query(&mut stream, "SELECT 1;");
+    let messages = read_until_ready(&mut stream);
+    assert!(messages.iter().any(|(kind, _)| *kind == b'D'));
+}
+
+#[test]
+fn password_auth_rejects_wrong_password() {
+    let options = tritdb_pgwire::ServerOptions {
+        auth: tritdb_pgwire::AuthMode::Password("s3cret".to_string()),
+        ..Default::default()
+    };
+    let (_dir, mut stream) = start_server_with("pgproto-auth-bad", options);
+    write_startup(&mut stream);
+
+    let (kind, payload) = read_message(&mut stream).expect("auth request");
+    assert_eq!(kind, b'R');
+    assert_eq!(
+        i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        3
+    );
+
+    write_message(&mut stream, b'p', b"wrong\0");
+    let messages = read_until_ready(&mut stream);
+    assert!(has_error(&messages), "wrong password must be rejected");
+    assert!(
+        connection_closed(&mut stream),
+        "the server must close the connection after a failed login"
+    );
+}
+
+#[test]
+fn trust_mode_never_asks_for_a_password() {
+    let (_dir, mut stream) = start_server("pgproto-auth-trust");
+    write_startup(&mut stream);
+    let messages = read_until_ready(&mut stream);
+    let auth = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'R')
+        .map(|(_, payload)| i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]))
+        .expect("AuthenticationOk");
+    assert_eq!(auth, 0, "trust mode must send AuthenticationOk directly");
+}
+
+fn tls_client_config(cert: &rcgen::CertifiedKey) -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(cert.cert.der().clone())
+        .expect("trust certificate");
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    std::sync::Arc::new(config)
+}
+
+#[test]
+fn tls_handshake_and_query() {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+    let dir = TempDir::new("pgproto-tls");
+    let db = dir.join("tls.db");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).expect("write certificate");
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("write key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db_path, listener, options);
+    });
+
+    let mut tcp = TcpStream::connect(addr).expect("connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    // SSLRequest, then the server must answer 'S'.
+    let mut ssl = Vec::new();
+    ssl.extend_from_slice(&8i32.to_be_bytes());
+    ssl.extend_from_slice(&80_877_103i32.to_be_bytes());
+    tcp.write_all(&ssl).expect("ssl request");
+    let mut reply = [0u8; 1];
+    tcp.read_exact(&mut reply).expect("ssl reply");
+    assert_eq!(reply[0], b'S', "server must accept TLS");
+
+    let config = tls_client_config(&certified);
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("server name");
+    let connection = rustls::ClientConnection::new(config, server_name).expect("client connection");
+    let mut tls = rustls::StreamOwned::new(connection, tcp);
+
+    write_startup(&mut tls);
+    let messages = read_until_ready(&mut tls);
+    assert!(
+        !has_error(&messages),
+        "startup over TLS failed: {messages:?}"
+    );
+    assert_eq!(ready_status(&messages), Some(b'I'));
+
+    query(
+        &mut tls,
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1);",
+    );
+    let _ = read_until_ready(&mut tls);
+    query(&mut tls, "SELECT id FROM t;");
+    let messages = read_until_ready(&mut tls);
+    let row = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'D')
+        .map(|(_, payload)| parse_row(payload))
+        .expect("DataRow over TLS");
+    assert_eq!(row, vec![Some("1".to_string())]);
+}
+
+#[test]
+fn require_tls_rejects_plaintext_startup() {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+    let dir = TempDir::new("pgproto-tls-required");
+    let db = dir.join("tls.db");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).expect("write certificate");
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("write key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let db_path = db.clone();
+    let options = std::sync::Arc::new(tritdb_pgwire::ServerOptions {
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        require_tls: true,
+        ..Default::default()
+    });
+    thread::spawn(move || {
+        let _ = tritdb_pgwire::serve_with_options(db_path, listener, options);
+    });
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    // Plain startup without SSLRequest must be refused.
+    write_startup(&mut stream);
+    let messages = read_until_ready(&mut stream);
+    assert!(
+        has_error(&messages) || messages.is_empty(),
+        "plaintext startup must be refused: {messages:?}"
+    );
+}
+
+#[test]
+fn tls_disabled_still_refuses_ssl_request() {
+    let (_dir, mut stream) = start_server("pgproto-tls-off");
+    let mut ssl = Vec::new();
+    ssl.extend_from_slice(&8i32.to_be_bytes());
+    ssl.extend_from_slice(&80_877_103i32.to_be_bytes());
+    stream.write_all(&ssl).expect("ssl request");
+    let mut reply = [0u8; 1];
+    stream.read_exact(&mut reply).expect("ssl reply");
+    assert_eq!(reply[0], b'N', "without TLS the server must answer 'N'");
 }

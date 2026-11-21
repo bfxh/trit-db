@@ -94,6 +94,8 @@ fn print_help() {
     println!("  pstore writer --data pstore.pages --wal pstore.wal --txns 1000 --sleep-ms 1");
     println!("  sql --db sql.db --sql \"SELECT * FROM t WHERE x IS NOT NULL\"");
     println!("  serve --db sql.db [--listen 127.0.0.1:5432]");
+    println!("        [--auth trust|password --password <pwd>|--password-file <file>]");
+    println!("        [--tls-cert <cert.pem> --tls-key <key.pem> [--require-tls]]");
     println!("  sql --db sql.db --file script.sql");
     println!("  models --vars 3 --expr \"a AND (NOT b OR c)\"");
     println!("  repair --facts 2 --denial 0,1 --query 0");
@@ -1719,11 +1721,64 @@ fn parse_bool_expr(text: &str, vars: usize) -> Result<tritdb_exec::ann::BoolExpr
 fn run_serve(args: &[String]) -> Result<(), String> {
     let db = required_arg(args, "--db")?;
     let listen = arg_value(args, "--listen").unwrap_or_else(|| "127.0.0.1:5432".to_string());
+
+    if arg_value(args, "--password").is_some() && arg_value(args, "--password-file").is_some() {
+        return Err("use either --password or --password-file, not both".to_string());
+    }
+    let auth = match arg_value(args, "--auth")
+        .unwrap_or_else(|| "trust".to_string())
+        .as_str()
+    {
+        "trust" => tritdb_pgwire::AuthMode::Trust,
+        "password" => {
+            let password = if let Some(password) = arg_value(args, "--password") {
+                password
+            } else if let Some(path) = arg_value(args, "--password-file") {
+                std::fs::read_to_string(&path)
+                    .map_err(|error| format!("read {path}: {error}"))?
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string()
+            } else {
+                return Err("--auth password requires --password or --password-file".to_string());
+            };
+            if password.is_empty() {
+                return Err("password must not be empty".to_string());
+            }
+            tritdb_pgwire::AuthMode::Password(password)
+        }
+        other => {
+            return Err(format!(
+                "unknown --auth {other}; expected trust or password"
+            ))
+        }
+    };
+
+    let tls_cert = arg_value(args, "--tls-cert").map(std::path::PathBuf::from);
+    let tls_key = arg_value(args, "--tls-key").map(std::path::PathBuf::from);
+    if tls_cert.is_some() != tls_key.is_some() {
+        return Err("--tls-cert and --tls-key must be given together".to_string());
+    }
+    let require_tls = args.iter().any(|argument| argument == "--require-tls");
+    if require_tls && tls_cert.is_none() {
+        return Err("--require-tls needs --tls-cert and --tls-key".to_string());
+    }
+
+    let options = tritdb_pgwire::ServerOptions {
+        auth,
+        tls_cert,
+        tls_key,
+        require_tls,
+    };
     let listener =
         std::net::TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     let local = listener.local_addr().map_err(|error| error.to_string())?;
     println!("listening={local} db={db}");
-    tritdb_pgwire::serve(std::path::PathBuf::from(db), listener).map_err(|error| error.to_string())
+    tritdb_pgwire::serve_with_options(
+        std::path::PathBuf::from(db),
+        listener,
+        std::sync::Arc::new(options),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn run_sql(args: &[String]) -> Result<(), String> {
