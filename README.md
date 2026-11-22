@@ -9,6 +9,8 @@
 
 ![bench trend](docs/results/bench-trend.svg)
 
+![bench distribution](docs/results/bench-distribution.svg)
+
 | 口径 | 更快 / 持平 / 更慢 | Δ% 中位数 |
 |---|---|---|
 | 5 次聚合（历史） | 4 / 6 / 4 | -0.9% |

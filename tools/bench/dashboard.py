@@ -5,6 +5,7 @@ Outputs:
   docs/results/BENCH-DASHBOARD.md   full tables (summary / per-case / per-path / per-layer /
                                     history / suggestions)
   docs/results/bench-trend.svg      horizontal bar chart of latency change vs baseline
+  docs/results/bench-distribution.svg box plot of per-round samples (p25/p50/p90)
   docs/results/bench-badge.json     shields.io endpoint badge (better/worse counts)
   docs/results/bench-delta-badge.json
   README.md                         replaces the block between BENCH-SUMMARY markers
@@ -76,6 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs-dir", default="docs/results/bench-runs")
     parser.add_argument("--out-md", default="docs/results/BENCH-DASHBOARD.md")
     parser.add_argument("--out-svg", default="docs/results/bench-trend.svg")
+    parser.add_argument(
+        "--out-dist-svg", default="docs/results/bench-distribution.svg"
+    )
     parser.add_argument("--out-badge", default="docs/results/bench-badge.json")
     parser.add_argument("--out-delta-badge", default="docs/results/bench-delta-badge.json")
     parser.add_argument("--readme", default="README.md")
@@ -169,6 +173,25 @@ def fmt_delta_pct(delta: float) -> str:
 
 def fmt_int(value: float) -> str:
     return f"{value:,.0f}"
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def fmt_rss(rss_kb: float | None) -> str:
+    if rss_kb is None or rss_kb <= 0:
+        return "—"
+    return f"{rss_kb / 1024.0:.1f}"
 
 
 def fmt_date(run: dict) -> str:
@@ -389,6 +412,10 @@ def aggregate_runs(items: list[dict]) -> dict | None:
     if not items:
         return None
     per_case: dict[str, list[float]] = {}
+    per_samples: dict[str, list[float]] = {}
+    per_rss: dict[str, list[float]] = {}
+    per_rss_before: dict[str, list[float]] = {}
+    per_rss_delta: dict[str, list[float]] = {}
     args: dict[str, str] = {}
     for run in items:
         for case in run.get("cases", []):
@@ -397,8 +424,24 @@ def aggregate_runs(items: list[dict]) -> dict | None:
             if isinstance(bench_id, str) and isinstance(median, (int, float)) and median > 0:
                 per_case.setdefault(bench_id, []).append(float(median))
                 args.setdefault(bench_id, str(case.get("args") or ""))
+                samples = case.get("samples")
+                if isinstance(samples, list):
+                    per_samples.setdefault(bench_id, []).extend(
+                        float(sample) for sample in samples
+                    )
+                rss_kb = case.get("rss_kb")
+                if isinstance(rss_kb, (int, float)) and rss_kb > 0:
+                    per_rss.setdefault(bench_id, []).append(float(rss_kb))
+                    rss_before = case.get("rss_before_kb")
+                    if isinstance(rss_before, (int, float)) and rss_before > 0:
+                        per_rss_before.setdefault(bench_id, []).append(float(rss_before))
+                        per_rss_delta.setdefault(bench_id, []).append(
+                            float(rss_kb) - float(rss_before)
+                        )
     cases = []
     for bench_id, values in per_case.items():
+        samples = per_samples.get(bench_id, [])
+        rss_values = per_rss.get(bench_id, [])
         cases.append(
             {
                 "bench_id": bench_id,
@@ -406,7 +449,22 @@ def aggregate_runs(items: list[dict]) -> dict | None:
                 "median_ms": statistics.median(values),
                 "min_ms": min(values),
                 "max_ms": max(values),
-                "samples": len(values),
+                "sample_count": len(samples),
+                "samples": samples,
+                "p50_ms": percentile(samples, 0.50),
+                "p90_ms": percentile(samples, 0.90),
+                "rss_kb": statistics.median(rss_values) if rss_values else None,
+                "rss_max_kb": max(rss_values) if rss_values else None,
+                "rss_before_kb": (
+                    statistics.median(per_rss_before[bench_id])
+                    if bench_id in per_rss_before
+                    else None
+                ),
+                "rss_delta_kb": (
+                    statistics.median(per_rss_delta[bench_id])
+                    if bench_id in per_rss_delta
+                    else None
+                ),
             }
         )
     last = items[-1]
@@ -464,6 +522,63 @@ def fmt_cell_delta(ms_delta: float) -> str:
 
 
 
+
+
+def distribution_table(rows: list[dict], latest: dict | None) -> str:
+    if not latest:
+        return ""
+    by_id = {
+        str(case.get("bench_id")): case
+        for case in latest.get("cases", [])
+        if isinstance(case.get("bench_id"), str)
+    }
+    data = []
+    for row in rows:
+        case = by_id.get(row["bench_id"])
+        if not case:
+            continue
+        samples = case.get("samples") if isinstance(case.get("samples"), list) else []
+        p50 = case.get("p50_ms") if samples else row["latest"]
+        p90 = case.get("p90_ms") if samples else None
+        max_ms = case.get("max_ms") if samples else None
+        rss_before = case.get("rss_before_kb")
+        rss_after = case.get("rss_kb")
+        rss_text = (
+            f"{fmt_rss(rss_before)} → {fmt_rss(rss_after)}"
+            if isinstance(rss_before, (int, float))
+            else fmt_rss(rss_after)
+        )
+        data.append(
+            [
+                row["layer"],
+                f"`{row['bench_id']}`",
+                str(len(samples)) if samples else "—",
+                fmt_ms(float(p50)) if p50 is not None else "—",
+                fmt_ms(float(p90)) if p90 is not None else "—",
+                fmt_ms(float(max_ms)) if max_ms is not None else "—",
+                rss_text,
+                f"{float(case['rss_delta_kb']) / 1024.0:+.1f} MiB"
+                if isinstance(case.get("rss_delta_kb"), (int, float))
+                else "—",
+                fmt_delta_pct(row["delta"]),
+            ]
+        )
+    if not data:
+        return ""
+    return md_table(
+        [
+            "分层",
+            "基准项",
+            "样本数",
+            "p50 (ms)",
+            "p90 (ms)",
+            "max (ms)",
+            "RSS 前→后 (MiB)",
+            "ΔRSS",
+            "中位数 Δ%",
+        ],
+        data,
+    )
 
 
 def path_table(rows: list[dict], ab: dict | None = None) -> str:
@@ -1036,25 +1151,31 @@ def build_markdown(
     parts.append("")
     parts.append(combined_table(rows, single))
     parts.append("")
-    parts.append("## 3. 读写路径")
+    parts.append("## 3. 分布与内存")
+    parts.append("")
+    parts.append(distribution_table(rows, latest))
+    parts.append("")
+    parts.append("![bench distribution](bench-distribution.svg)")
+    parts.append("")
+    parts.append("## 4. 读写路径")
     parts.append("")
     parts.append(path_table(rows, ab))
     parts.append("")
-    parts.append("## 4. 分层")
+    parts.append("## 5. 分层")
     parts.append("")
     parts.append("> 分层与徽章按 A/B 复核写路径；逐项总表保留 5 次历史值。")
     parts.append("")
     parts.append(layer_table(ab_corrected_rows(rows, ab)))
     parts.append("")
-    parts.append("## 5. 运行历史")
+    parts.append("## 6. 运行历史")
     parts.append("")
     parts.append(history_table(baseline, group_runs(runs, platform)))
     parts.append("")
-    parts.append("## 6. 建议")
+    parts.append("## 7. 建议")
     parts.append("")
     parts.append(suggestion_table(rows, single, ab))
     parts.append("")
-    parts.append("## 7. 口径")
+    parts.append("## 8. 口径")
     parts.append("")
     parts.append("```bash")
     parts.append("python tools/bench/run.py --repeat 5   # 跑 5 轮并写 docs/results/bench-runs/")
@@ -1246,6 +1367,152 @@ def build_svg(
     return "\n".join(parts)
 
 
+def build_distribution_svg(rows: list[dict], latest: dict | None, base_commit: str) -> str:
+    """Box plot of the raw per-round samples for the newest run batch."""
+    if not latest:
+        return empty_distribution_svg("no run data")
+    by_id = {
+        str(case.get("bench_id")): case
+        for case in latest.get("cases", [])
+        if isinstance(case.get("bench_id"), str)
+    }
+    cases = []
+    for row in rows:
+        case = by_id.get(row["bench_id"])
+        samples = case.get("samples") if case and isinstance(case.get("samples"), list) else []
+        if samples:
+            cases.append((row, case, [float(sample) for sample in samples]))
+    if not cases:
+        return empty_distribution_svg("no raw samples yet")
+
+    all_values = [value for _, _, samples in cases for value in samples if value > 0]
+    low = max(min(all_values), 1e-6)
+    high = max(all_values)
+    log_low = math.floor(math.log10(low))
+    log_high = math.ceil(math.log10(high))
+    if log_high <= log_low:
+        log_high = log_low + 1
+
+    width = 1080
+    label_left = 14
+    plot_left = 235
+    plot_right = 1000
+    plot_width = plot_right - plot_left
+    top = 104
+    row_height = 36
+    height = top + row_height * len(cases) + 54
+    plot_bottom = top + row_height * len(cases)
+
+    def x_of(value: float) -> float:
+        value = max(value, 1e-6)
+        return plot_left + (
+            (math.log10(value) - log_low) / (log_high - log_low)
+        ) * plot_width
+
+    colors = {"gain": "#2da44e", "regress": "#cf222e", "flat": "#8b949e"}
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="trit-db per-round latency distribution">',
+        "<style>"
+        "text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;}"
+        ".t{fill:#1f2328;font-size:13px}.s{fill:#57606a;font-size:11px}"
+        ".v{fill:#1f2328;font-size:12px}.g{fill:#8b949e;font-size:10px}"
+        "</style>",
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
+        f'<rect x="0.5" y="0.5" width="{width - 1}" height="{height - 1}" fill="none" stroke="#d0d7de"/>',
+        f'<text class="t" x="{label_left}" y="30">trit-db benchmark — per-round latency distribution</text>',
+        f'<text class="s" x="{label_left}" y="50">'
+        f'baseline {svg_escape(base_commit)} · {len(cases)} cases · log scale · box = p25–p75, line = median, dot = p90</text>',
+        f'<text class="s" x="{label_left}" y="70">lower is better · samples are every round of the newest run batch</text>',
+    ]
+
+    # Log grid and labels.
+    for decade in range(log_low, log_high + 1):
+        value = 10.0**decade
+        x = x_of(value)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{top - 8}" x2="{x:.1f}" y2="{plot_bottom + 4}" '
+            'stroke="#eaeef2" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<text class="g" x="{x:.1f}" y="{plot_bottom + 20}" text-anchor="middle">'
+            f'{svg_escape(fmt_ms(value))}</text>'
+        )
+
+    for index, (row, case, samples) in enumerate(cases):
+        y = top + index * row_height
+        color = (
+            colors["gain"]
+            if row["delta"] <= -5 and row["status"] != STATUS_RESOLUTION
+            else colors["regress"]
+            if row["delta"] >= 5
+            else colors["flat"]
+        )
+        q1 = percentile(samples, 0.25) or min(samples)
+        median = percentile(samples, 0.50) or statistics.median(samples)
+        q3 = percentile(samples, 0.75) or max(samples)
+        p90 = percentile(samples, 0.90) or max(samples)
+        low_sample = min(samples)
+        high_sample = max(samples)
+
+        parts.append(
+            f'<text class="v" x="{label_left}" y="{y + 15}">'
+            f'{svg_escape(row["bench_id"])}</text>'
+        )
+        parts.append(
+            f'<text class="g" x="{label_left}" y="{y + 29}">'
+            f'{svg_escape(row["layer"])} · n={len(samples)}</text>'
+        )
+        x_low = x_of(low_sample)
+        x_high = x_of(high_sample)
+        x_q1 = x_of(q1)
+        x_q3 = x_of(q3)
+        x_med = x_of(median)
+        x_p90 = x_of(p90)
+        parts.append(
+            f'<line x1="{x_low:.1f}" y1="{y + 17}" x2="{x_high:.1f}" y2="{y + 17}" '
+            'stroke="#8b949e" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<rect x="{x_q1:.1f}" y="{y + 7}" width="{max(2.0, x_q3 - x_q1):.1f}" height="20" '
+            f'fill="{color}" fill-opacity="0.35" stroke="{color}" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<line x1="{x_med:.1f}" y1="{y + 7}" x2="{x_med:.1f}" y2="{y + 27}" '
+            f'stroke="{color}" stroke-width="2"/>'
+        )
+        parts.append(
+            f'<circle cx="{x_p90:.1f}" cy="{y + 17}" r="3" fill="{color}"/>'
+        )
+        parts.append(
+            f'<text class="g" x="{min(1018.0, x_high + 6):.1f}" y="{y + 15}">'
+            f'{fmt_ms(median)}</text>'
+        )
+
+    parts.append(
+        f'<text class="g" x="{label_left}" y="{plot_bottom + 42}">'
+        "Generated by tools/bench/dashboard.py · samples from tritdb-bench record"
+        "</text>"
+    )
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def empty_distribution_svg(reason: str) -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="120" '
+        'viewBox="0 0 1080 120" role="img" aria-label="no benchmark samples">'
+        '<rect x="0" y="0" width="1080" height="120" fill="#ffffff"/>'
+        '<text x="14" y="34" font-family="monospace" font-size="13" fill="#1f2328">'
+        "trit-db benchmark — distribution"
+        "</text>"
+        '<text x="14" y="58" font-family="monospace" font-size="11" fill="#57606a">'
+        f"{svg_escape(reason)}"
+        "</text></svg>"
+    )
+
+
 def badge(message: str, color: str) -> str:
     return json.dumps(
         {"schemaVersion": 1, "label": "bench", "message": message, "color": color},
@@ -1288,6 +1555,8 @@ def readme_block(
     )
     lines.append("")
     lines.append('![bench trend](docs/results/bench-trend.svg)')
+    lines.append("")
+    lines.append('![bench distribution](docs/results/bench-distribution.svg)')
     lines.append("")
     lines.append(method_table(rows, count, single, ab))
     lines.append("")
@@ -1378,9 +1647,11 @@ def main() -> int:
         ab = None
     markdown = build_markdown(baseline, runs, rows, count, latest, commit, single, ab)
     svg = build_svg(rows, baseline, latest, commit, ab)
+    distribution_svg = build_distribution_svg(rows, latest, commit)
 
     (ROOT / args.out_md).write_text(markdown + "\n", encoding="utf-8")
     (ROOT / args.out_svg).write_text(svg + "\n", encoding="utf-8")
+    (ROOT / args.out_dist_svg).write_text(distribution_svg + "\n", encoding="utf-8")
 
     display_rows = ab_corrected_rows(rows, ab)
     total = len(display_rows)

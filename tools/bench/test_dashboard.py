@@ -60,6 +60,29 @@ class DashboardTests(unittest.TestCase):
         scan = next(row for row in rows if row["bench_id"] == "sql_scan")
         self.assertAlmostEqual(corrected["sql_scan"]["delta"], scan["delta"])
 
+    def test_percentile(self) -> None:
+        self.assertEqual(dashboard.percentile([1.0, 2.0, 3.0], 0.5), 2.0)
+        self.assertAlmostEqual(dashboard.percentile([1.0, 2.0, 3.0, 4.0], 0.9), 3.7)
+
+    def test_distribution_table_uses_samples_and_rss(self) -> None:
+        rows = dashboard.build_rows({"sql_scan": 0.09}, {"sql_scan": 0.08})
+        latest = {
+            "cases": [
+                {
+                    "bench_id": "sql_scan",
+                    "samples": [0.07, 0.08, 0.09, 0.10],
+                    "p50_ms": 0.085,
+                    "p90_ms": 0.095,
+                    "max_ms": 0.10,
+                    "rss_kb": 10_240,
+                }
+            ]
+        }
+        table = dashboard.distribution_table(rows, latest)
+        self.assertIn("p90 (ms)", table)
+        self.assertIn("10.0", table)
+        self.assertIn("4", table)
+
 
 if __name__ == "__main__":
     unittest.main()

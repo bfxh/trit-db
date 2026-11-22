@@ -84,6 +84,8 @@ def main() -> int:
                     "mins": [],
                     "maxs": [],
                     "samples": [],
+                    "rss_before": [],
+                    "rss_after": [],
                 },
             )
             entry["medians"].append(float(case["median_ms"]))
@@ -92,6 +94,12 @@ def main() -> int:
             samples = case.get("samples")
             if isinstance(samples, list):
                 entry["samples"].extend(float(sample) for sample in samples)
+            rss_before = case.get("rss_before_kb")
+            rss_after = case.get("rss_kb")
+            if isinstance(rss_before, (int, float)) and rss_before > 0:
+                entry["rss_before"].append(float(rss_before))
+            if isinstance(rss_after, (int, float)) and rss_after > 0:
+                entry["rss_after"].append(float(rss_after))
 
     cases = []
     for bench_id, entry in per_case.items():
@@ -104,6 +112,10 @@ def main() -> int:
         }
         if entry["samples"]:
             case["samples"] = entry["samples"]
+        if entry["rss_before"]:
+            case["rss_before_kb"] = statistics.median(entry["rss_before"])
+        if entry["rss_after"]:
+            case["rss_kb"] = statistics.median(entry["rss_after"])
         cases.append(case)
 
     last = selected[-1]

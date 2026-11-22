@@ -31,7 +31,12 @@ use tritdb_wal::{RecordKind, WalReader, WalWriter};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let command = args.first().map(String::as_str);
+    let print_memory = !matches!(command, Some("record" | "check" | "help" | "--help"));
+    if print_memory {
+        print_rss("rss_before_kb");
+    }
+    match command {
         Some("radix") | None => run_radix(&args),
         Some("baseline") => run_baseline(&args),
         Some("block") => run_block(&args),
@@ -65,6 +70,25 @@ fn main() {
             eprintln!("unknown subcommand: {other}");
             print_help();
             std::process::exit(2);
+        }
+    }
+    // `record`/`check` are orchestration commands; their child benchmarks
+    // print their own RSS line.  Keep their own output clean.
+    if print_memory {
+        print_rss("rss_kb");
+    }
+}
+
+/// Current process RSS at the end of a case.  This is a comparable footprint
+/// number across OSes; `sysinfo` keeps the crate free of unsafe FFI.
+fn print_rss(field: &str) {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    if let Some(process) = system.process(pid) {
+        let rss_kb = process.memory() / 1024;
+        if rss_kb > 0 {
+            println!("{{\"{field}\":{rss_kb}}}");
         }
     }
 }
@@ -2435,6 +2459,8 @@ struct CaseResult {
     median: f64,
     max: f64,
     samples: Vec<f64>,
+    rss_before_kb: Option<u64>,
+    rss_kb: Option<u64>,
 }
 
 /// Extracts raw `samples` from a benchmark JSON line.  Older binaries did not
@@ -2462,6 +2488,19 @@ fn format_samples(samples: &[f64]) -> String {
         .join(",")
 }
 
+/// Reads an optional `{"key":123}` line emitted around a benchmark case.
+fn find_u64_field(stdout: &str, key: &str) -> Option<u64> {
+    let marker = format!("\"{key}\":");
+    stdout.lines().find_map(|line| {
+        let start = line.find(&marker)? + marker.len();
+        line[start..]
+            .trim()
+            .trim_end_matches('}')
+            .parse::<u64>()
+            .ok()
+    })
+}
+
 /// Runs one benchmark case as a child process and parses its measurement.
 fn run_case(exe: &Path, spec: &CaseSpec, rounds: Option<usize>) -> Result<CaseResult, String> {
     let args = case_args(spec, rounds);
@@ -2481,6 +2520,8 @@ fn run_case(exe: &Path, spec: &CaseSpec, rounds: Option<usize>) -> Result<CaseRe
                     median,
                     max,
                     samples: find_samples(line),
+                    rss_before_kb: find_u64_field(&stdout, "rss_before_kb"),
+                    rss_kb: find_u64_field(&stdout, "rss_kb"),
                 });
             }
         }
@@ -2525,14 +2566,29 @@ fn run_record(args: &[String]) {
     writeln!(&mut json, "  \"platform\": \"{platform}\",").expect("write baseline");
     json.push_str("  \"cases\": [\n");
     for (index, (spec, case_args, result)) in recorded.iter().enumerate() {
+        let rss_before = result
+            .rss_before_kb
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let rss_after = result
+            .rss_kb
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let rss_delta = match (result.rss_before_kb, result.rss_kb) {
+            (Some(before), Some(after)) => (after as i64 - before as i64).to_string(),
+            _ => "null".to_string(),
+        };
         writeln!(
             &mut json,
-            "    {{\"bench_id\":\"{}\",\"args\":\"{}\",\"min_ms\":{:.6},\"median_ms\":{:.6},\"max_ms\":{:.6},\"samples\":[{}]}}{}",
+            "    {{\"bench_id\":\"{}\",\"args\":\"{}\",\"min_ms\":{:.6},\"median_ms\":{:.6},\"max_ms\":{:.6},\"rss_before_kb\":{},\"rss_kb\":{},\"rss_delta_kb\":{},\"samples\":[{}]}}{}",
             spec.bench_id,
             case_args.join(" "),
             result.min,
             result.median,
             result.max,
+            rss_before,
+            rss_after,
+            rss_delta,
             format_samples(&result.samples),
             if index + 1 < recorded.len() { "," } else { "" }
         )
