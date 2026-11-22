@@ -2,8 +2,8 @@
 """Build the trit-db benchmark dashboard from the committed baseline and run history.
 
 Outputs:
-  docs/results/BENCH-DASHBOARD.md   full tables (KPI / per-case / single-run / volatility /
-                                    per-path / per-layer / history / trend / next steps)
+  docs/results/BENCH-DASHBOARD.md   full tables (summary / per-case / per-path / per-layer /
+                                    history / suggestions)
   docs/results/bench-trend.svg      horizontal bar chart of latency change vs baseline
   docs/results/bench-badge.json     shields.io endpoint badge (better/worse counts)
   docs/results/bench-delta-badge.json
@@ -21,7 +21,6 @@ import json
 import math
 import statistics
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -385,71 +384,8 @@ def fmt_cell_delta(ms_delta: float) -> str:
     return f"{ms_delta:+.4f}"
 
 
-def detail_table(rows: list[dict]) -> str:
-    data = []
-    for index, row in enumerate(rows, 1):
-        if row["status"] == STATUS_RESOLUTION:
-            delta_ms = "—"
-            delta_text = "—"
-            throughput = "—"
-            throughput_delta = "—"
-        else:
-            delta_ms = fmt_cell_delta(row["latest"] - row["base"])
-            delta_text = fmt_delta_pct(row["delta"])
-            throughput = f"{fmt_int(row['throughput'])} {row['unit']}"
-            throughput_delta = f"{row['throughput_delta']:+.1f}%"
-        data.append(
-            [
-                str(index),
-                row["layer"],
-                f"`{row['bench_id']}`",
-                row["name"],
-                row["scene"],
-                fmt_ms(row["base"]),
-                fmt_ms(row["latest"]),
-                delta_ms,
-                delta_text,
-                f"{row['status']}（{row['speedup']}）"
-                if row["status"] not in (STATUS_RESOLUTION, STATUS_FLAT)
-                else row["status"],
-                throughput,
-                throughput_delta,
-            ]
-        )
-    return md_table(
-        [
-            "#",
-            "分层",
-            "基准项",
-            "场景",
-            "参数",
-            "基线 median (ms)",
-            "最新 median (ms)",
-            "Δ (ms)",
-            "Δ%",
-            "判定",
-            "最新吞吐",
-            "吞吐变化",
-        ],
-        data,
-    )
 
 
-def kpi_table(rows: list[dict], count: dict[str, int]) -> str:
-    measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
-    best = min(measured, key=lambda row: row["delta"])
-    worst = max(measured, key=lambda row: row["delta"])
-    median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
-    data = [
-        ["对比项", f"{len(rows)}"],
-        ["延迟下降（提升）", f"{better_count(count)}"],
-        ["持平", f"{count[STATUS_FLAT]}（另有 {count[STATUS_RESOLUTION]} 项低于 0.01 ms 分辨率）"],
-        ["延迟上升（退化）", f"{worse_count(count)}"],
-        ["最大提升", f"`{best['bench_id']}` {fmt_delta_pct(best['delta'])}（{best['speedup']}）"],
-        ["最大退化", f"`{worst['bench_id']}` {fmt_delta_pct(worst['delta'])}（{worst['speedup']}）"],
-        ["各项 Δ% 中位数", fmt_delta_pct(median_delta)],
-    ]
-    return md_table(["指标", "数值"], data)
 
 
 def path_table(rows: list[dict]) -> str:
@@ -560,32 +496,6 @@ def history_table(baseline: dict, groups: list[list[dict]]) -> str:
     )
 
 
-def trend_table(baseline: dict, groups: list[list[dict]], limit: int = 8) -> str:
-    base_cases = case_map(baseline)
-    selected = groups[-limit:]
-    headers = ["基准项", "基线"]
-    for group in selected:
-        aggregate = aggregate_runs(group)
-        label = f"{fmt_date(aggregate)}<br>`{aggregate.get('commit') or '—'}`"
-        if len(group) > 1:
-            label += f"<br>{len(group)} 次"
-        headers.append(label)
-    data = []
-    for bench_id in sorted(base_cases):
-        cells = [f"`{bench_id}`", fmt_ms(base_cases[bench_id])]
-        for group in selected:
-            aggregate = aggregate_runs(group)
-            latest = case_map(aggregate).get(bench_id)
-            if latest is None:
-                cells.append("—")
-            elif resolution_limited(base_cases[bench_id]):
-                cells.append(f"{fmt_ms(latest)}<br>分辨率不足")
-            else:
-                cells.append(
-                    f"{fmt_ms(latest)}<br>{fmt_delta_pct(delta_pct(base_cases[bench_id], latest))}"
-                )
-        data.append(cells)
-    return md_table(headers, data)
 
 
 def verdict_direction(status: str) -> int | None:
@@ -698,94 +608,113 @@ def method_table(rows: list[dict], count: dict[str, int], single: dict | None) -
     return md_table(["口径", "更快 / 持平 / 更慢", "Δ% 中位数"], data)
 
 
-def single_table(single: dict) -> str:
-    data = []
-    for row in single["rows"]:
-        delta = "—" if row["status"] == STATUS_RESOLUTION else fmt_delta_pct(row["delta"])
+def highlights_table(rows: list[dict], single: dict | None) -> str:
+    measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
+    read_subset = [row for row in measured if row["bench_id"] in READ_CASES]
+    write_subset = [row for row in measured if row["bench_id"] in WRITE_CASES]
+    read_avg = sum(row["delta"] for row in read_subset) / len(read_subset) if read_subset else 0.0
+    write_avg = sum(row["delta"] for row in write_subset) / len(write_subset) if write_subset else 0.0
+    best = min(measured, key=lambda row: row["delta"])
+    worst = max(measured, key=lambda row: row["delta"])
+    read_below = sum(1 for row in rows if row["bench_id"] in READ_CASES and row["status"] == STATUS_RESOLUTION)
+    read_note = f"（另 {read_below} 项分辨率不足）" if read_below else ""
+    data = [
+        ["最大提升", f"`{best['bench_id']}` {fmt_delta_pct(best['delta'])}（{best['speedup']}）"],
+        ["最大退化", f"`{worst['bench_id']}` {fmt_delta_pct(worst['delta'])}（{worst['speedup']}）"],
+        [
+            "读 / 写",
+            f"读 {len(read_subset)} 项{read_note} {fmt_delta_pct(read_avg)}；"
+            f"写 {len(write_subset)} 项 {fmt_delta_pct(write_avg)}",
+        ],
+    ]
+    if single:
+        flips = [row for row in single["rows"] if row["relation"] == "相反"]
+        if flips:
+            data.append(
+                [
+                    "单次 → 聚合 翻转",
+                    "；".join(
+                        f"`{row['bench_id']}` {fmt_delta_pct(row['delta'])} → "
+                        f"{fmt_delta_pct(row['aggregate_delta'])}"
+                        for row in flips
+                    ),
+                ]
+            )
+        vol = []
+        for row in single["rows"]:
+            values = case_values(single["baseline_runs"], row["bench_id"]) + case_values(
+                single["latest_runs"], row["bench_id"]
+            )
+            vol.append((volatility_ratio(values), row))
+        ratio, noisy = max(vol, key=lambda item: item[0])
+        latest_values = case_values(single["latest_runs"], noisy["bench_id"])
         data.append(
             [
-                f"`{row['bench_id']}`",
+                "单次噪声最大",
+                f"`{noisy['bench_id']}` {value_range(latest_values)} ms（{ratio:.1f}×）",
+            ]
+        )
+    return md_table(["重点", "数值"], data)
+
+
+def combined_table(rows: list[dict], single: dict | None) -> str:
+    single_map = {row["bench_id"]: row for row in single["rows"]} if single else {}
+    data = []
+    for row in rows:
+        single_row = single_map.get(row["bench_id"])
+        if row["status"] == STATUS_RESOLUTION:
+            aggregate_cell = "—（分辨率不足）"
+        else:
+            aggregate_cell = f"{fmt_delta_pct(row['delta'])}（{row['status']}）"
+        if single_row is None:
+            single_cell = "—"
+            relation = "—"
+            range_cell = "—"
+            noise = "—"
+        elif single_row["status"] == STATUS_RESOLUTION:
+            single_cell = "—（分辨率不足）"
+            relation = "不可比"
+            range_cell = "—"
+            noise = "—"
+        else:
+            single_cell = f"{fmt_delta_pct(single_row['delta'])}（{single_row['status']}）"
+            relation = single_row["relation"]
+            base_values = case_values(single["baseline_runs"], row["bench_id"])
+            latest_values = case_values(single["latest_runs"], row["bench_id"])
+            range_cell = f"{value_range(base_values)} / {value_range(latest_values)}"
+            noise = noise_grade(max(volatility_ratio(base_values), volatility_ratio(latest_values)))
+        data.append(
+            [
                 row["layer"],
+                f"`{row['bench_id']}`",
                 fmt_ms(row["base"]),
                 fmt_ms(row["latest"]),
-                delta,
-                row["status"],
-                row["aggregate_status"] or "—",
-                row["relation"],
+                aggregate_cell,
+                single_cell,
+                relation,
+                range_cell,
+                noise,
             ]
         )
     return md_table(
         [
-            "基准项",
             "分层",
-            "基线单次 (ms)",
-            "当前单次 (ms)",
-            "Δ%",
-            "单次判定",
-            "5 次聚合判定",
+            "基准项",
+            "基线 (ms)",
+            "当前 (ms)",
+            "5 次 Δ%",
+            "单次 Δ%",
             "对照",
+            "5 次区间（基线 / 当前）",
+            "噪声",
         ],
         data,
     )
 
 
-def volatility_table(single: dict) -> str:
-    records = []
-    for row in single["rows"]:
-        base_values = case_values(single["baseline_runs"], row["bench_id"])
-        latest_values = case_values(single["latest_runs"], row["bench_id"])
-        base_ratio = volatility_ratio(base_values)
-        latest_ratio = volatility_ratio(latest_values)
-        ratio = max(base_ratio, latest_ratio)
-        records.append(
-            (
-                ratio,
-                [
-                    f"`{row['bench_id']}`",
-                    row["layer"],
-                    value_range(base_values),
-                    value_range(latest_values),
-                    f"{base_ratio:.1f}× / {latest_ratio:.1f}×",
-                    noise_grade(ratio),
-                ],
-            )
-        )
-    records.sort(key=lambda item: item[0], reverse=True)
-    return md_table(
-        ["基准项", "分层", "基线 5 次区间 (ms)", "当前 5 次区间 (ms)", "波动倍数（基线 / 当前）", "噪声"],
-        [row for _, row in records],
-    )
-
-
-def readme_single_table(single: dict) -> str:
-    data = []
-    for row in single["rows"]:
-        delta = "—" if row["status"] == STATUS_RESOLUTION else fmt_delta_pct(row["delta"])
-        if row["aggregate_status"] == STATUS_RESOLUTION:
-            aggregate_delta = "—"
-        elif row["aggregate_delta"] is None:
-            aggregate_delta = "—"
-        else:
-            aggregate_delta = fmt_delta_pct(row["aggregate_delta"])
-        data.append(
-            [
-                f"`{row['bench_id']}`",
-                fmt_ms(row["base"]),
-                fmt_ms(row["latest"]),
-                delta,
-                aggregate_delta,
-                row["relation"],
-            ]
-        )
-    return md_table(
-        ["基准项", "基线单次 (ms)", "当前单次 (ms)", "单次 Δ%", "聚合 Δ%", "对照"],
-        data,
-    )
-
-
-def recommendation_lines(rows: list[dict], single: dict | None, write_avg: float) -> list[str]:
+def suggestion_table(rows: list[dict], single: dict | None, limit: int | None = None) -> str:
     by_id = {row["bench_id"]: row for row in rows}
-    lines = []
+    data = []
     if single:
         vol = []
         for row in single["rows"]:
@@ -794,61 +723,66 @@ def recommendation_lines(rows: list[dict], single: dict | None, write_avg: float
             )
             vol.append((volatility_ratio(values), row))
         ratio, noisy = max(vol, key=lambda item: item[0])
-        base_values = case_values(single["baseline_runs"], noisy["bench_id"])
         latest_values = case_values(single["latest_runs"], noisy["bench_id"])
-        flips = [row for row in single["rows"] if row["relation"] == "相反"]
-        gap = max(single["rows"], key=lambda row: row["gap"])
-        contrast = ""
-        if flips:
-            flip_ids = "、".join(f"`{row['bench_id']}`" for row in flips)
-            contrast = (
-                f"单次直比与 5 次聚合在 {flip_ids} 上方向相反，"
-                f"`{gap['bench_id']}` 的幅度差 {gap['gap']:.1f} 个百分点。"
-            )
-        lines.append(
-            f"1. **先降噪，再谈优化。** 同一 commit 连跑 {len(single['latest_runs'])} 次，"
-            f"`{noisy['bench_id']}` 的 median 在 "
-            f"{value_range(base_values)} / {value_range(latest_values)} ms（基线 / 当前）之间摆动，"
-            f"最高 {ratio:.1f}×；写路径 4 项平均 {fmt_delta_pct(write_avg)}，但{contrast}"
-            "建议固定电源计划、绑核运行、把 `target/` 与基准库目录加入 Defender 排除，"
-            "并让基线构建 / 当前构建 A/B 交替各跑 10 次；同时把 `ci` 套件的 DML 样本量从 "
-            "128 行 / 64 txn 提到 512 行 / 256 txn，让单次样本本身更抗噪。"
+        data.append(
+            [
+                "P0",
+                "降噪：固定电源、绑核、Defender 排除；基线/当前 A/B 各 10 次",
+                f"`{noisy['bench_id']}` 5 次 {value_range(latest_values)} ms，{ratio:.1f}×",
+            ]
         )
     txn = by_id.get("txn_put")
     if txn:
-        lines.append(
-            f"{len(lines) + 1}. **先查公共写路径，不要先改 SQL。** `txn_put` 不经过 SQL 解析也 "
-            f"{fmt_delta_pct(txn['delta'])}，和 `sql_insert` / `sql_update` / `sql_delete` 同向；"
-            "优先对比基线与当前之间的 `tritdb-txn` / `tritdb-wal` / 提交组 / fsync 路径，"
-            "用 `txn-put` 作为 bisect 判据，定位到层再改代码。"
+        data.append(
+            [
+                "P0",
+                "按层 bisect：用 `txn-put` 在基线..当前之间二分，先查 txn/WAL/提交组/fsync",
+                f"`txn_put` {fmt_delta_pct(txn['delta'])}，与 SQL 写项同向",
+            ]
         )
     subquery = by_id.get("sql_subquery")
     if subquery:
-        lines.append(
-            f"{len(lines) + 1}. **把 `sql_subquery` 的收益锁住。** 当前 {fmt_delta_pct(subquery['delta'])}"
-            f"（{fmt_ms(subquery['base'])} → {fmt_ms(subquery['latest'])} ms）是唯一大幅且稳定的提升；"
-            "套件现在只跑 `--query in`，建议把 `exists` / `scalar` 一并纳入，"
-            "并在 `check` 里给它单独设不回退门限，避免后续改执行计划时丢掉。"
+        data.append(
+            [
+                "P1",
+                "锁收益：`sql_subquery` 加入 `exists` / `scalar`，设不回退门限",
+                f"`sql_subquery` {fmt_delta_pct(subquery['delta'])}"
+                f"（{fmt_ms(subquery['base'])} → {fmt_ms(subquery['latest'])} ms）",
+            ]
         )
     graph = by_id.get("graph_reach")
     if graph:
-        lines.append(
-            f"{len(lines) + 1}. **给 `graph_reach` 一个能测的规模。** 当前 "
-            f"{fmt_ms(graph['latest'])} ms 低于 0.01 ms 分辨率，涨跌只能记 0.0%；"
-            "把 `--nodes` / `--hops` 提高一个数量级，或改成 1000 次批量计时，"
-            "让结果落到可比较的毫秒级。"
+        data.append(
+            [
+                "P1",
+                "放大 `graph_reach` 规模，或改 1000 次批量计时",
+                f"当前 {fmt_ms(graph['latest'])} ms，低于 0.01 ms 分辨率",
+            ]
         )
-    lines.append(
-        f"{len(lines) + 1}. **CI 门限按平台拆开。** `bench-regress` 现在拿 Windows 基线在 Ubuntu 上"
-        "用 `--tolerance 2.0` 只挡 3× 量级，挡不住 10–20% 的漂移；建议按平台各存一份基线，"
-        "或在 Windows runner 上定时跑 benchmark，PR 只比较同一 runner 上 main 的相对值。"
+    data.append(
+        [
+            "P2",
+            "CI 按平台各存基线，或在 Windows runner 定时跑基准",
+            "现在用 Windows 基线在 Ubuntu 上只挡 3× 量级",
+        ]
     )
-    lines.append(
-        f"{len(lines) + 1}. **看板下一版补分布。** 当前 JSON 只有 min / median / max，"
-        "只能做单次表和区间表；建议 `record` 额外存原始 samples，看板加 p50 / p90 与箱线图，"
-        "这样“涨了多少”与“抖了多少”能同时看见。"
+    data.append(
+        [
+            "P2",
+            "`record` 存原始 samples，看板补 p50 / p90 与箱线图",
+            "当前 JSON 只有 min / median / max",
+        ]
     )
-    return lines
+    selected = data[:limit] if limit else data
+    return md_table(["优先级", "动作", "依据"], selected)
+
+
+
+
+
+
+
+
 
 
 def build_markdown(
@@ -861,12 +795,10 @@ def build_markdown(
     single: dict | None = None,
 ) -> str:
     platform = baseline.get("platform", "unknown")
-    measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
-    median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
     generated = fmt_date(latest) if latest else "—"
     repeats = int(latest.get("aggregated_runs", 1)) if latest else 0
     provenance = (
-        f"最近 {repeats} 次同 commit 运行取各项中位数的中位数"
+        f"最近 {repeats} 次同 commit 运行取中位数的中位数"
         if repeats > 1
         else "单次运行"
     )
@@ -875,140 +807,56 @@ def build_markdown(
     parts.append("# trit-db 性能涨跌看板")
     parts.append("")
     parts.append(
-        "> 自动生成，请勿手改。数据来自 `docs/results/bench-baseline.json` 与 "
-        "`docs/results/bench-runs/*.json`，生成脚本 `tools/bench/dashboard.py`。"
+        f"> 基线 `{base_commit}`（2026-11-21）→ 当前 {fmt_commit(latest)}（{generated}）"
+        f" · `{platform}` · {len(rows)} 项 · {provenance} · 延迟越低越好"
     )
     parts.append("")
-    parts.append(f"- **基线**：2026-11-21（`{platform}`，commit `{base_commit}`）")
-    parts.append(
-        f"- **最新**：{generated}（`{platform}`，commit {fmt_commit(latest) if latest else '—'}；{provenance}）"
-    )
-    parts.append("- **口径**：同一平台、同一 `ci` 套件；指标为 6 轮交错的 median 延迟，**越低越好**")
-    parts.append("- **判定**：|Δ| < 5% 记持平；≥5% 记提升/退化；≥20% 记大幅提升/明显退化；基线 < 0.01 ms 记分辨率不足")
+    parts.append("## 1. 汇总")
     parts.append("")
-    parts.append("## 1. 一眼看涨跌")
+    parts.append(method_table(rows, count, single))
     parts.append("")
-    parts.append(
-        f"**{len(rows)} 项基准：{better_count(count)} 项更快、"
-        f"{count[STATUS_FLAT]} 项持平、{worse_count(count)} 项更慢；"
-        f"各项 Δ% 的中位数 {fmt_delta_pct(median_delta)}。**"
-    )
-    parts.append("")
-    parts.append(kpi_table(rows, count))
+    parts.append(highlights_table(rows, single))
     parts.append("")
     parts.append("![bench trend](bench-trend.svg)")
     parts.append("")
-    parts.append("## 2. 逐项涨跌明细")
+    parts.append("## 2. 逐项总表")
     parts.append("")
-    parts.append("按分层、再按 Δ% 从快到慢排列。Δ 为负表示延迟下降（变快），为正表示延迟上升（变慢）。")
+    parts.append(combined_table(rows, single))
     parts.append("")
-    parts.append(detail_table(rows))
-    parts.append("")
-    read_subset = [row for row in measured if row["bench_id"] in READ_CASES]
-    write_subset = [row for row in measured if row["bench_id"] in WRITE_CASES]
-    read_avg = sum(row["delta"] for row in read_subset) / len(read_subset) if read_subset else 0.0
-    write_avg = sum(row["delta"] for row in write_subset) / len(write_subset) if write_subset else 0.0
-    if single:
-        single_rows = single["rows"]
-        single_count = counts(single_rows)
-        single_measured = [row for row in single_rows if row["status"] != STATUS_RESOLUTION]
-        single_median = (
-            statistics.median(row["delta"] for row in single_measured) if single_measured else 0.0
-        )
-        flips = [row for row in single_rows if row["relation"] == "相反"]
-        gap_row = max(single_rows, key=lambda row: row["gap"])
-        flip_text = "、".join(f"`{row['bench_id']}`" for row in flips) or "无"
-        agg_gap = (
-            fmt_delta_pct(gap_row["aggregate_delta"])
-            if gap_row["aggregate_delta"] is not None
-            else "—"
-        )
-        parts.append("## 3. 单次直比（参考）")
-        parts.append("")
-        parts.append(
-            "取基线批次第 1 次与当前批次第 1 次直接相减。**单次结果只用于观察抖动，不参与判定**："
-            f"当前批次同一 commit 的 {len(single['latest_runs'])} 次运行里，DML 的 median 能差一个数量级。"
-        )
-        parts.append("")
-        parts.append(
-            f"单次直比：{better_count(single_count)} 项更快、{single_count[STATUS_FLAT]} 项持平、"
-            f"{worse_count(single_count)} 项更慢，Δ% 中位数 {fmt_delta_pct(single_median)}。"
-            f"与 5 次聚合相比，方向相反的项：{flip_text}；偏差最大的是 `{gap_row['bench_id']}`"
-            f"（单次 {fmt_delta_pct(gap_row['delta'])} vs 聚合 {agg_gap}）。"
-        )
-        parts.append("")
-        parts.append(method_table(rows, count, single))
-        parts.append("")
-        parts.append("**逐项直比**")
-        parts.append("")
-        parts.append(single_table(single))
-        parts.append("")
-        parts.append(
-            "**同 commit 5 次波动区间**"
-            "（每项 median 的 min–max；倍数越大，单次结论越不可信）"
-        )
-        parts.append("")
-        parts.append(volatility_table(single))
-        parts.append("")
-    best_row = min(measured, key=lambda row: row["delta"]) if measured else None
-    parts.append("## 4. 读写路径")
-    parts.append("")
-    parts.append(
-        f"读路径平均 {fmt_delta_pct(read_avg)}，写路径平均 {fmt_delta_pct(write_avg)}；"
-        f"最大单项是 `{best_row['bench_id']}` {fmt_delta_pct(best_row['delta'])}。"
-        if best_row
-        else "没有可比较的基准项。"
-    )
+    parts.append("## 3. 读写路径")
     parts.append("")
     parts.append(path_table(rows))
     parts.append("")
-    parts.append("## 5. 分层涨跌")
+    parts.append("## 4. 分层")
     parts.append("")
     parts.append(layer_table(rows))
     parts.append("")
-    parts.append("## 6. 运行历史")
-    parts.append("")
-    parts.append(
-        f"只把 `{platform}` 的运行与同平台基线比较；同一天、同一 commit 的多轮运行先取"
-        f"各项 median 的中位数，再算涨跌（避免单次 AV/fsync 抖动变成假涨跌）。"
-        "其它平台的运行保留在 `docs/results/bench-runs/`，但不混入本表（跨平台绝对延迟不可比）。"
-    )
+    parts.append("## 5. 运行历史")
     parts.append("")
     parts.append(history_table(baseline, group_runs(runs, platform)))
     parts.append("")
-    parts.append("## 7. 逐项趋势（最近 8 个运行批次）")
+    parts.append("## 6. 建议")
     parts.append("")
-    parts.append(trend_table(baseline, group_runs(runs, platform)))
+    parts.append(suggestion_table(rows, single))
     parts.append("")
-    parts.append("## 8. 后续修改建议")
-    parts.append("")
-    parts.append("按优先级：先降噪，再定位，最后才改代码。")
-    parts.append("")
-    for line in recommendation_lines(rows, single, write_avg):
-        parts.append(line)
-        parts.append("")
-    parts.append("## 9. 口径与复现")
+    parts.append("## 7. 口径")
     parts.append("")
     parts.append("```bash")
-    parts.append("# 本地跑 5 轮（同一 commit 的中位数聚合）并写进 docs/results/bench-runs/")
-    parts.append("python tools/bench/run.py --repeat 5")
-    parts.append("")
-    parts.append("# 只重建看板（不跑基准）")
-    parts.append("python tools/bench/dashboard.py")
-    parts.append("")
-    parts.append("# 回归门限（与基线比较，超过 3 倍才失败）")
+    parts.append("python tools/bench/run.py --repeat 5   # 跑 5 轮并写 docs/results/bench-runs/")
+    parts.append("python tools/bench/dashboard.py      # 只重建看板")
     parts.append("cargo run --release -p tritdb-bench -- check \\")
     parts.append("  --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05")
     parts.append("```")
     parts.append("")
-    parts.append("CI 不跑这套微基准：GitHub 共享 runner 与本机绝对延迟不可比，")
-    parts.append("`bench.yml` 只在 PR 上重新生成看板并要求与提交内容一致；")
-    parts.append("新数据由本机 `python tools/bench/run.py --repeat 5` 记录后提交。")
+    parts.append(
+        "判定：|Δ| < 5% 持平，≥5% 提升/退化，≥20% 大幅提升/明显退化；"
+        "基线 < 0.01 ms 记分辨率不足。CI 只校验看板可复现。"
+    )
     parts.append("")
     other_platforms = sorted({str(run.get("platform")) for run in runs if run.get("platform") != platform})
     if other_platforms:
         parts.append(
-            "已记录但未混入上表的其它平台："
+            "其它平台未混入："
             + "、".join(f"`{item}`" for item in other_platforms)
             + "。"
         )
@@ -1165,14 +1013,11 @@ def readme_block(
     latest: dict | None,
     single: dict | None = None,
 ) -> str:
-    measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
-    median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
-    best = min(measured, key=lambda row: row["delta"])
-    worst = max(measured, key=lambda row: row["delta"])
     date = fmt_date(latest) if latest else "—"
     platform = baseline.get("platform", "unknown")
+    base_commit = str(baseline.get("commit") or "—")
     repeats = int(latest.get("aggregated_runs", 1)) if latest else 0
-    provenance = f"最近 {repeats} 次同 commit 的中位数" if repeats > 1 else "单次运行"
+    provenance = f"最近 {repeats} 次中位数" if repeats > 1 else "单次"
 
     lines = []
     lines.append(README_START)
@@ -1186,82 +1031,26 @@ def readme_block(
     )
     lines.append("")
     lines.append(
-        f"> 基线 2026-11-21 → 最新 {date}（同平台 `{platform}`，{len(rows)} 项 `ci` 套件基准，{provenance}；"
-        "median 延迟越低越好）。"
+        f"> `{base_commit}` → {fmt_commit(latest)} · `{platform}` · {len(rows)} 项 · "
+        f"{provenance} · {date} · 延迟越低越好"
     )
     lines.append("")
     lines.append('![bench trend](docs/results/bench-trend.svg)')
     lines.append("")
-    lines.append(
-        f"**{better_count(count)} 项更快 / {count[STATUS_FLAT]} 项持平 / "
-        f"{worse_count(count)} 项更慢；各项 Δ% 的中位数 {fmt_delta_pct(median_delta)}。**"
-    )
+    lines.append(method_table(rows, count, single))
     lines.append("")
-    read_subset = [row for row in measured if row["bench_id"] in READ_CASES]
-    write_subset = [row for row in measured if row["bench_id"] in WRITE_CASES]
-    read_avg = sum(row["delta"] for row in read_subset) / len(read_subset) if read_subset else 0.0
-    write_avg = sum(row["delta"] for row in write_subset) / len(write_subset) if write_subset else 0.0
-    read_below = sum(1 for row in rows if row["bench_id"] in READ_CASES and row["status"] == STATUS_RESOLUTION)
-    read_note = f"（另 {read_below} 项低于 0.01 ms）" if read_below else ""
-    lines.append(
-        f"> 读路径 {len(read_subset)} 项{read_note}平均 {fmt_delta_pct(read_avg)}，"
-        f"写路径 {len(write_subset)} 项平均 {fmt_delta_pct(write_avg)}。"
-    )
+    lines.append(highlights_table(rows, single))
+    lines.append("")
+    lines.append("**逐项涨跌（5 次聚合 vs 单次直比）**")
+    lines.append("")
+    lines.append(combined_table(rows, single))
+    lines.append("")
+    lines.append("**下一步（前 3 条，完整 6 条见看板）**")
+    lines.append("")
+    lines.append(suggestion_table(rows, single, limit=3))
     lines.append("")
     lines.append(
-        md_table(
-            ["一眼看", "数值"],
-            [
-                ["最大提升", f"`{best['bench_id']}` {fmt_delta_pct(best['delta'])}（{best['speedup']}）"],
-                ["最大退化", f"`{worst['bench_id']}` {fmt_delta_pct(worst['delta'])}（{worst['speedup']}）"],
-                ["提升 / 持平 / 退化", f"{better_count(count)} / {count[STATUS_FLAT]} / {worse_count(count)}"],
-                ["各项 Δ% 中位数", fmt_delta_pct(median_delta)],
-            ],
-        )
-    )
-    lines.append("")
-    if single:
-        lines.append(method_table(rows, count, single))
-        lines.append("")
-    lines.append("<details>")
-    lines.append(f"<summary>逐项涨跌明细（{len(rows)} 项，点开看每一项涨了多少 / 跌了多少）</summary>")
-    lines.append("")
-    lines.append(
-        md_table(
-            ["基准项", "场景", "基线 (ms)", "最新 (ms)", "Δ%", "判定"],
-            [
-                [
-                    f"`{row['bench_id']}`",
-                    row["name"],
-                    fmt_ms(row["base"]),
-                    fmt_ms(row["latest"]),
-                    "—" if row["status"] == STATUS_RESOLUTION else fmt_delta_pct(row["delta"]),
-                    row["status"] if row["status"] != STATUS_RESOLUTION else row["status"],
-                ]
-                for row in rows
-            ],
-        )
-    )
-    lines.append("")
-    lines.append("</details>")
-    if single:
-        lines.append("")
-        lines.append("<details>")
-        lines.append(
-            "<summary>单次直比（仅参考：同一 commit 连跑 5 次，DML 的 median 可差一个数量级）</summary>"
-        )
-        lines.append("")
-        lines.append(readme_single_table(single))
-        lines.append("")
-        lines.append("</details>")
-    lines.append("")
-    lines.append(
-        "> **下一步**：先降噪（A/B 各 10 次），再按层定位写路径（`txn_put` 与 SQL 写项同向）；"
-        "单次表只作噪声参考。完整建议见看板第 8 节。"
-    )
-    lines.append("")
-    lines.append(
-        "分层汇总、单次波动区间、后续修改建议与口径见 "
+        "完整分层 / 历史 / 建议 / 口径见 "
         "[`docs/results/BENCH-DASHBOARD.md`](docs/results/BENCH-DASHBOARD.md)；"
         "原始数据在 [`docs/results/bench-runs/`](docs/results/bench-runs/)。"
     )
