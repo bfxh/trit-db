@@ -88,7 +88,7 @@ fn print_help() {
     println!("  sql-point --rows 4096 --lookups 256");
     println!("  sql-group --rows 4096 --groups 64 --rounds 5");
     println!("  sql-sort --rows 4096 --limit 64 --rounds 5");
-    println!("  sql-insert --rows 512 --rounds 5");
+    println!("  sql-insert --rows 512 --rounds 5 [--reset-each-round]");
     println!("  sql-update --rows 4096 --cutoff 512 --rounds 3");
     println!("  sql-delete --rows 4096 --cutoff 512 --rounds 3");
     println!("  sql-subquery --rows 2048 --rounds 3 [--query in|exists|scalar|all]");
@@ -970,8 +970,8 @@ fn run_sql_join(args: &[String]) {
         rows, name, rounds, stats.min, stats.median, stats.max, matches
     );
     println!(
-        "{{\"bench_id\":\"sql_join\",\"rows\":{},\"strategy\":\"{}\",\"rounds\":{},\"join_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
-        rows, name, rounds, stats.min, stats.median, stats.max, matches
+        "{{\"bench_id\":\"sql_join\",\"rows\":{},\"strategy\":\"{}\",\"rounds\":{},\"join_ms\":[{:.3},{:.3},{:.3}],\"matches\":{},\"samples\":[{}]}}",
+        rows, name, rounds, stats.min, stats.median, stats.max, matches, stats.samples_json()
     );
 }
 
@@ -1335,8 +1335,8 @@ fn run_sql_scan(args: &[String]) {
         rows, selectivity, rounds, stats.min, stats.median, stats.max, expected
     );
     println!(
-        "{{\"bench_id\":\"sql_scan\",\"rows\":{},\"selectivity\":{},\"rounds\":{},\"scan_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
-        rows, selectivity, rounds, stats.min, stats.median, stats.max, expected
+        "{{\"bench_id\":\"sql_scan\",\"rows\":{},\"selectivity\":{},\"rounds\":{},\"scan_ms\":[{:.3},{:.3},{:.3}],\"matches\":{},\"samples\":[{}]}}",
+        rows, selectivity, rounds, stats.min, stats.median, stats.max, expected, stats.samples_json()
     );
 }
 
@@ -1389,8 +1389,8 @@ fn run_sql_point(args: &[String]) {
         rows, lookups, stats.min, stats.median, stats.max
     );
     println!(
-        "{{\"bench_id\":\"sql_point\",\"rows\":{},\"lookups\":{},\"point_ms\":[{:.3},{:.3},{:.3}]}}",
-        rows, lookups, stats.min, stats.median, stats.max
+        "{{\"bench_id\":\"sql_point\",\"rows\":{},\"lookups\":{},\"point_ms\":[{:.3},{:.3},{:.3}],\"samples\":[{}]}}",
+        rows, lookups, stats.min, stats.median, stats.max, stats.samples_json()
     );
 }
 
@@ -1440,8 +1440,8 @@ fn run_sql_group(args: &[String]) {
         rows, groups, rounds, stats.min, stats.median, stats.max, expected
     );
     println!(
-        "{{\"bench_id\":\"sql_group\",\"rows\":{},\"groups\":{},\"rounds\":{},\"group_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
-        rows, groups, rounds, stats.min, stats.median, stats.max, expected
+        "{{\"bench_id\":\"sql_group\",\"rows\":{},\"groups\":{},\"rounds\":{},\"group_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{},\"samples\":[{}]}}",
+        rows, groups, rounds, stats.min, stats.median, stats.max, expected, stats.samples_json()
     );
 }
 
@@ -1491,8 +1491,8 @@ fn run_sql_sort(args: &[String]) {
         rows, limit, rounds, stats.min, stats.median, stats.max, expected
     );
     println!(
-        "{{\"bench_id\":\"sql_sort\",\"rows\":{},\"limit\":{},\"rounds\":{},\"sort_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
-        rows, limit, rounds, stats.min, stats.median, stats.max, expected
+        "{{\"bench_id\":\"sql_sort\",\"rows\":{},\"limit\":{},\"rounds\":{},\"sort_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{},\"samples\":[{}]}}",
+        rows, limit, rounds, stats.min, stats.median, stats.max, expected, stats.samples_json()
     );
 }
 
@@ -1513,6 +1513,7 @@ fn reset_scan_table(engine: &mut SqlEngine, rows: usize, groups: usize) {
 fn run_sql_insert(args: &[String]) {
     let batch = arg_usize(args, "--rows", 512);
     let rounds = arg_usize(args, "--rounds", 5).max(1);
+    let reset_each_round = args.iter().any(|arg| arg == "--reset-each-round");
     if batch == 0 {
         eprintln!("--rows must be greater than 0");
         std::process::exit(2);
@@ -1525,10 +1526,20 @@ fn run_sql_insert(args: &[String]) {
 
     let mut samples = Vec::with_capacity(rounds);
     let mut inserted = 0usize;
-    for _ in 0..rounds {
+    for round in 0..rounds {
+        // By default rows accumulate across rounds, so the workload grows.
+        // The opt-in reset mode opens a fresh database and times the same
+        // batch against an empty table every round, making rounds comparable.
+        if reset_each_round && round > 0 {
+            drop(engine);
+            let round_db = dir.0.join(format!("sql-insert-{round}.db"));
+            engine = SqlEngine::open(&round_db).expect("open fresh SQL engine");
+            create_scan_table(&mut engine);
+        }
+        let base = if reset_each_round { 0 } else { inserted };
         let mut sql = String::from("INSERT INTO t (id, payload, grp) VALUES ");
         for offset in 0..batch {
-            let id = inserted + offset;
+            let id = base + offset;
             write!(
                 &mut sql,
                 "({id}, {}, {})",
@@ -1559,18 +1570,39 @@ fn run_sql_insert(args: &[String]) {
     let Value::Int(count) = rows[0][0] else {
         panic!("COUNT did not return INT");
     };
-    assert_eq!(count as usize, inserted, "inserted row count mismatch");
+    let expected_final = if reset_each_round { batch } else { inserted };
+    assert_eq!(
+        count as usize, expected_final,
+        "inserted row count mismatch"
+    );
 
     let stats = Stats::new(samples);
     let rows_per_sec = batch as f64 / (stats.median.max(f64::MIN_POSITIVE) / 1000.0);
-    println!("batch\trounds\tinsert_ms(min/med/max)\trows_per_sec\tinserted");
+    println!("batch\trounds\tinsert_ms(min/med/max)\trows_per_sec\tinserted\tfinal_rows\treset");
     println!(
-        "{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.0}\t{}",
-        batch, rounds, stats.min, stats.median, stats.max, rows_per_sec, inserted
+        "{}\t{}\t{:.3}/{:.3}/{:.3}\t{:.0}\t{}\t{}\t{}",
+        batch,
+        rounds,
+        stats.min,
+        stats.median,
+        stats.max,
+        rows_per_sec,
+        inserted,
+        expected_final,
+        reset_each_round
     );
     println!(
-        "{{\"bench_id\":\"sql_insert\",\"batch\":{},\"rounds\":{},\"insert_ms\":[{:.3},{:.3},{:.3}],\"rows_per_sec\":{:.0},\"inserted\":{}}}",
-        batch, rounds, stats.min, stats.median, stats.max, rows_per_sec, inserted
+        "{{\"bench_id\":\"sql_insert\",\"batch\":{},\"rounds\":{},\"insert_ms\":[{:.3},{:.3},{:.3}],\"rows_per_sec\":{:.0},\"inserted\":{},\"final_rows\":{},\"reset\":{},\"samples\":[{}]}}",
+        batch,
+        rounds,
+        stats.min,
+        stats.median,
+        stats.max,
+        rows_per_sec,
+        inserted,
+        expected_final,
+        reset_each_round,
+        stats.samples_json()
     );
 }
 
@@ -1615,8 +1647,8 @@ fn run_sql_update(args: &[String]) {
         rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
     );
     println!(
-        "{{\"bench_id\":\"sql_update\",\"rows\":{},\"cutoff\":{},\"rounds\":{},\"update_ms\":[{:.3},{:.3},{:.3}],\"updated\":{}}}",
-        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
+        "{{\"bench_id\":\"sql_update\",\"rows\":{},\"cutoff\":{},\"rounds\":{},\"update_ms\":[{:.3},{:.3},{:.3}],\"updated\":{},\"samples\":[{}]}}",
+        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected, stats.samples_json()
     );
 }
 
@@ -1661,8 +1693,8 @@ fn run_sql_delete(args: &[String]) {
         rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
     );
     println!(
-        "{{\"bench_id\":\"sql_delete\",\"rows\":{},\"cutoff\":{},\"rounds\":{},\"delete_ms\":[{:.3},{:.3},{:.3}],\"deleted\":{}}}",
-        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected
+        "{{\"bench_id\":\"sql_delete\",\"rows\":{},\"cutoff\":{},\"rounds\":{},\"delete_ms\":[{:.3},{:.3},{:.3}],\"deleted\":{},\"samples\":[{}]}}",
+        rows, cutoff, rounds, stats.min, stats.median, stats.max, expected, stats.samples_json()
     );
 }
 
@@ -1736,8 +1768,8 @@ fn run_sql_subquery(args: &[String]) {
             rows, name, rounds, stats.min, stats.median, stats.max, matches
         );
         println!(
-            "{{\"bench_id\":\"sql_subquery\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"subquery_ms\":[{:.3},{:.3},{:.3}],\"matches\":{}}}",
-            rows, name, rounds, stats.min, stats.median, stats.max, matches
+            "{{\"bench_id\":\"sql_subquery\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"subquery_ms\":[{:.3},{:.3},{:.3}],\"matches\":{},\"samples\":[{}]}}",
+            rows, name, rounds, stats.min, stats.median, stats.max, matches, stats.samples_json()
         );
     }
 }
@@ -1808,8 +1840,8 @@ fn run_sql_window(args: &[String]) {
             rows, name, rounds, stats.min, stats.median, stats.max, result_rows
         );
         println!(
-            "{{\"bench_id\":\"sql_window\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"window_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{}}}",
-            rows, name, rounds, stats.min, stats.median, stats.max, result_rows
+            "{{\"bench_id\":\"sql_window\",\"rows\":{},\"query\":\"{}\",\"rounds\":{},\"window_ms\":[{:.3},{:.3},{:.3}],\"result_rows\":{},\"samples\":[{}]}}",
+            rows, name, rounds, stats.min, stats.median, stats.max, result_rows, stats.samples_json()
         );
     }
 }
@@ -1875,9 +1907,9 @@ fn run_pstore_scan(args: &[String]) {
         pages_per_sec
     );
     println!(
-        "{{\"bench_id\":\"pstore_scan\",\"pages\":{},\"payload\":{},\"mode\":\"{}\",\"rounds\":{},\"scan_ms\":[{:.3},{:.3},{:.3}],\"pages_per_sec\":{:.0}}}",
+        "{{\"bench_id\":\"pstore_scan\",\"pages\":{},\"payload\":{},\"mode\":\"{}\",\"rounds\":{},\"scan_ms\":[{:.3},{:.3},{:.3}],\"pages_per_sec\":{:.0},\"samples\":[{}]}}",
         pages, payload_len, if cold { "cold" } else { "warm" }, rounds,
-        stats.min, stats.median, stats.max, pages_per_sec
+        stats.min, stats.median, stats.max, pages_per_sec, stats.samples_json()
     );
 }
 
@@ -1938,9 +1970,9 @@ fn run_txn_put(args: &[String]) {
         syncs_max
     );
     println!(
-        "{{\"bench_id\":\"txn_put\",\"txns\":{},\"keys_per_txn\":{},\"keys\":{},\"wal_bytes\":{},\"rounds\":{},\"put_ms\":[{:.3},{:.3},{:.3}],\"txns_per_sec\":{:.0},\"syncs\":[{},{}]}}",
+        "{{\"bench_id\":\"txn_put\",\"txns\":{},\"keys_per_txn\":{},\"keys\":{},\"wal_bytes\":{},\"rounds\":{},\"put_ms\":[{:.3},{:.3},{:.3}],\"txns_per_sec\":{:.0},\"syncs\":[{},{}],\"samples\":[{}]}}",
         txns, keys_per_txn, keys, wal_bytes, rounds,
-        stats.min, stats.median, stats.max, txns_per_sec, syncs_min, syncs_max
+        stats.min, stats.median, stats.max, txns_per_sec, syncs_min, syncs_max, stats.samples_json()
     );
 }
 
@@ -2048,8 +2080,8 @@ fn run_pgwire_roundtrip(args: &[String]) {
         rows, queries, rounds, stats.min, stats.median, stats.max, qps
     );
     println!(
-        "{{\"bench_id\":\"pgwire_roundtrip\",\"rows\":{},\"queries\":{},\"rounds\":{},\"roundtrip_ms\":[{:.4},{:.4},{:.4}],\"qps\":{:.0}}}",
-        rows, queries, rounds, stats.min, stats.median, stats.max, qps
+        "{{\"bench_id\":\"pgwire_roundtrip\",\"rows\":{},\"queries\":{},\"rounds\":{},\"roundtrip_ms\":[{:.4},{:.4},{:.4}],\"qps\":{:.0},\"samples\":[{}]}}",
+        rows, queries, rounds, stats.min, stats.median, stats.max, qps, stats.samples_json()
     );
 }
 
@@ -2117,8 +2149,9 @@ fn run_ann_knn(args: &[String]) {
         warm.certain.len()
     );
     println!(
-        "{{\"bench_id\":\"ann_knn\",\"points\":{},\"dims\":{},\"k\":{},\"rounds\":{},\"knn_ms\":[{:.3},{:.3},{:.3}],\"points_per_sec\":{:.0},\"certain\":{}}}",
-        count, dims, k, rounds, stats.min, stats.median, stats.max, points_per_sec, warm.certain.len()
+        "{{\"bench_id\":\"ann_knn\",\"points\":{},\"dims\":{},\"k\":{},\"rounds\":{},\"knn_ms\":[{:.3},{:.3},{:.3}],\"points_per_sec\":{:.0},\"certain\":{},\"samples\":[{}]}}",
+        count, dims, k, rounds, stats.min, stats.median, stats.max, points_per_sec,
+        warm.certain.len(), stats.samples_json()
     );
 }
 
@@ -2184,9 +2217,9 @@ fn run_graph_reach(args: &[String]) {
         warm.answer
     );
     println!(
-        "{{\"bench_id\":\"graph_reach\",\"nodes\":{},\"edges\":{},\"fanout\":{},\"hops\":{},\"rounds\":{},\"reach_ms\":[{:.3},{:.3},{:.3}],\"answer\":\"{:?}\"}}",
+        "{{\"bench_id\":\"graph_reach\",\"nodes\":{},\"edges\":{},\"fanout\":{},\"hops\":{},\"rounds\":{},\"reach_ms\":[{:.3},{:.3},{:.3}],\"answer\":\"{:?}\",\"samples\":[{}]}}",
         nodes, graph.edge_count(), fanout, hops, rounds,
-        stats.min, stats.median, stats.max, warm.answer
+        stats.min, stats.median, stats.max, warm.answer, stats.samples_json()
     );
 }
 
@@ -2227,7 +2260,14 @@ const CI_CASES: &[CaseSpec] = &[
     },
     CaseSpec {
         bench_id: "sql_insert",
-        args: &["sql-insert", "--rows", "128", "--rounds", "2"],
+        args: &[
+            "sql-insert",
+            "--rows",
+            "128",
+            "--rounds",
+            "10",
+            "--reset-each-round",
+        ],
     },
     CaseSpec {
         bench_id: "sql_update",
@@ -2373,10 +2413,10 @@ fn rounds_override(args: &[String]) -> Option<usize> {
 
 fn case_args(spec: &CaseSpec, rounds: Option<usize>) -> Vec<String> {
     let mut args: Vec<String> = spec.args.iter().map(|arg| arg.to_string()).collect();
-    // sql_insert keeps appending rows across rounds, so raising --rounds
-    // changes the workload shape instead of reducing noise.  Leave its two
-    // rounds alone; use repeated `record` runs for that case.
-    let scalable = spec.bench_id != "sql_insert";
+    // The default sql_insert workload appends rows across rounds, so raising
+    // --rounds changes the workload shape instead of reducing noise.  A case
+    // that opts into --reset-each-round is safe to scale.
+    let scalable = spec.bench_id != "sql_insert" || spec.args.contains(&"--reset-each-round");
     if let Some(rounds) = rounds.filter(|_| scalable) {
         if let Some(index) = args.iter().position(|arg| arg == "--rounds") {
             if index + 1 < args.len() {
@@ -2389,8 +2429,41 @@ fn case_args(spec: &CaseSpec, rounds: Option<usize>) -> Vec<String> {
     args
 }
 
+/// One benchmark run's aggregated numbers plus the raw per-round samples.
+struct CaseResult {
+    min: f64,
+    median: f64,
+    max: f64,
+    samples: Vec<f64>,
+}
+
+/// Extracts raw `samples` from a benchmark JSON line.  Older binaries did not
+/// emit this field, so an empty vector is a valid fallback.
+fn find_samples(line: &str) -> Vec<f64> {
+    let marker = "\"samples\":[";
+    let Some(start) = line.find(marker).map(|index| index + marker.len()) else {
+        return Vec::new();
+    };
+    let rest = &line[start..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    rest[..end]
+        .split(',')
+        .filter_map(|value| value.trim().parse::<f64>().ok())
+        .collect()
+}
+
+fn format_samples(samples: &[f64]) -> String {
+    samples
+        .iter()
+        .map(|sample| format!("{sample:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Runs one benchmark case as a child process and parses its measurement.
-fn run_case(exe: &Path, spec: &CaseSpec, rounds: Option<usize>) -> Result<(f64, f64, f64), String> {
+fn run_case(exe: &Path, spec: &CaseSpec, rounds: Option<usize>) -> Result<CaseResult, String> {
     let args = case_args(spec, rounds);
     let output = std::process::Command::new(exe)
         .args(&args)
@@ -2402,8 +2475,13 @@ fn run_case(exe: &Path, spec: &CaseSpec, rounds: Option<usize>) -> Result<(f64, 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if line.contains("\"bench_id\"") {
-            if let Some(triplet) = find_ms_triplet(line) {
-                return Ok(triplet);
+            if let Some((min, median, max)) = find_ms_triplet(line) {
+                return Ok(CaseResult {
+                    min,
+                    median,
+                    max,
+                    samples: find_samples(line),
+                });
             }
         }
     }
@@ -2434,7 +2512,7 @@ fn run_record(args: &[String]) {
         eprintln!("recording {}", spec.bench_id);
         let case_args = case_args(spec, rounds);
         match run_case(&exe, spec, rounds) {
-            Ok(triplet) => recorded.push((spec, case_args, triplet)),
+            Ok(result) => recorded.push((spec, case_args, result)),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -2446,15 +2524,16 @@ fn run_record(args: &[String]) {
     json.push_str("{\n  \"format\": 1,\n  \"suite\": \"ci\",\n");
     writeln!(&mut json, "  \"platform\": \"{platform}\",").expect("write baseline");
     json.push_str("  \"cases\": [\n");
-    for (index, (spec, case_args, (min, median, max))) in recorded.iter().enumerate() {
+    for (index, (spec, case_args, result)) in recorded.iter().enumerate() {
         writeln!(
             &mut json,
-            "    {{\"bench_id\":\"{}\",\"args\":\"{}\",\"min_ms\":{:.6},\"median_ms\":{:.6},\"max_ms\":{:.6}}}{}",
+            "    {{\"bench_id\":\"{}\",\"args\":\"{}\",\"min_ms\":{:.6},\"median_ms\":{:.6},\"max_ms\":{:.6},\"samples\":[{}]}}{}",
             spec.bench_id,
             case_args.join(" "),
-            min,
-            median,
-            max,
+            result.min,
+            result.median,
+            result.max,
+            format_samples(&result.samples),
             if index + 1 < recorded.len() { "," } else { "" }
         )
         .expect("write baseline");
@@ -2473,15 +2552,15 @@ fn run_record(args: &[String]) {
         md.push_str(
             "| case | 参数 | min (ms) | median (ms) | max (ms) |\n|---|---|---:|---:|---:|\n",
         );
-        for (spec, case_args, (min, median, max)) in &recorded {
+        for (spec, case_args, result) in &recorded {
             writeln!(
                 &mut md,
                 "| `{}` | `{}` | {:.4} | {:.4} | {:.4} |",
                 spec.bench_id,
                 case_args.join(" "),
-                min,
-                median,
-                max
+                result.min,
+                result.median,
+                result.max
             )
             .expect("write markdown");
         }
@@ -2585,7 +2664,7 @@ fn run_check(args: &[String]) {
         }
         let mut current_samples = Vec::new();
         match run_case(&exe, spec, rounds) {
-            Ok((_, median, _)) => current_samples.push(median),
+            Ok(result) => current_samples.push(result.median),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -2602,7 +2681,7 @@ fn run_check(args: &[String]) {
             attempts += 1;
             eprintln!("{bench_id}: over tolerance, re-running (attempt {attempts}/{retries})");
             match run_case(&exe, spec, rounds) {
-                Ok((_, median, _)) => current_samples.push(median),
+                Ok(result) => current_samples.push(result.median),
                 Err(error) => {
                     eprintln!("{error}");
                     std::process::exit(1);
@@ -2779,11 +2858,15 @@ struct Stats {
     min: f64,
     median: f64,
     max: f64,
+    /// Sorted individual rounds.  Kept so `record` can persist the distribution
+    /// instead of only min/median/max.
+    samples: Vec<f64>,
 }
 
 impl Stats {
     fn new(mut samples: Vec<f64>) -> Self {
         assert!(!samples.is_empty());
+        let raw_samples = samples.clone();
         samples.sort_by(|a, b| a.partial_cmp(b).expect("finite sample"));
         let len = samples.len();
         let median = if len.is_multiple_of(2) {
@@ -2795,7 +2878,13 @@ impl Stats {
             min: samples[0],
             median,
             max: samples[len - 1],
+            samples: raw_samples,
         }
+    }
+
+    /// JSON fragment for the raw per-round numbers, e.g. `1.2,1.3,1.4`.
+    fn samples_json(&self) -> String {
+        format_samples(&self.samples)
     }
 }
 
@@ -2822,7 +2911,7 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_args, parse_baseline, CaseSpec};
+    use super::{case_args, find_samples, parse_baseline, CaseSpec};
 
     #[test]
     fn parses_pretty_and_compact_baseline_cases() {
@@ -2877,5 +2966,35 @@ mod tests {
             case_args(&insert, Some(10)),
             vec!["sql-insert", "--rows", "128", "--rounds", "2"]
         );
+
+        let reset_insert = CaseSpec {
+            bench_id: "sql_insert",
+            args: &[
+                "sql-insert",
+                "--rows",
+                "128",
+                "--rounds",
+                "2",
+                "--reset-each-round",
+            ],
+        };
+        assert_eq!(
+            case_args(&reset_insert, Some(10)),
+            vec![
+                "sql-insert",
+                "--rows",
+                "128",
+                "--rounds",
+                "10",
+                "--reset-each-round"
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_raw_samples_from_bench_json() {
+        let line = r#"{"bench_id":"sql_scan","scan_ms":[0.1,0.12,0.15],"samples":[0.100000,0.120000,0.150000]}"#;
+        assert_eq!(find_samples(line), vec![0.1, 0.12, 0.15]);
+        assert!(find_samples(r#"{"bench_id":"old","scan_ms":[0.1,0.12,0.15]}"#).is_empty());
     }
 }

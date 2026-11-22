@@ -84,11 +84,11 @@
 |---|---|---|
 | P0 | 降噪：A/B 交替 20 对；固定电源、绑核、Defender 排除 | `sql_delete` 5 次 1.211–24.735 ms，20.4× |
 | P0 | 写路径判定改用 A/B：不再按 5 次聚合判退化 | 4 项 A/B +0.8%，0 退化；`txn_put` +18.4% → -1.9% |
-| P0 | 微基准加轮次：update / delete / txn-put 提到 10 轮；insert 保持 2 轮（每轮累积行） | `sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5% |
+| P0 | 微基准加轮次：update / delete / txn-put 10 轮；insert 每轮 reset 后 10 轮 | `sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5% |
 | P1 | 锁收益：`sql_subquery` 加入 `exists` / `scalar`，设不回退门限 | `sql_subquery` -52.5%（0.3220 → 0.1530 ms） |
 | P1 | 放大 `graph_reach` 规模，或改 1000 次批量计时 | 当前 0.0010 ms，低于 0.01 ms 分辨率 |
 | P2 | CI 按平台各存基线，或在 Windows runner 定时跑基准 | 现在用 Windows 基线在 Ubuntu 上只挡 3× 量级 |
-| P2 | `record` 存原始 samples，看板补 p50 / p90 与箱线图 | 当前 JSON 只有 min / median / max |
+| P2 | 看板补 p50 / p90 与箱线图 | `record` 已把每轮 samples 写进 JSON；看板仍只显示 min / median / max |
 
 ## 7. 口径
 
@@ -102,5 +102,5 @@ cargo run --release -p tritdb-bench -- check \
   --rounds 10 --retries 2
 ```
 
-判定：|Δ| < 5% 持平，≥5% 提升/退化，≥20% 大幅提升/明显退化；基线 < 0.01 ms 记分辨率不足。写路径以 A/B 复核为准，5 次表保留作历史。CI 只校验看板可复现。
+判定：|Δ| < 5% 持平，≥5% 提升/退化，≥20% 大幅提升/明显退化；基线 < 0.01 ms 记分辨率不足。写路径以 A/B 复核为准，5 次表保留作历史。`sql_insert` 自本轮起改为每轮 reset；此前的 5 次值是累积语义。`record` 输出每轮 `samples`，`promote_baseline.py` 会把 5 次运行的样本合并进基线。CI 只校验看板可复现。
 

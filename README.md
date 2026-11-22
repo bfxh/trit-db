@@ -60,7 +60,7 @@
 |---|---|---|
 | P0 | 降噪：A/B 交替 20 对；固定电源、绑核、Defender 排除 | `sql_delete` 5 次 1.211–24.735 ms，20.4× |
 | P0 | 写路径判定改用 A/B：不再按 5 次聚合判退化 | 4 项 A/B +0.8%，0 退化；`txn_put` +18.4% → -1.9% |
-| P0 | 微基准加轮次：update / delete / txn-put 提到 10 轮；insert 保持 2 轮（每轮累积行） | `sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5% |
+| P0 | 微基准加轮次：update / delete / txn-put 10 轮；insert 每轮 reset 后 10 轮 | `sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5% |
 
 完整分层 / 历史 / 建议 / 口径见 [`docs/results/BENCH-DASHBOARD.md`](docs/results/BENCH-DASHBOARD.md)；原始数据在 [`docs/results/bench-runs/`](docs/results/bench-runs/)。
 <!-- BENCH-SUMMARY:END -->

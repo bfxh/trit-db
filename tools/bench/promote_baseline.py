@@ -78,23 +78,33 @@ def main() -> int:
                 continue
             entry = per_case.setdefault(
                 bench_id,
-                {"args": str(case.get("args") or ""), "medians": [], "mins": [], "maxs": []},
+                {
+                    "args": str(case.get("args") or ""),
+                    "medians": [],
+                    "mins": [],
+                    "maxs": [],
+                    "samples": [],
+                },
             )
             entry["medians"].append(float(case["median_ms"]))
             entry["mins"].append(float(case["min_ms"]))
             entry["maxs"].append(float(case["max_ms"]))
+            samples = case.get("samples")
+            if isinstance(samples, list):
+                entry["samples"].extend(float(sample) for sample in samples)
 
     cases = []
     for bench_id, entry in per_case.items():
-        cases.append(
-            {
-                "bench_id": bench_id,
-                "args": entry["args"],
-                "min_ms": min(entry["mins"]),
-                "median_ms": statistics.median(entry["medians"]),
-                "max_ms": max(entry["maxs"]),
-            }
-        )
+        case = {
+            "bench_id": bench_id,
+            "args": entry["args"],
+            "min_ms": min(entry["mins"]),
+            "median_ms": statistics.median(entry["medians"]),
+            "max_ms": max(entry["maxs"]),
+        }
+        if entry["samples"]:
+            case["samples"] = entry["samples"]
+        cases.append(case)
 
     last = selected[-1]
     baseline = {

@@ -931,7 +931,7 @@ def suggestion_table(
         data.append(
             [
                 "P0",
-                "微基准加轮次：update / delete / txn-put 提到 10 轮；insert 保持 2 轮（每轮累积行）",
+                "微基准加轮次：update / delete / txn-put 10 轮；insert 每轮 reset 后 10 轮",
                 "`sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5%",
             ]
         )
@@ -974,8 +974,8 @@ def suggestion_table(
     data.append(
         [
             "P2",
-            "`record` 存原始 samples，看板补 p50 / p90 与箱线图",
-            "当前 JSON 只有 min / median / max",
+            "看板补 p50 / p90 与箱线图",
+            "`record` 已把每轮 samples 写进 JSON；看板仍只显示 min / median / max",
         ]
     )
     selected = data[:limit] if limit else data
@@ -1073,6 +1073,8 @@ def build_markdown(
     parts.append(
         "判定：|Δ| < 5% 持平，≥5% 提升/退化，≥20% 大幅提升/明显退化；"
         "基线 < 0.01 ms 记分辨率不足。写路径以 A/B 复核为准，5 次表保留作历史。"
+        "`sql_insert` 自本轮起改为每轮 reset；此前的 5 次值是累积语义。"
+        "`record` 输出每轮 `samples`，`promote_baseline.py` 会把 5 次运行的样本合并进基线。"
         "CI 只校验看板可复现。"
     )
     parts.append("")
