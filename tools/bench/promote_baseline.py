@@ -16,11 +16,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,10 +126,17 @@ def main() -> int:
         }
         if entry["samples"]:
             case["samples"] = entry["samples"]
+            case["p50_ms"] = percentile(entry["samples"], 0.50)
+            case["p90_ms"] = percentile(entry["samples"], 0.90)
         if entry["rss_before"]:
             case["rss_before_kb"] = statistics.median(entry["rss_before"])
         if entry["rss_after"]:
             case["rss_kb"] = statistics.median(entry["rss_after"])
+        if entry["rss_before"] and entry["rss_after"]:
+            case["rss_delta_kb"] = statistics.median(
+                float(after) - float(before)
+                for before, after in zip(entry["rss_before"], entry["rss_after"])
+            )
         cases.append(case)
 
     last = selected[-1]
@@ -143,14 +164,45 @@ def main() -> int:
         lines.append(f"- 平台：`{baseline['platform']}`")
         lines.append(f"- 套件：`{baseline['suite']}`（小规模、秒级；不代表性能上限，只用于捕获数量级回归）")
         lines.append(f"- 基线 commit：`{baseline['commit']}`")
+        lines.append(
+            "- 测量口径：`1865f65` bench harness；全部 case 10 轮，"
+            "`sql_insert` 每轮 reset，RSS 在 case 前后采集；生产代码仍为基线 commit"
+        )
         lines.append(f"- 口径：每项 `median_ms` 取 {len(selected)} 次运行 median 的中位数；`min_ms` 取最小值，`max_ms` 取最大值")
+        lines.append("- 样本：`samples` 合并 5 次运行的全部逐轮值；`p50` / `p90` 由样本计算")
+        lines.append("- 内存：`rss_before_kb` / `rss_kb` 取 5 次运行的进程 RSS 中位数，`rss_delta_kb` 为对应增量")
         lines.append("")
-        lines.append("| case | 参数 | min (ms) | median (ms) | max (ms) |")
-        lines.append("|---|---|---:|---:|---:|")
+        lines.append("| case | 参数 | 样本数 | min (ms) | median (ms) | max (ms) | p50 (ms) | p90 (ms) | RSS 前→后 (MiB) | ΔRSS |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for case in cases:
+            samples = case.get("samples") or []
+            before = case.get("rss_before_kb")
+            after = case.get("rss_kb")
+            rss = (
+                f"{float(before) / 1024.0:.1f} → {float(after) / 1024.0:.1f}"
+                if isinstance(before, (int, float)) and isinstance(after, (int, float))
+                else "—"
+            )
+            delta = (
+                f"{float(case['rss_delta_kb']) / 1024.0:+.1f} MiB"
+                if isinstance(case.get("rss_delta_kb"), (int, float))
+                else "—"
+            )
+            p50 = (
+                f"{float(case['p50_ms']):.4f}"
+                if isinstance(case.get("p50_ms"), (int, float))
+                else "—"
+            )
+            p90 = (
+                f"{float(case['p90_ms']):.4f}"
+                if isinstance(case.get("p90_ms"), (int, float))
+                else "—"
+            )
             lines.append(
-                f"| `{case['bench_id']}` | `{case['args']}` | {case['min_ms']:.4f} | "
-                f"{case['median_ms']:.4f} | {case['max_ms']:.4f} |"
+                f"| `{case['bench_id']}` | `{case['args']}` | {len(samples) or '—'} | "
+                f"{case['min_ms']:.4f} | {case['median_ms']:.4f} | {case['max_ms']:.4f} | "
+                f"{p50} | {p90} | "
+                f"{rss} | {delta} |"
             )
         lines.append("")
         lines.append("## 如何更新基线")

@@ -1,0 +1,2001 @@
+bench_id,layer,source,run,round,ms
+sql_scan,SQL 执行,baseline,1,1,0.103300
+sql_scan,SQL 执行,baseline,1,2,0.102700
+sql_scan,SQL 执行,baseline,1,3,0.106000
+sql_scan,SQL 执行,baseline,1,4,0.095300
+sql_scan,SQL 执行,baseline,1,5,0.101500
+sql_scan,SQL 执行,baseline,1,6,0.105800
+sql_scan,SQL 执行,baseline,1,7,0.096000
+sql_scan,SQL 执行,baseline,1,8,0.098400
+sql_scan,SQL 执行,baseline,1,9,0.106800
+sql_scan,SQL 执行,baseline,1,10,0.105200
+sql_scan,SQL 执行,baseline,2,1,0.094400
+sql_scan,SQL 执行,baseline,2,2,0.099700
+sql_scan,SQL 执行,baseline,2,3,0.101400
+sql_scan,SQL 执行,baseline,2,4,0.089700
+sql_scan,SQL 执行,baseline,2,5,0.093300
+sql_scan,SQL 执行,baseline,2,6,0.099300
+sql_scan,SQL 执行,baseline,2,7,0.095300
+sql_scan,SQL 执行,baseline,2,8,0.095500
+sql_scan,SQL 执行,baseline,2,9,0.098500
+sql_scan,SQL 执行,baseline,2,10,0.102300
+sql_scan,SQL 执行,baseline,3,1,0.095700
+sql_scan,SQL 执行,baseline,3,2,0.110000
+sql_scan,SQL 执行,baseline,3,3,0.111000
+sql_scan,SQL 执行,baseline,3,4,0.113100
+sql_scan,SQL 执行,baseline,3,5,0.105600
+sql_scan,SQL 执行,baseline,3,6,0.129100
+sql_scan,SQL 执行,baseline,3,7,0.097000
+sql_scan,SQL 执行,baseline,3,8,0.108000
+sql_scan,SQL 执行,baseline,3,9,0.101700
+sql_scan,SQL 执行,baseline,3,10,0.108900
+sql_scan,SQL 执行,baseline,4,1,0.117100
+sql_scan,SQL 执行,baseline,4,2,0.113300
+sql_scan,SQL 执行,baseline,4,3,0.125000
+sql_scan,SQL 执行,baseline,4,4,0.114000
+sql_scan,SQL 执行,baseline,4,5,0.110600
+sql_scan,SQL 执行,baseline,4,6,0.117900
+sql_scan,SQL 执行,baseline,4,7,0.113600
+sql_scan,SQL 执行,baseline,4,8,0.101200
+sql_scan,SQL 执行,baseline,4,9,0.103700
+sql_scan,SQL 执行,baseline,4,10,0.120200
+sql_scan,SQL 执行,baseline,5,1,0.088500
+sql_scan,SQL 执行,baseline,5,2,0.106900
+sql_scan,SQL 执行,baseline,5,3,0.118600
+sql_scan,SQL 执行,baseline,5,4,0.110400
+sql_scan,SQL 执行,baseline,5,5,0.124200
+sql_scan,SQL 执行,baseline,5,6,0.106300
+sql_scan,SQL 执行,baseline,5,7,0.111300
+sql_scan,SQL 执行,baseline,5,8,0.113100
+sql_scan,SQL 执行,baseline,5,9,0.106500
+sql_scan,SQL 执行,baseline,5,10,0.103200
+sql_point,SQL 执行,baseline,1,1,0.121600
+sql_point,SQL 执行,baseline,1,2,0.117200
+sql_point,SQL 执行,baseline,1,3,0.097300
+sql_point,SQL 执行,baseline,1,4,0.104300
+sql_point,SQL 执行,baseline,1,5,0.115900
+sql_point,SQL 执行,baseline,1,6,0.108100
+sql_point,SQL 执行,baseline,1,7,0.087600
+sql_point,SQL 执行,baseline,1,8,0.086400
+sql_point,SQL 执行,baseline,1,9,0.099600
+sql_point,SQL 执行,baseline,1,10,0.093600
+sql_point,SQL 执行,baseline,1,11,0.092700
+sql_point,SQL 执行,baseline,1,12,0.091900
+sql_point,SQL 执行,baseline,1,13,0.114200
+sql_point,SQL 执行,baseline,1,14,0.117000
+sql_point,SQL 执行,baseline,1,15,0.106900
+sql_point,SQL 执行,baseline,1,16,0.092600
+sql_point,SQL 执行,baseline,1,17,0.088700
+sql_point,SQL 执行,baseline,1,18,0.079700
+sql_point,SQL 执行,baseline,1,19,0.108500
+sql_point,SQL 执行,baseline,1,20,0.110100
+sql_point,SQL 执行,baseline,1,21,0.111200
+sql_point,SQL 执行,baseline,1,22,0.080500
+sql_point,SQL 执行,baseline,1,23,0.085100
+sql_point,SQL 执行,baseline,1,24,0.081200
+sql_point,SQL 执行,baseline,1,25,0.095000
+sql_point,SQL 执行,baseline,1,26,0.102100
+sql_point,SQL 执行,baseline,1,27,0.088900
+sql_point,SQL 执行,baseline,1,28,0.081900
+sql_point,SQL 执行,baseline,1,29,0.088000
+sql_point,SQL 执行,baseline,1,30,0.073600
+sql_point,SQL 执行,baseline,1,31,0.107500
+sql_point,SQL 执行,baseline,1,32,0.083500
+sql_point,SQL 执行,baseline,1,33,0.086200
+sql_point,SQL 执行,baseline,1,34,0.081200
+sql_point,SQL 执行,baseline,1,35,0.081800
+sql_point,SQL 执行,baseline,1,36,0.075100
+sql_point,SQL 执行,baseline,1,37,0.080400
+sql_point,SQL 执行,baseline,1,38,0.078100
+sql_point,SQL 执行,baseline,1,39,0.079600
+sql_point,SQL 执行,baseline,1,40,0.079400
+sql_point,SQL 执行,baseline,1,41,0.090500
+sql_point,SQL 执行,baseline,1,42,0.078900
+sql_point,SQL 执行,baseline,1,43,0.078300
+sql_point,SQL 执行,baseline,1,44,0.075700
+sql_point,SQL 执行,baseline,1,45,0.074600
+sql_point,SQL 执行,baseline,1,46,0.066700
+sql_point,SQL 执行,baseline,1,47,0.059000
+sql_point,SQL 执行,baseline,1,48,0.057400
+sql_point,SQL 执行,baseline,1,49,0.068100
+sql_point,SQL 执行,baseline,1,50,0.078000
+sql_point,SQL 执行,baseline,1,51,0.075700
+sql_point,SQL 执行,baseline,1,52,0.068000
+sql_point,SQL 执行,baseline,1,53,0.068400
+sql_point,SQL 执行,baseline,1,54,0.080300
+sql_point,SQL 执行,baseline,1,55,0.077300
+sql_point,SQL 执行,baseline,1,56,0.085300
+sql_point,SQL 执行,baseline,1,57,0.079000
+sql_point,SQL 执行,baseline,1,58,0.068500
+sql_point,SQL 执行,baseline,1,59,0.066300
+sql_point,SQL 执行,baseline,1,60,0.076200
+sql_point,SQL 执行,baseline,1,61,0.074300
+sql_point,SQL 执行,baseline,1,62,0.074600
+sql_point,SQL 执行,baseline,1,63,0.072200
+sql_point,SQL 执行,baseline,1,64,0.064800
+sql_point,SQL 执行,baseline,2,1,0.121500
+sql_point,SQL 执行,baseline,2,2,0.102800
+sql_point,SQL 执行,baseline,2,3,0.109200
+sql_point,SQL 执行,baseline,2,4,0.100500
+sql_point,SQL 执行,baseline,2,5,0.109500
+sql_point,SQL 执行,baseline,2,6,0.103300
+sql_point,SQL 执行,baseline,2,7,0.111800
+sql_point,SQL 执行,baseline,2,8,0.102400
+sql_point,SQL 执行,baseline,2,9,0.102400
+sql_point,SQL 执行,baseline,2,10,0.099900
+sql_point,SQL 执行,baseline,2,11,0.107400
+sql_point,SQL 执行,baseline,2,12,0.105200
+sql_point,SQL 执行,baseline,2,13,0.115200
+sql_point,SQL 执行,baseline,2,14,0.102300
+sql_point,SQL 执行,baseline,2,15,0.114300
+sql_point,SQL 执行,baseline,2,16,0.101300
+sql_point,SQL 执行,baseline,2,17,0.105800
+sql_point,SQL 执行,baseline,2,18,0.105400
+sql_point,SQL 执行,baseline,2,19,0.091700
+sql_point,SQL 执行,baseline,2,20,0.113700
+sql_point,SQL 执行,baseline,2,21,0.101100
+sql_point,SQL 执行,baseline,2,22,0.095200
+sql_point,SQL 执行,baseline,2,23,0.111800
+sql_point,SQL 执行,baseline,2,24,0.097500
+sql_point,SQL 执行,baseline,2,25,0.104000
+sql_point,SQL 执行,baseline,2,26,0.095100
+sql_point,SQL 执行,baseline,2,27,0.110000
+sql_point,SQL 执行,baseline,2,28,0.092000
+sql_point,SQL 执行,baseline,2,29,0.103900
+sql_point,SQL 执行,baseline,2,30,0.099100
+sql_point,SQL 执行,baseline,2,31,0.103800
+sql_point,SQL 执行,baseline,2,32,0.101600
+sql_point,SQL 执行,baseline,2,33,0.103900
+sql_point,SQL 执行,baseline,2,34,0.106800
+sql_point,SQL 执行,baseline,2,35,0.103800
+sql_point,SQL 执行,baseline,2,36,0.102000
+sql_point,SQL 执行,baseline,2,37,0.100800
+sql_point,SQL 执行,baseline,2,38,0.103400
+sql_point,SQL 执行,baseline,2,39,0.098400
+sql_point,SQL 执行,baseline,2,40,0.104900
+sql_point,SQL 执行,baseline,2,41,0.099700
+sql_point,SQL 执行,baseline,2,42,0.101800
+sql_point,SQL 执行,baseline,2,43,0.099700
+sql_point,SQL 执行,baseline,2,44,0.104100
+sql_point,SQL 执行,baseline,2,45,0.103000
+sql_point,SQL 执行,baseline,2,46,0.102300
+sql_point,SQL 执行,baseline,2,47,0.103100
+sql_point,SQL 执行,baseline,2,48,0.104500
+sql_point,SQL 执行,baseline,2,49,0.106300
+sql_point,SQL 执行,baseline,2,50,0.106600
+sql_point,SQL 执行,baseline,2,51,0.104500
+sql_point,SQL 执行,baseline,2,52,0.104200
+sql_point,SQL 执行,baseline,2,53,0.109700
+sql_point,SQL 执行,baseline,2,54,0.103100
+sql_point,SQL 执行,baseline,2,55,0.102100
+sql_point,SQL 执行,baseline,2,56,0.106400
+sql_point,SQL 执行,baseline,2,57,0.100200
+sql_point,SQL 执行,baseline,2,58,0.102000
+sql_point,SQL 执行,baseline,2,59,0.115400
+sql_point,SQL 执行,baseline,2,60,0.105400
+sql_point,SQL 执行,baseline,2,61,0.101500
+sql_point,SQL 执行,baseline,2,62,0.106300
+sql_point,SQL 执行,baseline,2,63,0.101400
+sql_point,SQL 执行,baseline,2,64,0.103700
+sql_point,SQL 执行,baseline,3,1,0.100200
+sql_point,SQL 执行,baseline,3,2,0.095200
+sql_point,SQL 执行,baseline,3,3,0.098600
+sql_point,SQL 执行,baseline,3,4,0.096700
+sql_point,SQL 执行,baseline,3,5,0.095100
+sql_point,SQL 执行,baseline,3,6,0.095900
+sql_point,SQL 执行,baseline,3,7,0.094300
+sql_point,SQL 执行,baseline,3,8,0.098200
+sql_point,SQL 执行,baseline,3,9,0.101300
+sql_point,SQL 执行,baseline,3,10,0.089100
+sql_point,SQL 执行,baseline,3,11,0.091400
+sql_point,SQL 执行,baseline,3,12,0.098600
+sql_point,SQL 执行,baseline,3,13,0.103000
+sql_point,SQL 执行,baseline,3,14,0.097800
+sql_point,SQL 执行,baseline,3,15,0.114400
+sql_point,SQL 执行,baseline,3,16,0.097500
+sql_point,SQL 执行,baseline,3,17,0.101800
+sql_point,SQL 执行,baseline,3,18,0.090500
+sql_point,SQL 执行,baseline,3,19,0.094300
+sql_point,SQL 执行,baseline,3,20,0.101200
+sql_point,SQL 执行,baseline,3,21,0.098800
+sql_point,SQL 执行,baseline,3,22,0.104100
+sql_point,SQL 执行,baseline,3,23,0.078800
+sql_point,SQL 执行,baseline,3,24,0.088800
+sql_point,SQL 执行,baseline,3,25,0.087400
+sql_point,SQL 执行,baseline,3,26,0.086100
+sql_point,SQL 执行,baseline,3,27,0.103300
+sql_point,SQL 执行,baseline,3,28,0.078100
+sql_point,SQL 执行,baseline,3,29,0.094100
+sql_point,SQL 执行,baseline,3,30,0.081600
+sql_point,SQL 执行,baseline,3,31,0.098400
+sql_point,SQL 执行,baseline,3,32,0.091200
+sql_point,SQL 执行,baseline,3,33,0.100200
+sql_point,SQL 执行,baseline,3,34,0.096300
+sql_point,SQL 执行,baseline,3,35,0.099300
+sql_point,SQL 执行,baseline,3,36,0.091500
+sql_point,SQL 执行,baseline,3,37,0.098100
+sql_point,SQL 执行,baseline,3,38,0.094400
+sql_point,SQL 执行,baseline,3,39,0.081600
+sql_point,SQL 执行,baseline,3,40,0.096400
+sql_point,SQL 执行,baseline,3,41,0.107200
+sql_point,SQL 执行,baseline,3,42,0.114800
+sql_point,SQL 执行,baseline,3,43,0.125800
+sql_point,SQL 执行,baseline,3,44,0.082600
+sql_point,SQL 执行,baseline,3,45,0.081500
+sql_point,SQL 执行,baseline,3,46,0.092700
+sql_point,SQL 执行,baseline,3,47,0.108000
+sql_point,SQL 执行,baseline,3,48,0.081400
+sql_point,SQL 执行,baseline,3,49,0.077100
+sql_point,SQL 执行,baseline,3,50,0.085200
+sql_point,SQL 执行,baseline,3,51,0.078100
+sql_point,SQL 执行,baseline,3,52,0.075000
+sql_point,SQL 执行,baseline,3,53,0.073500
+sql_point,SQL 执行,baseline,3,54,0.101100
+sql_point,SQL 执行,baseline,3,55,0.105600
+sql_point,SQL 执行,baseline,3,56,0.099900
+sql_point,SQL 执行,baseline,3,57,0.077000
+sql_point,SQL 执行,baseline,3,58,0.093100
+sql_point,SQL 执行,baseline,3,59,0.099500
+sql_point,SQL 执行,baseline,3,60,0.103200
+sql_point,SQL 执行,baseline,3,61,0.102700
+sql_point,SQL 执行,baseline,3,62,0.110700
+sql_point,SQL 执行,baseline,3,63,0.105400
+sql_point,SQL 执行,baseline,3,64,0.104500
+sql_point,SQL 执行,baseline,4,1,0.100000
+sql_point,SQL 执行,baseline,4,2,0.112500
+sql_point,SQL 执行,baseline,4,3,0.103200
+sql_point,SQL 执行,baseline,4,4,0.099800
+sql_point,SQL 执行,baseline,4,5,0.102000
+sql_point,SQL 执行,baseline,4,6,0.079900
+sql_point,SQL 执行,baseline,4,7,0.086100
+sql_point,SQL 执行,baseline,4,8,0.099700
+sql_point,SQL 执行,baseline,4,9,0.097500
+sql_point,SQL 执行,baseline,4,10,0.103600
+sql_point,SQL 执行,baseline,4,11,0.101800
+sql_point,SQL 执行,baseline,4,12,0.082300
+sql_point,SQL 执行,baseline,4,13,0.104100
+sql_point,SQL 执行,baseline,4,14,0.110200
+sql_point,SQL 执行,baseline,4,15,0.109000
+sql_point,SQL 执行,baseline,4,16,0.105300
+sql_point,SQL 执行,baseline,4,17,0.108700
+sql_point,SQL 执行,baseline,4,18,0.084000
+sql_point,SQL 执行,baseline,4,19,0.077000
+sql_point,SQL 执行,baseline,4,20,0.079200
+sql_point,SQL 执行,baseline,4,21,0.081100
+sql_point,SQL 执行,baseline,4,22,0.105800
+sql_point,SQL 执行,baseline,4,23,0.089500
+sql_point,SQL 执行,baseline,4,24,0.082100
+sql_point,SQL 执行,baseline,4,25,0.086000
+sql_point,SQL 执行,baseline,4,26,0.079300
+sql_point,SQL 执行,baseline,4,27,0.077500
+sql_point,SQL 执行,baseline,4,28,0.080500
+sql_point,SQL 执行,baseline,4,29,0.094300
+sql_point,SQL 执行,baseline,4,30,0.074600
+sql_point,SQL 执行,baseline,4,31,0.108300
+sql_point,SQL 执行,baseline,4,32,0.087700
+sql_point,SQL 执行,baseline,4,33,0.084400
+sql_point,SQL 执行,baseline,4,34,0.082700
+sql_point,SQL 执行,baseline,4,35,0.089700
+sql_point,SQL 执行,baseline,4,36,0.083700
+sql_point,SQL 执行,baseline,4,37,0.084900
+sql_point,SQL 执行,baseline,4,38,0.086800
+sql_point,SQL 执行,baseline,4,39,0.098700
+sql_point,SQL 执行,baseline,4,40,0.109800
+sql_point,SQL 执行,baseline,4,41,0.087600
+sql_point,SQL 执行,baseline,4,42,0.074500
+sql_point,SQL 执行,baseline,4,43,0.081900
+sql_point,SQL 执行,baseline,4,44,0.074800
+sql_point,SQL 执行,baseline,4,45,0.078200
+sql_point,SQL 执行,baseline,4,46,0.081500
+sql_point,SQL 执行,baseline,4,47,0.080600
+sql_point,SQL 执行,baseline,4,48,0.083400
+sql_point,SQL 执行,baseline,4,49,0.075500
+sql_point,SQL 执行,baseline,4,50,0.079800
+sql_point,SQL 执行,baseline,4,51,0.075400
+sql_point,SQL 执行,baseline,4,52,0.070500
+sql_point,SQL 执行,baseline,4,53,0.095200
+sql_point,SQL 执行,baseline,4,54,0.112500
+sql_point,SQL 执行,baseline,4,55,0.104000
+sql_point,SQL 执行,baseline,4,56,0.104300
+sql_point,SQL 执行,baseline,4,57,0.101900
+sql_point,SQL 执行,baseline,4,58,0.095100
+sql_point,SQL 执行,baseline,4,59,0.090200
+sql_point,SQL 执行,baseline,4,60,0.080200
+sql_point,SQL 执行,baseline,4,61,0.079000
+sql_point,SQL 执行,baseline,4,62,0.082700
+sql_point,SQL 执行,baseline,4,63,0.075100
+sql_point,SQL 执行,baseline,4,64,0.076600
+sql_point,SQL 执行,baseline,5,1,0.144100
+sql_point,SQL 执行,baseline,5,2,0.111900
+sql_point,SQL 执行,baseline,5,3,0.140500
+sql_point,SQL 执行,baseline,5,4,0.140300
+sql_point,SQL 执行,baseline,5,5,0.146600
+sql_point,SQL 执行,baseline,5,6,0.126600
+sql_point,SQL 执行,baseline,5,7,0.132000
+sql_point,SQL 执行,baseline,5,8,0.133700
+sql_point,SQL 执行,baseline,5,9,0.150200
+sql_point,SQL 执行,baseline,5,10,0.133100
+sql_point,SQL 执行,baseline,5,11,0.133900
+sql_point,SQL 执行,baseline,5,12,0.141800
+sql_point,SQL 执行,baseline,5,13,0.104400
+sql_point,SQL 执行,baseline,5,14,0.107100
+sql_point,SQL 执行,baseline,5,15,0.132900
+sql_point,SQL 执行,baseline,5,16,0.114200
+sql_point,SQL 执行,baseline,5,17,0.126000
+sql_point,SQL 执行,baseline,5,18,0.119300
+sql_point,SQL 执行,baseline,5,19,0.084900
+sql_point,SQL 执行,baseline,5,20,0.105600
+sql_point,SQL 执行,baseline,5,21,0.104500
+sql_point,SQL 执行,baseline,5,22,0.107900
+sql_point,SQL 执行,baseline,5,23,0.079800
+sql_point,SQL 执行,baseline,5,24,0.081800
+sql_point,SQL 执行,baseline,5,25,0.109900
+sql_point,SQL 执行,baseline,5,26,0.087500
+sql_point,SQL 执行,baseline,5,27,0.113200
+sql_point,SQL 执行,baseline,5,28,0.101100
+sql_point,SQL 执行,baseline,5,29,0.107200
+sql_point,SQL 执行,baseline,5,30,0.114000
+sql_point,SQL 执行,baseline,5,31,0.102400
+sql_point,SQL 执行,baseline,5,32,0.105900
+sql_point,SQL 执行,baseline,5,33,0.096900
+sql_point,SQL 执行,baseline,5,34,0.106200
+sql_point,SQL 执行,baseline,5,35,0.087800
+sql_point,SQL 执行,baseline,5,36,0.103200
+sql_point,SQL 执行,baseline,5,37,0.109200
+sql_point,SQL 执行,baseline,5,38,0.106200
+sql_point,SQL 执行,baseline,5,39,0.083600
+sql_point,SQL 执行,baseline,5,40,0.098700
+sql_point,SQL 执行,baseline,5,41,0.083700
+sql_point,SQL 执行,baseline,5,42,0.079800
+sql_point,SQL 执行,baseline,5,43,0.079700
+sql_point,SQL 执行,baseline,5,44,0.096600
+sql_point,SQL 执行,baseline,5,45,0.097100
+sql_point,SQL 执行,baseline,5,46,0.105400
+sql_point,SQL 执行,baseline,5,47,0.102100
+sql_point,SQL 执行,baseline,5,48,0.104600
+sql_point,SQL 执行,baseline,5,49,0.110100
+sql_point,SQL 执行,baseline,5,50,0.102200
+sql_point,SQL 执行,baseline,5,51,0.105100
+sql_point,SQL 执行,baseline,5,52,0.108700
+sql_point,SQL 执行,baseline,5,53,0.111200
+sql_point,SQL 执行,baseline,5,54,0.114200
+sql_point,SQL 执行,baseline,5,55,0.108800
+sql_point,SQL 执行,baseline,5,56,0.108700
+sql_point,SQL 执行,baseline,5,57,0.102200
+sql_point,SQL 执行,baseline,5,58,0.079400
+sql_point,SQL 执行,baseline,5,59,0.076900
+sql_point,SQL 执行,baseline,5,60,0.077000
+sql_point,SQL 执行,baseline,5,61,0.074100
+sql_point,SQL 执行,baseline,5,62,0.080000
+sql_point,SQL 执行,baseline,5,63,0.078800
+sql_point,SQL 执行,baseline,5,64,0.074100
+sql_group,SQL 执行,baseline,1,1,0.171100
+sql_group,SQL 执行,baseline,1,2,0.165900
+sql_group,SQL 执行,baseline,1,3,0.165900
+sql_group,SQL 执行,baseline,1,4,0.186900
+sql_group,SQL 执行,baseline,1,5,0.186400
+sql_group,SQL 执行,baseline,1,6,0.178300
+sql_group,SQL 执行,baseline,1,7,0.157300
+sql_group,SQL 执行,baseline,1,8,0.169800
+sql_group,SQL 执行,baseline,1,9,0.161800
+sql_group,SQL 执行,baseline,1,10,0.159600
+sql_group,SQL 执行,baseline,2,1,0.153400
+sql_group,SQL 执行,baseline,2,2,0.165400
+sql_group,SQL 执行,baseline,2,3,0.155100
+sql_group,SQL 执行,baseline,2,4,0.167300
+sql_group,SQL 执行,baseline,2,5,0.180400
+sql_group,SQL 执行,baseline,2,6,0.193400
+sql_group,SQL 执行,baseline,2,7,0.172600
+sql_group,SQL 执行,baseline,2,8,0.152300
+sql_group,SQL 执行,baseline,2,9,0.155600
+sql_group,SQL 执行,baseline,2,10,0.171700
+sql_group,SQL 执行,baseline,3,1,0.156000
+sql_group,SQL 执行,baseline,3,2,0.145000
+sql_group,SQL 执行,baseline,3,3,0.157500
+sql_group,SQL 执行,baseline,3,4,0.166200
+sql_group,SQL 执行,baseline,3,5,0.158300
+sql_group,SQL 执行,baseline,3,6,0.161700
+sql_group,SQL 执行,baseline,3,7,0.162000
+sql_group,SQL 执行,baseline,3,8,0.152300
+sql_group,SQL 执行,baseline,3,9,0.166600
+sql_group,SQL 执行,baseline,3,10,0.159000
+sql_group,SQL 执行,baseline,4,1,0.179500
+sql_group,SQL 执行,baseline,4,2,0.171700
+sql_group,SQL 执行,baseline,4,3,0.237400
+sql_group,SQL 执行,baseline,4,4,0.181300
+sql_group,SQL 执行,baseline,4,5,0.203600
+sql_group,SQL 执行,baseline,4,6,0.180900
+sql_group,SQL 执行,baseline,4,7,0.162800
+sql_group,SQL 执行,baseline,4,8,0.170500
+sql_group,SQL 执行,baseline,4,9,0.165200
+sql_group,SQL 执行,baseline,4,10,0.163900
+sql_group,SQL 执行,baseline,5,1,0.171300
+sql_group,SQL 执行,baseline,5,2,0.166700
+sql_group,SQL 执行,baseline,5,3,0.163600
+sql_group,SQL 执行,baseline,5,4,0.174400
+sql_group,SQL 执行,baseline,5,5,0.155500
+sql_group,SQL 执行,baseline,5,6,0.159300
+sql_group,SQL 执行,baseline,5,7,0.166700
+sql_group,SQL 执行,baseline,5,8,0.163600
+sql_group,SQL 执行,baseline,5,9,0.159500
+sql_group,SQL 执行,baseline,5,10,0.153300
+sql_sort,SQL 执行,baseline,1,1,0.221400
+sql_sort,SQL 执行,baseline,1,2,0.233300
+sql_sort,SQL 执行,baseline,1,3,0.210900
+sql_sort,SQL 执行,baseline,1,4,0.213700
+sql_sort,SQL 执行,baseline,1,5,0.219100
+sql_sort,SQL 执行,baseline,1,6,0.358500
+sql_sort,SQL 执行,baseline,1,7,0.350300
+sql_sort,SQL 执行,baseline,1,8,0.264900
+sql_sort,SQL 执行,baseline,1,9,0.198100
+sql_sort,SQL 执行,baseline,1,10,0.257800
+sql_sort,SQL 执行,baseline,2,1,0.217900
+sql_sort,SQL 执行,baseline,2,2,0.210500
+sql_sort,SQL 执行,baseline,2,3,0.228000
+sql_sort,SQL 执行,baseline,2,4,0.230500
+sql_sort,SQL 执行,baseline,2,5,0.224300
+sql_sort,SQL 执行,baseline,2,6,0.226800
+sql_sort,SQL 执行,baseline,2,7,0.216300
+sql_sort,SQL 执行,baseline,2,8,0.237600
+sql_sort,SQL 执行,baseline,2,9,0.180800
+sql_sort,SQL 执行,baseline,2,10,0.234400
+sql_sort,SQL 执行,baseline,3,1,0.201600
+sql_sort,SQL 执行,baseline,3,2,0.190700
+sql_sort,SQL 执行,baseline,3,3,0.216900
+sql_sort,SQL 执行,baseline,3,4,0.187900
+sql_sort,SQL 执行,baseline,3,5,0.214100
+sql_sort,SQL 执行,baseline,3,6,0.186500
+sql_sort,SQL 执行,baseline,3,7,0.221300
+sql_sort,SQL 执行,baseline,3,8,0.219300
+sql_sort,SQL 执行,baseline,3,9,0.210400
+sql_sort,SQL 执行,baseline,3,10,0.230200
+sql_sort,SQL 执行,baseline,4,1,0.266600
+sql_sort,SQL 执行,baseline,4,2,0.263300
+sql_sort,SQL 执行,baseline,4,3,0.207200
+sql_sort,SQL 执行,baseline,4,4,0.196900
+sql_sort,SQL 执行,baseline,4,5,0.217400
+sql_sort,SQL 执行,baseline,4,6,0.221100
+sql_sort,SQL 执行,baseline,4,7,0.217500
+sql_sort,SQL 执行,baseline,4,8,0.218100
+sql_sort,SQL 执行,baseline,4,9,0.211600
+sql_sort,SQL 执行,baseline,4,10,0.225800
+sql_sort,SQL 执行,baseline,5,1,0.222500
+sql_sort,SQL 执行,baseline,5,2,0.185500
+sql_sort,SQL 执行,baseline,5,3,0.236900
+sql_sort,SQL 执行,baseline,5,4,0.187100
+sql_sort,SQL 执行,baseline,5,5,0.215300
+sql_sort,SQL 执行,baseline,5,6,0.249400
+sql_sort,SQL 执行,baseline,5,7,0.236400
+sql_sort,SQL 执行,baseline,5,8,0.249800
+sql_sort,SQL 执行,baseline,5,9,0.236300
+sql_sort,SQL 执行,baseline,5,10,0.246100
+sql_insert,SQL 执行,baseline,1,1,2.452400
+sql_insert,SQL 执行,baseline,1,2,2.285400
+sql_insert,SQL 执行,baseline,1,3,1.158500
+sql_insert,SQL 执行,baseline,1,4,1.994800
+sql_insert,SQL 执行,baseline,1,5,2.968400
+sql_insert,SQL 执行,baseline,1,6,3.920500
+sql_insert,SQL 执行,baseline,1,7,5.120800
+sql_insert,SQL 执行,baseline,1,8,2.355300
+sql_insert,SQL 执行,baseline,1,9,2.279300
+sql_insert,SQL 执行,baseline,1,10,1.781600
+sql_insert,SQL 执行,baseline,2,1,5.085100
+sql_insert,SQL 执行,baseline,2,2,2.403200
+sql_insert,SQL 执行,baseline,2,3,2.309500
+sql_insert,SQL 执行,baseline,2,4,1.381000
+sql_insert,SQL 执行,baseline,2,5,2.380200
+sql_insert,SQL 执行,baseline,2,6,4.118300
+sql_insert,SQL 执行,baseline,2,7,14.204500
+sql_insert,SQL 执行,baseline,2,8,2.335700
+sql_insert,SQL 执行,baseline,2,9,2.367800
+sql_insert,SQL 执行,baseline,2,10,1.593500
+sql_insert,SQL 执行,baseline,3,1,3.181000
+sql_insert,SQL 执行,baseline,3,2,8.355200
+sql_insert,SQL 执行,baseline,3,3,2.454700
+sql_insert,SQL 执行,baseline,3,4,2.516700
+sql_insert,SQL 执行,baseline,3,5,0.925100
+sql_insert,SQL 执行,baseline,3,6,1.711100
+sql_insert,SQL 执行,baseline,3,7,5.053200
+sql_insert,SQL 执行,baseline,3,8,2.508100
+sql_insert,SQL 执行,baseline,3,9,2.397800
+sql_insert,SQL 执行,baseline,3,10,1.436000
+sql_insert,SQL 执行,baseline,4,1,2.614400
+sql_insert,SQL 执行,baseline,4,2,1.507600
+sql_insert,SQL 执行,baseline,4,3,2.229000
+sql_insert,SQL 执行,baseline,4,4,3.408600
+sql_insert,SQL 执行,baseline,4,5,8.291700
+sql_insert,SQL 执行,baseline,4,6,2.812900
+sql_insert,SQL 执行,baseline,4,7,2.495200
+sql_insert,SQL 执行,baseline,4,8,1.536500
+sql_insert,SQL 执行,baseline,4,9,2.045300
+sql_insert,SQL 执行,baseline,4,10,3.277300
+sql_insert,SQL 执行,baseline,5,1,3.666100
+sql_insert,SQL 执行,baseline,5,2,4.696600
+sql_insert,SQL 执行,baseline,5,3,2.460900
+sql_insert,SQL 执行,baseline,5,4,2.404600
+sql_insert,SQL 执行,baseline,5,5,1.294700
+sql_insert,SQL 执行,baseline,5,6,2.235300
+sql_insert,SQL 执行,baseline,5,7,3.117000
+sql_insert,SQL 执行,baseline,5,8,4.144800
+sql_insert,SQL 执行,baseline,5,9,6.774200
+sql_insert,SQL 执行,baseline,5,10,2.340100
+sql_update,SQL 执行,baseline,1,1,3.331800
+sql_update,SQL 执行,baseline,1,2,3.753700
+sql_update,SQL 执行,baseline,1,3,3.967200
+sql_update,SQL 执行,baseline,1,4,4.269000
+sql_update,SQL 执行,baseline,1,5,6.272100
+sql_update,SQL 执行,baseline,1,6,2.318100
+sql_update,SQL 执行,baseline,1,7,2.279700
+sql_update,SQL 执行,baseline,1,8,2.294400
+sql_update,SQL 执行,baseline,1,9,2.332000
+sql_update,SQL 执行,baseline,1,10,2.285500
+sql_update,SQL 执行,baseline,2,1,2.809700
+sql_update,SQL 执行,baseline,2,2,3.294600
+sql_update,SQL 执行,baseline,2,3,3.702900
+sql_update,SQL 执行,baseline,2,4,3.978700
+sql_update,SQL 执行,baseline,2,5,4.479600
+sql_update,SQL 执行,baseline,2,6,5.092700
+sql_update,SQL 执行,baseline,2,7,6.751400
+sql_update,SQL 执行,baseline,2,8,2.432200
+sql_update,SQL 执行,baseline,2,9,2.363300
+sql_update,SQL 执行,baseline,2,10,2.364900
+sql_update,SQL 执行,baseline,3,1,2.700900
+sql_update,SQL 执行,baseline,3,2,3.015400
+sql_update,SQL 执行,baseline,3,3,3.406200
+sql_update,SQL 执行,baseline,3,4,3.850600
+sql_update,SQL 执行,baseline,3,5,4.268000
+sql_update,SQL 执行,baseline,3,6,9.964700
+sql_update,SQL 执行,baseline,3,7,2.482600
+sql_update,SQL 执行,baseline,3,8,2.433500
+sql_update,SQL 执行,baseline,3,9,2.507800
+sql_update,SQL 执行,baseline,3,10,2.449500
+sql_update,SQL 执行,baseline,4,1,2.454400
+sql_update,SQL 执行,baseline,4,2,2.778900
+sql_update,SQL 执行,baseline,4,3,3.056400
+sql_update,SQL 执行,baseline,4,4,3.419000
+sql_update,SQL 执行,baseline,4,5,3.778900
+sql_update,SQL 执行,baseline,4,6,4.135100
+sql_update,SQL 执行,baseline,4,7,4.500600
+sql_update,SQL 执行,baseline,4,8,2.503600
+sql_update,SQL 执行,baseline,4,9,2.497800
+sql_update,SQL 执行,baseline,4,10,2.445300
+sql_update,SQL 执行,baseline,5,1,1.018400
+sql_update,SQL 执行,baseline,5,2,1.493300
+sql_update,SQL 执行,baseline,5,3,1.900900
+sql_update,SQL 执行,baseline,5,4,2.205100
+sql_update,SQL 执行,baseline,5,5,2.547200
+sql_update,SQL 执行,baseline,5,6,2.890700
+sql_update,SQL 执行,baseline,5,7,3.231800
+sql_update,SQL 执行,baseline,5,8,3.579700
+sql_update,SQL 执行,baseline,5,9,4.230900
+sql_update,SQL 执行,baseline,5,10,5.967800
+sql_delete,SQL 执行,baseline,1,1,1.981100
+sql_delete,SQL 执行,baseline,1,2,2.375700
+sql_delete,SQL 执行,baseline,1,3,2.715800
+sql_delete,SQL 执行,baseline,1,4,3.038900
+sql_delete,SQL 执行,baseline,1,5,3.576200
+sql_delete,SQL 执行,baseline,1,6,3.937300
+sql_delete,SQL 执行,baseline,1,7,4.411200
+sql_delete,SQL 执行,baseline,1,8,4.737500
+sql_delete,SQL 执行,baseline,1,9,6.871500
+sql_delete,SQL 执行,baseline,1,10,2.720400
+sql_delete,SQL 执行,baseline,2,1,1.062400
+sql_delete,SQL 执行,baseline,2,2,1.412000
+sql_delete,SQL 执行,baseline,2,3,1.869100
+sql_delete,SQL 执行,baseline,2,4,2.481300
+sql_delete,SQL 执行,baseline,2,5,2.941800
+sql_delete,SQL 执行,baseline,2,6,3.273300
+sql_delete,SQL 执行,baseline,2,7,3.665000
+sql_delete,SQL 执行,baseline,2,8,3.930800
+sql_delete,SQL 执行,baseline,2,9,4.373700
+sql_delete,SQL 执行,baseline,2,10,4.672200
+sql_delete,SQL 执行,baseline,3,1,2.580200
+sql_delete,SQL 执行,baseline,3,2,2.451800
+sql_delete,SQL 执行,baseline,3,3,2.599400
+sql_delete,SQL 执行,baseline,3,4,2.513600
+sql_delete,SQL 执行,baseline,3,5,0.954100
+sql_delete,SQL 执行,baseline,3,6,1.390100
+sql_delete,SQL 执行,baseline,3,7,1.722300
+sql_delete,SQL 执行,baseline,3,8,2.051000
+sql_delete,SQL 执行,baseline,3,9,2.419400
+sql_delete,SQL 执行,baseline,3,10,2.875600
+sql_delete,SQL 执行,baseline,4,1,1.092900
+sql_delete,SQL 执行,baseline,4,2,1.468200
+sql_delete,SQL 执行,baseline,4,3,1.856700
+sql_delete,SQL 执行,baseline,4,4,2.317600
+sql_delete,SQL 执行,baseline,4,5,2.616200
+sql_delete,SQL 执行,baseline,4,6,3.046200
+sql_delete,SQL 执行,baseline,4,7,3.501900
+sql_delete,SQL 执行,baseline,4,8,3.914000
+sql_delete,SQL 执行,baseline,4,9,4.384100
+sql_delete,SQL 执行,baseline,4,10,7.099200
+sql_delete,SQL 执行,baseline,5,1,2.492500
+sql_delete,SQL 执行,baseline,5,2,2.361300
+sql_delete,SQL 执行,baseline,5,3,2.534700
+sql_delete,SQL 执行,baseline,5,4,1.087600
+sql_delete,SQL 执行,baseline,5,5,1.568200
+sql_delete,SQL 执行,baseline,5,6,1.884400
+sql_delete,SQL 执行,baseline,5,7,2.290800
+sql_delete,SQL 执行,baseline,5,8,2.854400
+sql_delete,SQL 执行,baseline,5,9,3.197400
+sql_delete,SQL 执行,baseline,5,10,3.696700
+sql_subquery,SQL 执行,baseline,1,1,0.494100
+sql_subquery,SQL 执行,baseline,1,2,0.420200
+sql_subquery,SQL 执行,baseline,1,3,0.401300
+sql_subquery,SQL 执行,baseline,1,4,0.415900
+sql_subquery,SQL 执行,baseline,1,5,0.405300
+sql_subquery,SQL 执行,baseline,1,6,0.422100
+sql_subquery,SQL 执行,baseline,1,7,0.408000
+sql_subquery,SQL 执行,baseline,1,8,0.414000
+sql_subquery,SQL 执行,baseline,1,9,0.406900
+sql_subquery,SQL 执行,baseline,1,10,0.414700
+sql_subquery,SQL 执行,baseline,2,1,0.331200
+sql_subquery,SQL 执行,baseline,2,2,0.337200
+sql_subquery,SQL 执行,baseline,2,3,0.308100
+sql_subquery,SQL 执行,baseline,2,4,0.320700
+sql_subquery,SQL 执行,baseline,2,5,0.309800
+sql_subquery,SQL 执行,baseline,2,6,0.347400
+sql_subquery,SQL 执行,baseline,2,7,0.272700
+sql_subquery,SQL 执行,baseline,2,8,0.291700
+sql_subquery,SQL 执行,baseline,2,9,0.278500
+sql_subquery,SQL 执行,baseline,2,10,0.299700
+sql_subquery,SQL 执行,baseline,3,1,0.354500
+sql_subquery,SQL 执行,baseline,3,2,0.286700
+sql_subquery,SQL 执行,baseline,3,3,0.287300
+sql_subquery,SQL 执行,baseline,3,4,0.287400
+sql_subquery,SQL 执行,baseline,3,5,0.288600
+sql_subquery,SQL 执行,baseline,3,6,0.290800
+sql_subquery,SQL 执行,baseline,3,7,0.281000
+sql_subquery,SQL 执行,baseline,3,8,0.268000
+sql_subquery,SQL 执行,baseline,3,9,0.292900
+sql_subquery,SQL 执行,baseline,3,10,0.272900
+sql_subquery,SQL 执行,baseline,4,1,0.313900
+sql_subquery,SQL 执行,baseline,4,2,0.322700
+sql_subquery,SQL 执行,baseline,4,3,0.334500
+sql_subquery,SQL 执行,baseline,4,4,0.275200
+sql_subquery,SQL 执行,baseline,4,5,0.274000
+sql_subquery,SQL 执行,baseline,4,6,0.277300
+sql_subquery,SQL 执行,baseline,4,7,0.271100
+sql_subquery,SQL 执行,baseline,4,8,0.331100
+sql_subquery,SQL 执行,baseline,4,9,0.277600
+sql_subquery,SQL 执行,baseline,4,10,0.275000
+sql_subquery,SQL 执行,baseline,5,1,0.366300
+sql_subquery,SQL 执行,baseline,5,2,0.301100
+sql_subquery,SQL 执行,baseline,5,3,0.287900
+sql_subquery,SQL 执行,baseline,5,4,0.287600
+sql_subquery,SQL 执行,baseline,5,5,0.280000
+sql_subquery,SQL 执行,baseline,5,6,0.300700
+sql_subquery,SQL 执行,baseline,5,7,0.274700
+sql_subquery,SQL 执行,baseline,5,8,0.277000
+sql_subquery,SQL 执行,baseline,5,9,0.283500
+sql_subquery,SQL 执行,baseline,5,10,0.282100
+sql_window,SQL 执行,baseline,1,1,0.308300
+sql_window,SQL 执行,baseline,1,2,0.297700
+sql_window,SQL 执行,baseline,1,3,0.324500
+sql_window,SQL 执行,baseline,1,4,0.320100
+sql_window,SQL 执行,baseline,1,5,0.306800
+sql_window,SQL 执行,baseline,1,6,0.318400
+sql_window,SQL 执行,baseline,1,7,0.305500
+sql_window,SQL 执行,baseline,1,8,0.310300
+sql_window,SQL 执行,baseline,1,9,0.315600
+sql_window,SQL 执行,baseline,1,10,0.334500
+sql_window,SQL 执行,baseline,2,1,0.383700
+sql_window,SQL 执行,baseline,2,2,0.322600
+sql_window,SQL 执行,baseline,2,3,0.319300
+sql_window,SQL 执行,baseline,2,4,0.308900
+sql_window,SQL 执行,baseline,2,5,0.318500
+sql_window,SQL 执行,baseline,2,6,0.318700
+sql_window,SQL 执行,baseline,2,7,0.294700
+sql_window,SQL 执行,baseline,2,8,0.293500
+sql_window,SQL 执行,baseline,2,9,0.315000
+sql_window,SQL 执行,baseline,2,10,0.292500
+sql_window,SQL 执行,baseline,3,1,0.306900
+sql_window,SQL 执行,baseline,3,2,0.308900
+sql_window,SQL 执行,baseline,3,3,0.296000
+sql_window,SQL 执行,baseline,3,4,0.311200
+sql_window,SQL 执行,baseline,3,5,0.313800
+sql_window,SQL 执行,baseline,3,6,0.313300
+sql_window,SQL 执行,baseline,3,7,0.300000
+sql_window,SQL 执行,baseline,3,8,0.268500
+sql_window,SQL 执行,baseline,3,9,0.316100
+sql_window,SQL 执行,baseline,3,10,0.245800
+sql_window,SQL 执行,baseline,4,1,0.323700
+sql_window,SQL 执行,baseline,4,2,0.291500
+sql_window,SQL 执行,baseline,4,3,0.322800
+sql_window,SQL 执行,baseline,4,4,0.315200
+sql_window,SQL 执行,baseline,4,5,0.253800
+sql_window,SQL 执行,baseline,4,6,0.505200
+sql_window,SQL 执行,baseline,4,7,0.282700
+sql_window,SQL 执行,baseline,4,8,0.308800
+sql_window,SQL 执行,baseline,4,9,0.341700
+sql_window,SQL 执行,baseline,4,10,0.348900
+sql_window,SQL 执行,baseline,5,1,0.320500
+sql_window,SQL 执行,baseline,5,2,0.285600
+sql_window,SQL 执行,baseline,5,3,0.312000
+sql_window,SQL 执行,baseline,5,4,0.342100
+sql_window,SQL 执行,baseline,5,5,0.313900
+sql_window,SQL 执行,baseline,5,6,0.319700
+sql_window,SQL 执行,baseline,5,7,0.259300
+sql_window,SQL 执行,baseline,5,8,0.312200
+sql_window,SQL 执行,baseline,5,9,0.319800
+sql_window,SQL 执行,baseline,5,10,0.375600
+sql_join,SQL 执行,baseline,1,1,0.461400
+sql_join,SQL 执行,baseline,1,2,0.360200
+sql_join,SQL 执行,baseline,1,3,0.333800
+sql_join,SQL 执行,baseline,1,4,0.348200
+sql_join,SQL 执行,baseline,1,5,0.344800
+sql_join,SQL 执行,baseline,1,6,0.364700
+sql_join,SQL 执行,baseline,1,7,0.353800
+sql_join,SQL 执行,baseline,1,8,0.368700
+sql_join,SQL 执行,baseline,1,9,0.339000
+sql_join,SQL 执行,baseline,1,10,0.402200
+sql_join,SQL 执行,baseline,2,1,0.459600
+sql_join,SQL 执行,baseline,2,2,0.375300
+sql_join,SQL 执行,baseline,2,3,0.334500
+sql_join,SQL 执行,baseline,2,4,0.347800
+sql_join,SQL 执行,baseline,2,5,0.366700
+sql_join,SQL 执行,baseline,2,6,0.376400
+sql_join,SQL 执行,baseline,2,7,0.346700
+sql_join,SQL 执行,baseline,2,8,0.373700
+sql_join,SQL 执行,baseline,2,9,0.332800
+sql_join,SQL 执行,baseline,2,10,0.385100
+sql_join,SQL 执行,baseline,3,1,0.497400
+sql_join,SQL 执行,baseline,3,2,0.374200
+sql_join,SQL 执行,baseline,3,3,0.372000
+sql_join,SQL 执行,baseline,3,4,0.422700
+sql_join,SQL 执行,baseline,3,5,0.355900
+sql_join,SQL 执行,baseline,3,6,0.388000
+sql_join,SQL 执行,baseline,3,7,0.363100
+sql_join,SQL 执行,baseline,3,8,0.385400
+sql_join,SQL 执行,baseline,3,9,0.364300
+sql_join,SQL 执行,baseline,3,10,0.381800
+sql_join,SQL 执行,baseline,4,1,0.464600
+sql_join,SQL 执行,baseline,4,2,0.362300
+sql_join,SQL 执行,baseline,4,3,0.339400
+sql_join,SQL 执行,baseline,4,4,0.346200
+sql_join,SQL 执行,baseline,4,5,0.359900
+sql_join,SQL 执行,baseline,4,6,0.386100
+sql_join,SQL 执行,baseline,4,7,0.344700
+sql_join,SQL 执行,baseline,4,8,0.370200
+sql_join,SQL 执行,baseline,4,9,0.351700
+sql_join,SQL 执行,baseline,4,10,0.386500
+sql_join,SQL 执行,baseline,5,1,0.529000
+sql_join,SQL 执行,baseline,5,2,0.356100
+sql_join,SQL 执行,baseline,5,3,0.346900
+sql_join,SQL 执行,baseline,5,4,0.375800
+sql_join,SQL 执行,baseline,5,5,0.350600
+sql_join,SQL 执行,baseline,5,6,0.369900
+sql_join,SQL 执行,baseline,5,7,0.369200
+sql_join,SQL 执行,baseline,5,8,0.385000
+sql_join,SQL 执行,baseline,5,9,0.377400
+sql_join,SQL 执行,baseline,5,10,0.385800
+pstore_scan,存储引擎,baseline,1,1,1.031100
+pstore_scan,存储引擎,baseline,1,2,1.092300
+pstore_scan,存储引擎,baseline,1,3,1.069900
+pstore_scan,存储引擎,baseline,1,4,1.047100
+pstore_scan,存储引擎,baseline,1,5,1.068200
+pstore_scan,存储引擎,baseline,1,6,1.073900
+pstore_scan,存储引擎,baseline,1,7,1.004200
+pstore_scan,存储引擎,baseline,1,8,1.101800
+pstore_scan,存储引擎,baseline,1,9,1.997700
+pstore_scan,存储引擎,baseline,1,10,1.141900
+pstore_scan,存储引擎,baseline,2,1,1.025200
+pstore_scan,存储引擎,baseline,2,2,1.015900
+pstore_scan,存储引擎,baseline,2,3,1.045600
+pstore_scan,存储引擎,baseline,2,4,1.036300
+pstore_scan,存储引擎,baseline,2,5,1.036300
+pstore_scan,存储引擎,baseline,2,6,1.100300
+pstore_scan,存储引擎,baseline,2,7,1.315000
+pstore_scan,存储引擎,baseline,2,8,1.094400
+pstore_scan,存储引擎,baseline,2,9,1.101500
+pstore_scan,存储引擎,baseline,2,10,0.997900
+pstore_scan,存储引擎,baseline,3,1,1.033800
+pstore_scan,存储引擎,baseline,3,2,1.131100
+pstore_scan,存储引擎,baseline,3,3,1.049700
+pstore_scan,存储引擎,baseline,3,4,1.094600
+pstore_scan,存储引擎,baseline,3,5,1.029600
+pstore_scan,存储引擎,baseline,3,6,1.078800
+pstore_scan,存储引擎,baseline,3,7,0.947200
+pstore_scan,存储引擎,baseline,3,8,1.036900
+pstore_scan,存储引擎,baseline,3,9,0.976800
+pstore_scan,存储引擎,baseline,3,10,1.061900
+pstore_scan,存储引擎,baseline,4,1,1.059900
+pstore_scan,存储引擎,baseline,4,2,1.134300
+pstore_scan,存储引擎,baseline,4,3,1.614800
+pstore_scan,存储引擎,baseline,4,4,1.134200
+pstore_scan,存储引擎,baseline,4,5,1.000500
+pstore_scan,存储引擎,baseline,4,6,1.070700
+pstore_scan,存储引擎,baseline,4,7,1.069900
+pstore_scan,存储引擎,baseline,4,8,0.967700
+pstore_scan,存储引擎,baseline,4,9,1.060000
+pstore_scan,存储引擎,baseline,4,10,1.011700
+pstore_scan,存储引擎,baseline,5,1,1.041200
+pstore_scan,存储引擎,baseline,5,2,1.026500
+pstore_scan,存储引擎,baseline,5,3,1.019900
+pstore_scan,存储引擎,baseline,5,4,1.016200
+pstore_scan,存储引擎,baseline,5,5,0.999300
+pstore_scan,存储引擎,baseline,5,6,1.086400
+pstore_scan,存储引擎,baseline,5,7,1.074700
+pstore_scan,存储引擎,baseline,5,8,1.099600
+pstore_scan,存储引擎,baseline,5,9,1.007200
+pstore_scan,存储引擎,baseline,5,10,1.054000
+txn_put,存储引擎,baseline,1,1,232.496800
+txn_put,存储引擎,baseline,1,2,171.554800
+txn_put,存储引擎,baseline,1,3,271.049800
+txn_put,存储引擎,baseline,1,4,218.373600
+txn_put,存储引擎,baseline,1,5,167.310400
+txn_put,存储引擎,baseline,1,6,229.347700
+txn_put,存储引擎,baseline,1,7,236.069000
+txn_put,存储引擎,baseline,1,8,220.499400
+txn_put,存储引擎,baseline,1,9,210.906100
+txn_put,存储引擎,baseline,1,10,219.289900
+txn_put,存储引擎,baseline,2,1,209.567700
+txn_put,存储引擎,baseline,2,2,244.536900
+txn_put,存储引擎,baseline,2,3,192.467000
+txn_put,存储引擎,baseline,2,4,236.500300
+txn_put,存储引擎,baseline,2,5,351.977900
+txn_put,存储引擎,baseline,2,6,376.545900
+txn_put,存储引擎,baseline,2,7,393.352000
+txn_put,存储引擎,baseline,2,8,301.210100
+txn_put,存储引擎,baseline,2,9,447.901000
+txn_put,存储引擎,baseline,2,10,427.483900
+txn_put,存储引擎,baseline,3,1,274.547100
+txn_put,存储引擎,baseline,3,2,181.079900
+txn_put,存储引擎,baseline,3,3,207.087900
+txn_put,存储引擎,baseline,3,4,263.495800
+txn_put,存储引擎,baseline,3,5,212.510000
+txn_put,存储引擎,baseline,3,6,225.422400
+txn_put,存储引擎,baseline,3,7,195.203800
+txn_put,存储引擎,baseline,3,8,265.886400
+txn_put,存储引擎,baseline,3,9,286.245200
+txn_put,存储引擎,baseline,3,10,201.372200
+txn_put,存储引擎,baseline,4,1,176.539100
+txn_put,存储引擎,baseline,4,2,264.342500
+txn_put,存储引擎,baseline,4,3,174.708000
+txn_put,存储引擎,baseline,4,4,408.859800
+txn_put,存储引擎,baseline,4,5,188.270900
+txn_put,存储引擎,baseline,4,6,239.862300
+txn_put,存储引擎,baseline,4,7,191.949900
+txn_put,存储引擎,baseline,4,8,264.259600
+txn_put,存储引擎,baseline,4,9,199.130900
+txn_put,存储引擎,baseline,4,10,177.192000
+txn_put,存储引擎,baseline,5,1,190.482700
+txn_put,存储引擎,baseline,5,2,224.146100
+txn_put,存储引擎,baseline,5,3,197.824200
+txn_put,存储引擎,baseline,5,4,175.108300
+txn_put,存储引擎,baseline,5,5,234.318400
+txn_put,存储引擎,baseline,5,6,195.629300
+txn_put,存储引擎,baseline,5,7,236.187900
+txn_put,存储引擎,baseline,5,8,188.406500
+txn_put,存储引擎,baseline,5,9,181.243200
+txn_put,存储引擎,baseline,5,10,294.679200
+pgwire_roundtrip,协议接口,baseline,1,1,0.115241
+pgwire_roundtrip,协议接口,baseline,1,2,0.145347
+pgwire_roundtrip,协议接口,baseline,1,3,0.111300
+pgwire_roundtrip,协议接口,baseline,1,4,0.110853
+pgwire_roundtrip,协议接口,baseline,1,5,0.109194
+pgwire_roundtrip,协议接口,baseline,1,6,0.113956
+pgwire_roundtrip,协议接口,baseline,1,7,0.133875
+pgwire_roundtrip,协议接口,baseline,1,8,0.104700
+pgwire_roundtrip,协议接口,baseline,1,9,0.115819
+pgwire_roundtrip,协议接口,baseline,1,10,0.108306
+pgwire_roundtrip,协议接口,baseline,2,1,0.109828
+pgwire_roundtrip,协议接口,baseline,2,2,0.138028
+pgwire_roundtrip,协议接口,baseline,2,3,0.108947
+pgwire_roundtrip,协议接口,baseline,2,4,0.122569
+pgwire_roundtrip,协议接口,baseline,2,5,0.108719
+pgwire_roundtrip,协议接口,baseline,2,6,0.107428
+pgwire_roundtrip,协议接口,baseline,2,7,0.105744
+pgwire_roundtrip,协议接口,baseline,2,8,0.119709
+pgwire_roundtrip,协议接口,baseline,2,9,0.107834
+pgwire_roundtrip,协议接口,baseline,2,10,0.117144
+pgwire_roundtrip,协议接口,baseline,3,1,0.117209
+pgwire_roundtrip,协议接口,baseline,3,2,0.110234
+pgwire_roundtrip,协议接口,baseline,3,3,0.110966
+pgwire_roundtrip,协议接口,baseline,3,4,0.107069
+pgwire_roundtrip,协议接口,baseline,3,5,0.109688
+pgwire_roundtrip,协议接口,baseline,3,6,0.111725
+pgwire_roundtrip,协议接口,baseline,3,7,0.108869
+pgwire_roundtrip,协议接口,baseline,3,8,0.104500
+pgwire_roundtrip,协议接口,baseline,3,9,0.105281
+pgwire_roundtrip,协议接口,baseline,3,10,0.114603
+pgwire_roundtrip,协议接口,baseline,4,1,0.113856
+pgwire_roundtrip,协议接口,baseline,4,2,0.117253
+pgwire_roundtrip,协议接口,baseline,4,3,0.104709
+pgwire_roundtrip,协议接口,baseline,4,4,0.111753
+pgwire_roundtrip,协议接口,baseline,4,5,0.106275
+pgwire_roundtrip,协议接口,baseline,4,6,0.113891
+pgwire_roundtrip,协议接口,baseline,4,7,0.106956
+pgwire_roundtrip,协议接口,baseline,4,8,0.106353
+pgwire_roundtrip,协议接口,baseline,4,9,0.110347
+pgwire_roundtrip,协议接口,baseline,4,10,0.109063
+pgwire_roundtrip,协议接口,baseline,5,1,0.122559
+pgwire_roundtrip,协议接口,baseline,5,2,0.108113
+pgwire_roundtrip,协议接口,baseline,5,3,0.120256
+pgwire_roundtrip,协议接口,baseline,5,4,0.108966
+pgwire_roundtrip,协议接口,baseline,5,5,0.109562
+pgwire_roundtrip,协议接口,baseline,5,6,0.112900
+pgwire_roundtrip,协议接口,baseline,5,7,0.108566
+pgwire_roundtrip,协议接口,baseline,5,8,0.108722
+pgwire_roundtrip,协议接口,baseline,5,9,0.113397
+pgwire_roundtrip,协议接口,baseline,5,10,0.116856
+ann_knn,索引与图,baseline,1,1,0.055000
+ann_knn,索引与图,baseline,1,2,0.048100
+ann_knn,索引与图,baseline,1,3,0.044200
+ann_knn,索引与图,baseline,1,4,0.045100
+ann_knn,索引与图,baseline,1,5,0.042200
+ann_knn,索引与图,baseline,1,6,0.042700
+ann_knn,索引与图,baseline,1,7,0.041900
+ann_knn,索引与图,baseline,1,8,0.042400
+ann_knn,索引与图,baseline,1,9,0.054900
+ann_knn,索引与图,baseline,1,10,0.042300
+ann_knn,索引与图,baseline,2,1,0.048400
+ann_knn,索引与图,baseline,2,2,0.047600
+ann_knn,索引与图,baseline,2,3,0.042700
+ann_knn,索引与图,baseline,2,4,0.041700
+ann_knn,索引与图,baseline,2,5,0.042300
+ann_knn,索引与图,baseline,2,6,0.040700
+ann_knn,索引与图,baseline,2,7,0.041000
+ann_knn,索引与图,baseline,2,8,0.039800
+ann_knn,索引与图,baseline,2,9,0.040800
+ann_knn,索引与图,baseline,2,10,0.046200
+ann_knn,索引与图,baseline,3,1,0.052600
+ann_knn,索引与图,baseline,3,2,0.061700
+ann_knn,索引与图,baseline,3,3,0.049700
+ann_knn,索引与图,baseline,3,4,0.049800
+ann_knn,索引与图,baseline,3,5,0.051100
+ann_knn,索引与图,baseline,3,6,0.047000
+ann_knn,索引与图,baseline,3,7,0.047200
+ann_knn,索引与图,baseline,3,8,0.044600
+ann_knn,索引与图,baseline,3,9,0.046500
+ann_knn,索引与图,baseline,3,10,0.046200
+ann_knn,索引与图,baseline,4,1,0.049500
+ann_knn,索引与图,baseline,4,2,0.049000
+ann_knn,索引与图,baseline,4,3,0.044600
+ann_knn,索引与图,baseline,4,4,0.045100
+ann_knn,索引与图,baseline,4,5,0.040700
+ann_knn,索引与图,baseline,4,6,0.045200
+ann_knn,索引与图,baseline,4,7,0.047600
+ann_knn,索引与图,baseline,4,8,0.042200
+ann_knn,索引与图,baseline,4,9,0.040900
+ann_knn,索引与图,baseline,4,10,0.044300
+ann_knn,索引与图,baseline,5,1,0.053100
+ann_knn,索引与图,baseline,5,2,0.053800
+ann_knn,索引与图,baseline,5,3,0.047100
+ann_knn,索引与图,baseline,5,4,0.045500
+ann_knn,索引与图,baseline,5,5,0.048900
+ann_knn,索引与图,baseline,5,6,0.042100
+ann_knn,索引与图,baseline,5,7,0.043600
+ann_knn,索引与图,baseline,5,8,0.042500
+ann_knn,索引与图,baseline,5,9,0.051200
+ann_knn,索引与图,baseline,5,10,0.043800
+graph_reach,索引与图,baseline,1,1,0.000700
+graph_reach,索引与图,baseline,1,2,0.000500
+graph_reach,索引与图,baseline,1,3,0.000500
+graph_reach,索引与图,baseline,1,4,0.000400
+graph_reach,索引与图,baseline,1,5,0.000400
+graph_reach,索引与图,baseline,1,6,0.000300
+graph_reach,索引与图,baseline,1,7,0.000300
+graph_reach,索引与图,baseline,1,8,0.000300
+graph_reach,索引与图,baseline,1,9,0.000300
+graph_reach,索引与图,baseline,1,10,0.000400
+graph_reach,索引与图,baseline,2,1,0.000700
+graph_reach,索引与图,baseline,2,2,0.000500
+graph_reach,索引与图,baseline,2,3,0.000400
+graph_reach,索引与图,baseline,2,4,0.000300
+graph_reach,索引与图,baseline,2,5,0.000600
+graph_reach,索引与图,baseline,2,6,0.000200
+graph_reach,索引与图,baseline,2,7,0.000200
+graph_reach,索引与图,baseline,2,8,0.000200
+graph_reach,索引与图,baseline,2,9,0.000200
+graph_reach,索引与图,baseline,2,10,0.000200
+graph_reach,索引与图,baseline,3,1,0.000700
+graph_reach,索引与图,baseline,3,2,0.000400
+graph_reach,索引与图,baseline,3,3,0.000400
+graph_reach,索引与图,baseline,3,4,0.000400
+graph_reach,索引与图,baseline,3,5,0.000500
+graph_reach,索引与图,baseline,3,6,0.000400
+graph_reach,索引与图,baseline,3,7,0.000400
+graph_reach,索引与图,baseline,3,8,0.000400
+graph_reach,索引与图,baseline,3,9,0.000400
+graph_reach,索引与图,baseline,3,10,0.000300
+graph_reach,索引与图,baseline,4,1,0.000700
+graph_reach,索引与图,baseline,4,2,0.000800
+graph_reach,索引与图,baseline,4,3,0.000500
+graph_reach,索引与图,baseline,4,4,0.000500
+graph_reach,索引与图,baseline,4,5,0.000400
+graph_reach,索引与图,baseline,4,6,0.000400
+graph_reach,索引与图,baseline,4,7,0.000400
+graph_reach,索引与图,baseline,4,8,0.000400
+graph_reach,索引与图,baseline,4,9,0.000400
+graph_reach,索引与图,baseline,4,10,0.000500
+graph_reach,索引与图,baseline,5,1,0.000800
+graph_reach,索引与图,baseline,5,2,0.000500
+graph_reach,索引与图,baseline,5,3,0.000400
+graph_reach,索引与图,baseline,5,4,0.000600
+graph_reach,索引与图,baseline,5,5,0.000500
+graph_reach,索引与图,baseline,5,6,0.000400
+graph_reach,索引与图,baseline,5,7,0.000400
+graph_reach,索引与图,baseline,5,8,0.000400
+graph_reach,索引与图,baseline,5,9,0.000400
+graph_reach,索引与图,baseline,5,10,0.000300
+sql_scan,SQL 执行,current,1,1,0.100100
+sql_scan,SQL 执行,current,1,2,0.102000
+sql_scan,SQL 执行,current,1,3,0.108400
+sql_scan,SQL 执行,current,1,4,0.109300
+sql_scan,SQL 执行,current,1,5,0.108200
+sql_scan,SQL 执行,current,1,6,0.104800
+sql_scan,SQL 执行,current,1,7,0.106900
+sql_scan,SQL 执行,current,1,8,0.096700
+sql_scan,SQL 执行,current,1,9,0.094400
+sql_scan,SQL 执行,current,1,10,0.093900
+sql_scan,SQL 执行,current,2,1,0.106300
+sql_scan,SQL 执行,current,2,2,0.112900
+sql_scan,SQL 执行,current,2,3,0.115400
+sql_scan,SQL 执行,current,2,4,0.110600
+sql_scan,SQL 执行,current,2,5,0.110500
+sql_scan,SQL 执行,current,2,6,0.118400
+sql_scan,SQL 执行,current,2,7,0.118300
+sql_scan,SQL 执行,current,2,8,0.117700
+sql_scan,SQL 执行,current,2,9,0.123200
+sql_scan,SQL 执行,current,2,10,0.112300
+sql_scan,SQL 执行,current,3,1,0.237800
+sql_scan,SQL 执行,current,3,2,0.119600
+sql_scan,SQL 执行,current,3,3,0.115400
+sql_scan,SQL 执行,current,3,4,0.111100
+sql_scan,SQL 执行,current,3,5,0.112800
+sql_scan,SQL 执行,current,3,6,0.108100
+sql_scan,SQL 执行,current,3,7,0.116500
+sql_scan,SQL 执行,current,3,8,0.110400
+sql_scan,SQL 执行,current,3,9,0.112200
+sql_scan,SQL 执行,current,3,10,0.146200
+sql_scan,SQL 执行,current,4,1,0.106400
+sql_scan,SQL 执行,current,4,2,0.115300
+sql_scan,SQL 执行,current,4,3,0.097700
+sql_scan,SQL 执行,current,4,4,0.100600
+sql_scan,SQL 执行,current,4,5,0.105300
+sql_scan,SQL 执行,current,4,6,0.114600
+sql_scan,SQL 执行,current,4,7,0.109800
+sql_scan,SQL 执行,current,4,8,0.244500
+sql_scan,SQL 执行,current,4,9,0.113400
+sql_scan,SQL 执行,current,4,10,0.127900
+sql_scan,SQL 执行,current,5,1,0.102000
+sql_scan,SQL 执行,current,5,2,0.110500
+sql_scan,SQL 执行,current,5,3,0.117800
+sql_scan,SQL 执行,current,5,4,0.113800
+sql_scan,SQL 执行,current,5,5,0.107700
+sql_scan,SQL 执行,current,5,6,0.109900
+sql_scan,SQL 执行,current,5,7,0.256300
+sql_scan,SQL 执行,current,5,8,0.107800
+sql_scan,SQL 执行,current,5,9,0.119200
+sql_scan,SQL 执行,current,5,10,0.107000
+sql_point,SQL 执行,current,1,1,0.101100
+sql_point,SQL 执行,current,1,2,0.098200
+sql_point,SQL 执行,current,1,3,0.103500
+sql_point,SQL 执行,current,1,4,0.098500
+sql_point,SQL 执行,current,1,5,0.098600
+sql_point,SQL 执行,current,1,6,0.076900
+sql_point,SQL 执行,current,1,7,0.097200
+sql_point,SQL 执行,current,1,8,0.093200
+sql_point,SQL 执行,current,1,9,0.089700
+sql_point,SQL 执行,current,1,10,0.102900
+sql_point,SQL 执行,current,1,11,0.090500
+sql_point,SQL 执行,current,1,12,0.095000
+sql_point,SQL 执行,current,1,13,0.086500
+sql_point,SQL 执行,current,1,14,0.097700
+sql_point,SQL 执行,current,1,15,0.102000
+sql_point,SQL 执行,current,1,16,0.096900
+sql_point,SQL 执行,current,1,17,0.092800
+sql_point,SQL 执行,current,1,18,0.092700
+sql_point,SQL 执行,current,1,19,0.100400
+sql_point,SQL 执行,current,1,20,0.104300
+sql_point,SQL 执行,current,1,21,0.102400
+sql_point,SQL 执行,current,1,22,0.097700
+sql_point,SQL 执行,current,1,23,0.093400
+sql_point,SQL 执行,current,1,24,0.093800
+sql_point,SQL 执行,current,1,25,0.098800
+sql_point,SQL 执行,current,1,26,0.097300
+sql_point,SQL 执行,current,1,27,0.094000
+sql_point,SQL 执行,current,1,28,0.096000
+sql_point,SQL 执行,current,1,29,0.095900
+sql_point,SQL 执行,current,1,30,0.095800
+sql_point,SQL 执行,current,1,31,0.094500
+sql_point,SQL 执行,current,1,32,0.097800
+sql_point,SQL 执行,current,1,33,0.097900
+sql_point,SQL 执行,current,1,34,0.096100
+sql_point,SQL 执行,current,1,35,0.099800
+sql_point,SQL 执行,current,1,36,0.096400
+sql_point,SQL 执行,current,1,37,0.094000
+sql_point,SQL 执行,current,1,38,0.101600
+sql_point,SQL 执行,current,1,39,0.074700
+sql_point,SQL 执行,current,1,40,0.099400
+sql_point,SQL 执行,current,1,41,0.092300
+sql_point,SQL 执行,current,1,42,0.157900
+sql_point,SQL 执行,current,1,43,0.116000
+sql_point,SQL 执行,current,1,44,0.083600
+sql_point,SQL 执行,current,1,45,0.116800
+sql_point,SQL 执行,current,1,46,0.105900
+sql_point,SQL 执行,current,1,47,0.110200
+sql_point,SQL 执行,current,1,48,0.095100
+sql_point,SQL 执行,current,1,49,0.096500
+sql_point,SQL 执行,current,1,50,0.100000
+sql_point,SQL 执行,current,1,51,0.102900
+sql_point,SQL 执行,current,1,52,0.091700
+sql_point,SQL 执行,current,1,53,0.100800
+sql_point,SQL 执行,current,1,54,0.104600
+sql_point,SQL 执行,current,1,55,0.089700
+sql_point,SQL 执行,current,1,56,0.097300
+sql_point,SQL 执行,current,1,57,0.102700
+sql_point,SQL 执行,current,1,58,0.099300
+sql_point,SQL 执行,current,1,59,0.078100
+sql_point,SQL 执行,current,1,60,0.070800
+sql_point,SQL 执行,current,1,61,0.069000
+sql_point,SQL 执行,current,1,62,0.069600
+sql_point,SQL 执行,current,1,63,0.070900
+sql_point,SQL 执行,current,1,64,0.068600
+sql_point,SQL 执行,current,2,1,0.085400
+sql_point,SQL 执行,current,2,2,0.107400
+sql_point,SQL 执行,current,2,3,0.108000
+sql_point,SQL 执行,current,2,4,0.105600
+sql_point,SQL 执行,current,2,5,0.097600
+sql_point,SQL 执行,current,2,6,0.108000
+sql_point,SQL 执行,current,2,7,0.114200
+sql_point,SQL 执行,current,2,8,0.106400
+sql_point,SQL 执行,current,2,9,0.102900
+sql_point,SQL 执行,current,2,10,0.086100
+sql_point,SQL 执行,current,2,11,0.077900
+sql_point,SQL 执行,current,2,12,0.105600
+sql_point,SQL 执行,current,2,13,0.105700
+sql_point,SQL 执行,current,2,14,0.110900
+sql_point,SQL 执行,current,2,15,0.103900
+sql_point,SQL 执行,current,2,16,0.104200
+sql_point,SQL 执行,current,2,17,0.110200
+sql_point,SQL 执行,current,2,18,0.100200
+sql_point,SQL 执行,current,2,19,0.091000
+sql_point,SQL 执行,current,2,20,0.110200
+sql_point,SQL 执行,current,2,21,0.097900
+sql_point,SQL 执行,current,2,22,0.084200
+sql_point,SQL 执行,current,2,23,0.106800
+sql_point,SQL 执行,current,2,24,0.096000
+sql_point,SQL 执行,current,2,25,0.085800
+sql_point,SQL 执行,current,2,26,0.106900
+sql_point,SQL 执行,current,2,27,0.098100
+sql_point,SQL 执行,current,2,28,0.085100
+sql_point,SQL 执行,current,2,29,0.105600
+sql_point,SQL 执行,current,2,30,0.099600
+sql_point,SQL 执行,current,2,31,0.083800
+sql_point,SQL 执行,current,2,32,0.108700
+sql_point,SQL 执行,current,2,33,0.095800
+sql_point,SQL 执行,current,2,34,0.089500
+sql_point,SQL 执行,current,2,35,0.107300
+sql_point,SQL 执行,current,2,36,0.098000
+sql_point,SQL 执行,current,2,37,0.099900
+sql_point,SQL 执行,current,2,38,0.104300
+sql_point,SQL 执行,current,2,39,0.075600
+sql_point,SQL 执行,current,2,40,0.099400
+sql_point,SQL 执行,current,2,41,0.103300
+sql_point,SQL 执行,current,2,42,0.110400
+sql_point,SQL 执行,current,2,43,0.097700
+sql_point,SQL 执行,current,2,44,0.113800
+sql_point,SQL 执行,current,2,45,0.102500
+sql_point,SQL 执行,current,2,46,0.111400
+sql_point,SQL 执行,current,2,47,0.189500
+sql_point,SQL 执行,current,2,48,0.138500
+sql_point,SQL 执行,current,2,49,0.097100
+sql_point,SQL 执行,current,2,50,0.113400
+sql_point,SQL 执行,current,2,51,0.089800
+sql_point,SQL 执行,current,2,52,0.082100
+sql_point,SQL 执行,current,2,53,0.118700
+sql_point,SQL 执行,current,2,54,0.107500
+sql_point,SQL 执行,current,2,55,0.092300
+sql_point,SQL 执行,current,2,56,0.103200
+sql_point,SQL 执行,current,2,57,0.098700
+sql_point,SQL 执行,current,2,58,0.087900
+sql_point,SQL 执行,current,2,59,0.109300
+sql_point,SQL 执行,current,2,60,0.105800
+sql_point,SQL 执行,current,2,61,0.107900
+sql_point,SQL 执行,current,2,62,0.107800
+sql_point,SQL 执行,current,2,63,0.119400
+sql_point,SQL 执行,current,2,64,0.108800
+sql_point,SQL 执行,current,3,1,0.103800
+sql_point,SQL 执行,current,3,2,0.103200
+sql_point,SQL 执行,current,3,3,0.107700
+sql_point,SQL 执行,current,3,4,0.105400
+sql_point,SQL 执行,current,3,5,0.101800
+sql_point,SQL 执行,current,3,6,0.099000
+sql_point,SQL 执行,current,3,7,0.098200
+sql_point,SQL 执行,current,3,8,0.102400
+sql_point,SQL 执行,current,3,9,0.107400
+sql_point,SQL 执行,current,3,10,0.107300
+sql_point,SQL 执行,current,3,11,0.100900
+sql_point,SQL 执行,current,3,12,0.100100
+sql_point,SQL 执行,current,3,13,0.105700
+sql_point,SQL 执行,current,3,14,0.103400
+sql_point,SQL 执行,current,3,15,0.101000
+sql_point,SQL 执行,current,3,16,0.106300
+sql_point,SQL 执行,current,3,17,0.100800
+sql_point,SQL 执行,current,3,18,0.099600
+sql_point,SQL 执行,current,3,19,0.110200
+sql_point,SQL 执行,current,3,20,0.105600
+sql_point,SQL 执行,current,3,21,0.102900
+sql_point,SQL 执行,current,3,22,0.106200
+sql_point,SQL 执行,current,3,23,0.099200
+sql_point,SQL 执行,current,3,24,0.133400
+sql_point,SQL 执行,current,3,25,0.105300
+sql_point,SQL 执行,current,3,26,0.097000
+sql_point,SQL 执行,current,3,27,0.106500
+sql_point,SQL 执行,current,3,28,0.095100
+sql_point,SQL 执行,current,3,29,0.098500
+sql_point,SQL 执行,current,3,30,0.195300
+sql_point,SQL 执行,current,3,31,0.118900
+sql_point,SQL 执行,current,3,32,0.103700
+sql_point,SQL 执行,current,3,33,0.104700
+sql_point,SQL 执行,current,3,34,0.095600
+sql_point,SQL 执行,current,3,35,0.097300
+sql_point,SQL 执行,current,3,36,0.105200
+sql_point,SQL 执行,current,3,37,0.102800
+sql_point,SQL 执行,current,3,38,0.098900
+sql_point,SQL 执行,current,3,39,0.103700
+sql_point,SQL 执行,current,3,40,0.098500
+sql_point,SQL 执行,current,3,41,0.103700
+sql_point,SQL 执行,current,3,42,0.101500
+sql_point,SQL 执行,current,3,43,0.082400
+sql_point,SQL 执行,current,3,44,0.071800
+sql_point,SQL 执行,current,3,45,0.072800
+sql_point,SQL 执行,current,3,46,0.072200
+sql_point,SQL 执行,current,3,47,0.074800
+sql_point,SQL 执行,current,3,48,0.076600
+sql_point,SQL 执行,current,3,49,0.072700
+sql_point,SQL 执行,current,3,50,0.072500
+sql_point,SQL 执行,current,3,51,0.071100
+sql_point,SQL 执行,current,3,52,0.075100
+sql_point,SQL 执行,current,3,53,0.071300
+sql_point,SQL 执行,current,3,54,0.071500
+sql_point,SQL 执行,current,3,55,0.074500
+sql_point,SQL 执行,current,3,56,0.068200
+sql_point,SQL 执行,current,3,57,0.059800
+sql_point,SQL 执行,current,3,58,0.062500
+sql_point,SQL 执行,current,3,59,0.071300
+sql_point,SQL 执行,current,3,60,0.072400
+sql_point,SQL 执行,current,3,61,0.073600
+sql_point,SQL 执行,current,3,62,0.074100
+sql_point,SQL 执行,current,3,63,0.073000
+sql_point,SQL 执行,current,3,64,0.071200
+sql_point,SQL 执行,current,4,1,0.102000
+sql_point,SQL 执行,current,4,2,0.098800
+sql_point,SQL 执行,current,4,3,0.097100
+sql_point,SQL 执行,current,4,4,0.100100
+sql_point,SQL 执行,current,4,5,0.098100
+sql_point,SQL 执行,current,4,6,0.100500
+sql_point,SQL 执行,current,4,7,0.099400
+sql_point,SQL 执行,current,4,8,0.099600
+sql_point,SQL 执行,current,4,9,0.102800
+sql_point,SQL 执行,current,4,10,0.101700
+sql_point,SQL 执行,current,4,11,0.102100
+sql_point,SQL 执行,current,4,12,0.101200
+sql_point,SQL 执行,current,4,13,0.103200
+sql_point,SQL 执行,current,4,14,0.104200
+sql_point,SQL 执行,current,4,15,0.096900
+sql_point,SQL 执行,current,4,16,0.101400
+sql_point,SQL 执行,current,4,17,0.075900
+sql_point,SQL 执行,current,4,18,0.083200
+sql_point,SQL 执行,current,4,19,0.096900
+sql_point,SQL 执行,current,4,20,0.081300
+sql_point,SQL 执行,current,4,21,0.076500
+sql_point,SQL 执行,current,4,22,0.098600
+sql_point,SQL 执行,current,4,23,0.079300
+sql_point,SQL 执行,current,4,24,0.073800
+sql_point,SQL 执行,current,4,25,0.099700
+sql_point,SQL 执行,current,4,26,0.075500
+sql_point,SQL 执行,current,4,27,0.075800
+sql_point,SQL 执行,current,4,28,0.096300
+sql_point,SQL 执行,current,4,29,0.071500
+sql_point,SQL 执行,current,4,30,0.177500
+sql_point,SQL 执行,current,4,31,0.104600
+sql_point,SQL 执行,current,4,32,0.076500
+sql_point,SQL 执行,current,4,33,0.079400
+sql_point,SQL 执行,current,4,34,0.100400
+sql_point,SQL 执行,current,4,35,0.073300
+sql_point,SQL 执行,current,4,36,0.084100
+sql_point,SQL 执行,current,4,37,0.102800
+sql_point,SQL 执行,current,4,38,0.091600
+sql_point,SQL 执行,current,4,39,0.098900
+sql_point,SQL 执行,current,4,40,0.101600
+sql_point,SQL 执行,current,4,41,0.110100
+sql_point,SQL 执行,current,4,42,0.107600
+sql_point,SQL 执行,current,4,43,0.066400
+sql_point,SQL 执行,current,4,44,0.057800
+sql_point,SQL 执行,current,4,45,0.069200
+sql_point,SQL 执行,current,4,46,0.068700
+sql_point,SQL 执行,current,4,47,0.071900
+sql_point,SQL 执行,current,4,48,0.067900
+sql_point,SQL 执行,current,4,49,0.071300
+sql_point,SQL 执行,current,4,50,0.070200
+sql_point,SQL 执行,current,4,51,0.063700
+sql_point,SQL 执行,current,4,52,0.062100
+sql_point,SQL 执行,current,4,53,0.056900
+sql_point,SQL 执行,current,4,54,0.072100
+sql_point,SQL 执行,current,4,55,0.065300
+sql_point,SQL 执行,current,4,56,0.072800
+sql_point,SQL 执行,current,4,57,0.069000
+sql_point,SQL 执行,current,4,58,0.061700
+sql_point,SQL 执行,current,4,59,0.072400
+sql_point,SQL 执行,current,4,60,0.062800
+sql_point,SQL 执行,current,4,61,0.068800
+sql_point,SQL 执行,current,4,62,0.067700
+sql_point,SQL 执行,current,4,63,0.068100
+sql_point,SQL 执行,current,4,64,0.063700
+sql_point,SQL 执行,current,5,1,0.109500
+sql_point,SQL 执行,current,5,2,0.081900
+sql_point,SQL 执行,current,5,3,0.079400
+sql_point,SQL 执行,current,5,4,0.091000
+sql_point,SQL 执行,current,5,5,0.105900
+sql_point,SQL 执行,current,5,6,0.100900
+sql_point,SQL 执行,current,5,7,0.103200
+sql_point,SQL 执行,current,5,8,0.108800
+sql_point,SQL 执行,current,5,9,0.102900
+sql_point,SQL 执行,current,5,10,0.098000
+sql_point,SQL 执行,current,5,11,0.108000
+sql_point,SQL 执行,current,5,12,0.092200
+sql_point,SQL 执行,current,5,13,0.099500
+sql_point,SQL 执行,current,5,14,0.113700
+sql_point,SQL 执行,current,5,15,0.103400
+sql_point,SQL 执行,current,5,16,0.102100
+sql_point,SQL 执行,current,5,17,0.113200
+sql_point,SQL 执行,current,5,18,0.116900
+sql_point,SQL 执行,current,5,19,0.105600
+sql_point,SQL 执行,current,5,20,0.112800
+sql_point,SQL 执行,current,5,21,0.104600
+sql_point,SQL 执行,current,5,22,0.111200
+sql_point,SQL 执行,current,5,23,0.114900
+sql_point,SQL 执行,current,5,24,0.104600
+sql_point,SQL 执行,current,5,25,0.112400
+sql_point,SQL 执行,current,5,26,0.114800
+sql_point,SQL 执行,current,5,27,0.106500
+sql_point,SQL 执行,current,5,28,0.111100
+sql_point,SQL 执行,current,5,29,0.110800
+sql_point,SQL 执行,current,5,30,0.106600
+sql_point,SQL 执行,current,5,31,0.105700
+sql_point,SQL 执行,current,5,32,0.109400
+sql_point,SQL 执行,current,5,33,0.100500
+sql_point,SQL 执行,current,5,34,0.232600
+sql_point,SQL 执行,current,5,35,0.127300
+sql_point,SQL 执行,current,5,36,0.102900
+sql_point,SQL 执行,current,5,37,0.103000
+sql_point,SQL 执行,current,5,38,0.106800
+sql_point,SQL 执行,current,5,39,0.108800
+sql_point,SQL 执行,current,5,40,0.101900
+sql_point,SQL 执行,current,5,41,0.102700
+sql_point,SQL 执行,current,5,42,0.106100
+sql_point,SQL 执行,current,5,43,0.105800
+sql_point,SQL 执行,current,5,44,0.105000
+sql_point,SQL 执行,current,5,45,0.107400
+sql_point,SQL 执行,current,5,46,0.107800
+sql_point,SQL 执行,current,5,47,0.104200
+sql_point,SQL 执行,current,5,48,0.111400
+sql_point,SQL 执行,current,5,49,0.106700
+sql_point,SQL 执行,current,5,50,0.107100
+sql_point,SQL 执行,current,5,51,0.106100
+sql_point,SQL 执行,current,5,52,0.102900
+sql_point,SQL 执行,current,5,53,0.110700
+sql_point,SQL 执行,current,5,54,0.105300
+sql_point,SQL 执行,current,5,55,0.105500
+sql_point,SQL 执行,current,5,56,0.103800
+sql_point,SQL 执行,current,5,57,0.106400
+sql_point,SQL 执行,current,5,58,0.112300
+sql_point,SQL 执行,current,5,59,0.073500
+sql_point,SQL 执行,current,5,60,0.077800
+sql_point,SQL 执行,current,5,61,0.077700
+sql_point,SQL 执行,current,5,62,0.074700
+sql_point,SQL 执行,current,5,63,0.075300
+sql_point,SQL 执行,current,5,64,0.073200
+sql_group,SQL 执行,current,1,1,0.183200
+sql_group,SQL 执行,current,1,2,0.163400
+sql_group,SQL 执行,current,1,3,0.160800
+sql_group,SQL 执行,current,1,4,0.166100
+sql_group,SQL 执行,current,1,5,0.148300
+sql_group,SQL 执行,current,1,6,0.159000
+sql_group,SQL 执行,current,1,7,0.176400
+sql_group,SQL 执行,current,1,8,0.157300
+sql_group,SQL 执行,current,1,9,0.155100
+sql_group,SQL 执行,current,1,10,0.146500
+sql_group,SQL 执行,current,2,1,0.187200
+sql_group,SQL 执行,current,2,2,0.162500
+sql_group,SQL 执行,current,2,3,0.188600
+sql_group,SQL 执行,current,2,4,0.166500
+sql_group,SQL 执行,current,2,5,0.169000
+sql_group,SQL 执行,current,2,6,0.176300
+sql_group,SQL 执行,current,2,7,0.157300
+sql_group,SQL 执行,current,2,8,0.165800
+sql_group,SQL 执行,current,2,9,0.164600
+sql_group,SQL 执行,current,2,10,0.161200
+sql_group,SQL 执行,current,3,1,0.184700
+sql_group,SQL 执行,current,3,2,0.179200
+sql_group,SQL 执行,current,3,3,0.170500
+sql_group,SQL 执行,current,3,4,0.173100
+sql_group,SQL 执行,current,3,5,0.168100
+sql_group,SQL 执行,current,3,6,0.182600
+sql_group,SQL 执行,current,3,7,0.164900
+sql_group,SQL 执行,current,3,8,0.176700
+sql_group,SQL 执行,current,3,9,0.168900
+sql_group,SQL 执行,current,3,10,0.167800
+sql_group,SQL 执行,current,4,1,0.187900
+sql_group,SQL 执行,current,4,2,0.172300
+sql_group,SQL 执行,current,4,3,0.179400
+sql_group,SQL 执行,current,4,4,0.191300
+sql_group,SQL 执行,current,4,5,0.169100
+sql_group,SQL 执行,current,4,6,0.191400
+sql_group,SQL 执行,current,4,7,0.175400
+sql_group,SQL 执行,current,4,8,0.161600
+sql_group,SQL 执行,current,4,9,0.188600
+sql_group,SQL 执行,current,4,10,0.155500
+sql_group,SQL 执行,current,5,1,0.179400
+sql_group,SQL 执行,current,5,2,0.161000
+sql_group,SQL 执行,current,5,3,0.160500
+sql_group,SQL 执行,current,5,4,0.193300
+sql_group,SQL 执行,current,5,5,0.170300
+sql_group,SQL 执行,current,5,6,0.163300
+sql_group,SQL 执行,current,5,7,0.179300
+sql_group,SQL 执行,current,5,8,0.151500
+sql_group,SQL 执行,current,5,9,0.150900
+sql_group,SQL 执行,current,5,10,0.180800
+sql_sort,SQL 执行,current,1,1,0.256500
+sql_sort,SQL 执行,current,1,2,0.207000
+sql_sort,SQL 执行,current,1,3,0.215300
+sql_sort,SQL 执行,current,1,4,0.247500
+sql_sort,SQL 执行,current,1,5,0.230700
+sql_sort,SQL 执行,current,1,6,0.204000
+sql_sort,SQL 执行,current,1,7,0.229800
+sql_sort,SQL 执行,current,1,8,0.231500
+sql_sort,SQL 执行,current,1,9,0.225800
+sql_sort,SQL 执行,current,1,10,0.220600
+sql_sort,SQL 执行,current,2,1,0.226500
+sql_sort,SQL 执行,current,2,2,0.220200
+sql_sort,SQL 执行,current,2,3,0.195900
+sql_sort,SQL 执行,current,2,4,0.228100
+sql_sort,SQL 执行,current,2,5,0.194100
+sql_sort,SQL 执行,current,2,6,0.244500
+sql_sort,SQL 执行,current,2,7,0.238000
+sql_sort,SQL 执行,current,2,8,0.215200
+sql_sort,SQL 执行,current,2,9,0.218700
+sql_sort,SQL 执行,current,2,10,0.218300
+sql_sort,SQL 执行,current,3,1,0.223000
+sql_sort,SQL 执行,current,3,2,0.227600
+sql_sort,SQL 执行,current,3,3,0.180600
+sql_sort,SQL 执行,current,3,4,0.247700
+sql_sort,SQL 执行,current,3,5,0.183600
+sql_sort,SQL 执行,current,3,6,0.233000
+sql_sort,SQL 执行,current,3,7,0.200500
+sql_sort,SQL 执行,current,3,8,0.224100
+sql_sort,SQL 执行,current,3,9,0.223000
+sql_sort,SQL 执行,current,3,10,0.210200
+sql_sort,SQL 执行,current,4,1,0.294400
+sql_sort,SQL 执行,current,4,2,0.290500
+sql_sort,SQL 执行,current,4,3,0.296000
+sql_sort,SQL 执行,current,4,4,0.310300
+sql_sort,SQL 执行,current,4,5,0.265100
+sql_sort,SQL 执行,current,4,6,0.240000
+sql_sort,SQL 执行,current,4,7,0.220400
+sql_sort,SQL 执行,current,4,8,0.246400
+sql_sort,SQL 执行,current,4,9,0.241900
+sql_sort,SQL 执行,current,4,10,0.224700
+sql_sort,SQL 执行,current,5,1,0.229300
+sql_sort,SQL 执行,current,5,2,0.231300
+sql_sort,SQL 执行,current,5,3,0.190200
+sql_sort,SQL 执行,current,5,4,0.227900
+sql_sort,SQL 执行,current,5,5,0.199100
+sql_sort,SQL 执行,current,5,6,0.243500
+sql_sort,SQL 执行,current,5,7,0.244400
+sql_sort,SQL 执行,current,5,8,0.231500
+sql_sort,SQL 执行,current,5,9,0.225500
+sql_sort,SQL 执行,current,5,10,0.224900
+sql_insert,SQL 执行,current,1,1,2.710900
+sql_insert,SQL 执行,current,1,2,3.566900
+sql_insert,SQL 执行,current,1,3,4.534300
+sql_insert,SQL 执行,current,1,4,2.446800
+sql_insert,SQL 执行,current,1,5,2.431300
+sql_insert,SQL 执行,current,1,6,1.274800
+sql_insert,SQL 执行,current,1,7,2.520100
+sql_insert,SQL 执行,current,1,8,3.462000
+sql_insert,SQL 执行,current,1,9,8.724300
+sql_insert,SQL 执行,current,1,10,2.390800
+sql_insert,SQL 执行,current,2,1,2.532400
+sql_insert,SQL 执行,current,2,2,2.489200
+sql_insert,SQL 执行,current,2,3,0.972600
+sql_insert,SQL 执行,current,2,4,1.931400
+sql_insert,SQL 执行,current,2,5,2.823200
+sql_insert,SQL 执行,current,2,6,3.759900
+sql_insert,SQL 执行,current,2,7,4.801700
+sql_insert,SQL 执行,current,2,8,2.411300
+sql_insert,SQL 执行,current,2,9,2.380900
+sql_insert,SQL 执行,current,2,10,1.417600
+sql_insert,SQL 执行,current,3,1,1.024100
+sql_insert,SQL 执行,current,3,2,2.131200
+sql_insert,SQL 执行,current,3,3,3.142600
+sql_insert,SQL 执行,current,3,4,4.149400
+sql_insert,SQL 执行,current,3,5,5.335300
+sql_insert,SQL 执行,current,3,6,2.474600
+sql_insert,SQL 执行,current,3,7,0.852000
+sql_insert,SQL 执行,current,3,8,1.687200
+sql_insert,SQL 执行,current,3,9,2.829900
+sql_insert,SQL 执行,current,3,10,3.462500
+sql_insert,SQL 执行,current,4,1,1.836200
+sql_insert,SQL 执行,current,4,2,2.514800
+sql_insert,SQL 执行,current,4,3,3.981900
+sql_insert,SQL 执行,current,4,4,4.753500
+sql_insert,SQL 执行,current,4,5,5.041700
+sql_insert,SQL 执行,current,4,6,0.991200
+sql_insert,SQL 执行,current,4,7,1.919700
+sql_insert,SQL 执行,current,4,8,2.903900
+sql_insert,SQL 执行,current,4,9,4.022800
+sql_insert,SQL 执行,current,4,10,4.732500
+sql_insert,SQL 执行,current,5,1,5.095900
+sql_insert,SQL 执行,current,5,2,2.447200
+sql_insert,SQL 执行,current,5,3,2.463800
+sql_insert,SQL 执行,current,5,4,1.631300
+sql_insert,SQL 执行,current,5,5,2.689700
+sql_insert,SQL 执行,current,5,6,3.402900
+sql_insert,SQL 执行,current,5,7,4.259500
+sql_insert,SQL 执行,current,5,8,2.376600
+sql_insert,SQL 执行,current,5,9,2.392400
+sql_insert,SQL 执行,current,5,10,0.996400
+sql_update,SQL 执行,current,1,1,2.470800
+sql_update,SQL 执行,current,1,2,0.954700
+sql_update,SQL 执行,current,1,3,1.420200
+sql_update,SQL 执行,current,1,4,1.996300
+sql_update,SQL 执行,current,1,5,2.264300
+sql_update,SQL 执行,current,1,6,2.792200
+sql_update,SQL 执行,current,1,7,3.083000
+sql_update,SQL 执行,current,1,8,3.552000
+sql_update,SQL 执行,current,1,9,3.892400
+sql_update,SQL 执行,current,1,10,4.194200
+sql_update,SQL 执行,current,2,1,1.080800
+sql_update,SQL 执行,current,2,2,1.468000
+sql_update,SQL 执行,current,2,3,2.002800
+sql_update,SQL 执行,current,2,4,2.250300
+sql_update,SQL 执行,current,2,5,2.628800
+sql_update,SQL 执行,current,2,6,3.052600
+sql_update,SQL 执行,current,2,7,3.441500
+sql_update,SQL 执行,current,2,8,3.872400
+sql_update,SQL 执行,current,2,9,4.397100
+sql_update,SQL 执行,current,2,10,9.129200
+sql_update,SQL 执行,current,3,1,2.451100
+sql_update,SQL 执行,current,3,2,2.611800
+sql_update,SQL 执行,current,3,3,2.378000
+sql_update,SQL 执行,current,3,4,2.402500
+sql_update,SQL 执行,current,3,5,0.956400
+sql_update,SQL 执行,current,3,6,1.413900
+sql_update,SQL 执行,current,3,7,1.640600
+sql_update,SQL 执行,current,3,8,2.030000
+sql_update,SQL 执行,current,3,9,2.488100
+sql_update,SQL 执行,current,3,10,3.052700
+sql_update,SQL 执行,current,4,1,2.466800
+sql_update,SQL 执行,current,4,2,2.454700
+sql_update,SQL 执行,current,4,3,2.385800
+sql_update,SQL 执行,current,4,4,1.070700
+sql_update,SQL 执行,current,4,5,1.216100
+sql_update,SQL 执行,current,4,6,1.739500
+sql_update,SQL 执行,current,4,7,2.055500
+sql_update,SQL 执行,current,4,8,2.282900
+sql_update,SQL 执行,current,4,9,3.078400
+sql_update,SQL 执行,current,4,10,3.145200
+sql_update,SQL 执行,current,5,1,2.217200
+sql_update,SQL 执行,current,5,2,2.558600
+sql_update,SQL 执行,current,5,3,2.873000
+sql_update,SQL 执行,current,5,4,3.328100
+sql_update,SQL 执行,current,5,5,3.601000
+sql_update,SQL 执行,current,5,6,3.951600
+sql_update,SQL 执行,current,5,7,4.254600
+sql_update,SQL 执行,current,5,8,4.751300
+sql_update,SQL 执行,current,5,9,2.390800
+sql_update,SQL 执行,current,5,10,2.424900
+sql_delete,SQL 执行,current,1,1,2.554700
+sql_delete,SQL 执行,current,1,2,2.472700
+sql_delete,SQL 执行,current,1,3,2.479300
+sql_delete,SQL 执行,current,1,4,2.452000
+sql_delete,SQL 执行,current,1,5,2.356300
+sql_delete,SQL 执行,current,1,6,0.961900
+sql_delete,SQL 执行,current,1,7,1.300400
+sql_delete,SQL 执行,current,1,8,1.773900
+sql_delete,SQL 执行,current,1,9,2.060700
+sql_delete,SQL 执行,current,1,10,2.444700
+sql_delete,SQL 执行,current,2,1,2.568300
+sql_delete,SQL 执行,current,2,2,2.461200
+sql_delete,SQL 执行,current,2,3,2.381700
+sql_delete,SQL 执行,current,2,4,0.824500
+sql_delete,SQL 执行,current,2,5,1.282700
+sql_delete,SQL 执行,current,2,6,1.629100
+sql_delete,SQL 执行,current,2,7,2.205500
+sql_delete,SQL 执行,current,2,8,2.741000
+sql_delete,SQL 执行,current,2,9,2.994300
+sql_delete,SQL 执行,current,2,10,3.593300
+sql_delete,SQL 执行,current,3,1,4.297100
+sql_delete,SQL 执行,current,3,2,4.667500
+sql_delete,SQL 执行,current,3,3,4.963700
+sql_delete,SQL 执行,current,3,4,2.431000
+sql_delete,SQL 执行,current,3,5,2.406900
+sql_delete,SQL 执行,current,3,6,2.494800
+sql_delete,SQL 执行,current,3,7,2.427400
+sql_delete,SQL 执行,current,3,8,2.341700
+sql_delete,SQL 执行,current,3,9,0.977200
+sql_delete,SQL 执行,current,3,10,1.317400
+sql_delete,SQL 执行,current,4,1,4.570100
+sql_delete,SQL 执行,current,4,2,5.373800
+sql_delete,SQL 执行,current,4,3,2.380100
+sql_delete,SQL 执行,current,4,4,2.743200
+sql_delete,SQL 执行,current,4,5,2.389700
+sql_delete,SQL 执行,current,4,6,2.694300
+sql_delete,SQL 执行,current,4,7,2.570100
+sql_delete,SQL 执行,current,4,8,1.056600
+sql_delete,SQL 执行,current,4,9,1.449100
+sql_delete,SQL 执行,current,4,10,2.125700
+sql_delete,SQL 执行,current,5,1,2.474700
+sql_delete,SQL 执行,current,5,2,1.604500
+sql_delete,SQL 执行,current,5,3,1.566500
+sql_delete,SQL 执行,current,5,4,1.946100
+sql_delete,SQL 执行,current,5,5,2.279000
+sql_delete,SQL 执行,current,5,6,2.655100
+sql_delete,SQL 执行,current,5,7,3.717200
+sql_delete,SQL 执行,current,5,8,3.546800
+sql_delete,SQL 执行,current,5,9,3.885400
+sql_delete,SQL 执行,current,5,10,4.349700
+sql_subquery,SQL 执行,current,1,1,0.155900
+sql_subquery,SQL 执行,current,1,2,0.149100
+sql_subquery,SQL 执行,current,1,3,0.138100
+sql_subquery,SQL 执行,current,1,4,0.139100
+sql_subquery,SQL 执行,current,1,5,0.180900
+sql_subquery,SQL 执行,current,1,6,0.131900
+sql_subquery,SQL 执行,current,1,7,0.107400
+sql_subquery,SQL 执行,current,1,8,0.104200
+sql_subquery,SQL 执行,current,1,9,0.108500
+sql_subquery,SQL 执行,current,1,10,0.128900
+sql_subquery,SQL 执行,current,2,1,0.150800
+sql_subquery,SQL 执行,current,2,2,0.145400
+sql_subquery,SQL 执行,current,2,3,0.140200
+sql_subquery,SQL 执行,current,2,4,0.135100
+sql_subquery,SQL 执行,current,2,5,0.162400
+sql_subquery,SQL 执行,current,2,6,0.135800
+sql_subquery,SQL 执行,current,2,7,0.175500
+sql_subquery,SQL 执行,current,2,8,0.129900
+sql_subquery,SQL 执行,current,2,9,0.106000
+sql_subquery,SQL 执行,current,2,10,0.132400
+sql_subquery,SQL 执行,current,3,1,0.158500
+sql_subquery,SQL 执行,current,3,2,0.152200
+sql_subquery,SQL 执行,current,3,3,0.157400
+sql_subquery,SQL 执行,current,3,4,0.160300
+sql_subquery,SQL 执行,current,3,5,0.140600
+sql_subquery,SQL 执行,current,3,6,0.160400
+sql_subquery,SQL 执行,current,3,7,0.141800
+sql_subquery,SQL 执行,current,3,8,0.160800
+sql_subquery,SQL 执行,current,3,9,0.148700
+sql_subquery,SQL 执行,current,3,10,0.144800
+sql_subquery,SQL 执行,current,4,1,0.146900
+sql_subquery,SQL 执行,current,4,2,0.156400
+sql_subquery,SQL 执行,current,4,3,0.138900
+sql_subquery,SQL 执行,current,4,4,0.151500
+sql_subquery,SQL 执行,current,4,5,0.319600
+sql_subquery,SQL 执行,current,4,6,0.175800
+sql_subquery,SQL 执行,current,4,7,0.169100
+sql_subquery,SQL 执行,current,4,8,0.146700
+sql_subquery,SQL 执行,current,4,9,0.120500
+sql_subquery,SQL 执行,current,4,10,0.123900
+sql_subquery,SQL 执行,current,5,1,0.161100
+sql_subquery,SQL 执行,current,5,2,0.154500
+sql_subquery,SQL 执行,current,5,3,0.179000
+sql_subquery,SQL 执行,current,5,4,0.125700
+sql_subquery,SQL 执行,current,5,5,0.108000
+sql_subquery,SQL 执行,current,5,6,0.133600
+sql_subquery,SQL 执行,current,5,7,0.120000
+sql_subquery,SQL 执行,current,5,8,0.108900
+sql_subquery,SQL 执行,current,5,9,0.104500
+sql_subquery,SQL 执行,current,5,10,0.111700
+sql_window,SQL 执行,current,1,1,0.313000
+sql_window,SQL 执行,current,1,2,0.319300
+sql_window,SQL 执行,current,1,3,0.320300
+sql_window,SQL 执行,current,1,4,0.316100
+sql_window,SQL 执行,current,1,5,0.311900
+sql_window,SQL 执行,current,1,6,0.313700
+sql_window,SQL 执行,current,1,7,0.308000
+sql_window,SQL 执行,current,1,8,0.293900
+sql_window,SQL 执行,current,1,9,0.284100
+sql_window,SQL 执行,current,1,10,0.326000
+sql_window,SQL 执行,current,2,1,0.307200
+sql_window,SQL 执行,current,2,2,0.326900
+sql_window,SQL 执行,current,2,3,0.329300
+sql_window,SQL 执行,current,2,4,0.464300
+sql_window,SQL 执行,current,2,5,0.426400
+sql_window,SQL 执行,current,2,6,0.322000
+sql_window,SQL 执行,current,2,7,0.329900
+sql_window,SQL 执行,current,2,8,0.322600
+sql_window,SQL 执行,current,2,9,0.269400
+sql_window,SQL 执行,current,2,10,0.309800
+sql_window,SQL 执行,current,3,1,0.310000
+sql_window,SQL 执行,current,3,2,0.308100
+sql_window,SQL 执行,current,3,3,0.320700
+sql_window,SQL 执行,current,3,4,0.326000
+sql_window,SQL 执行,current,3,5,0.315500
+sql_window,SQL 执行,current,3,6,0.305400
+sql_window,SQL 执行,current,3,7,0.309800
+sql_window,SQL 执行,current,3,8,0.346500
+sql_window,SQL 执行,current,3,9,0.307300
+sql_window,SQL 执行,current,3,10,0.323500
+sql_window,SQL 执行,current,4,1,0.428800
+sql_window,SQL 执行,current,4,2,0.432200
+sql_window,SQL 执行,current,4,3,0.465500
+sql_window,SQL 执行,current,4,4,0.516200
+sql_window,SQL 执行,current,4,5,0.355300
+sql_window,SQL 执行,current,4,6,0.338600
+sql_window,SQL 执行,current,4,7,0.340000
+sql_window,SQL 执行,current,4,8,0.332700
+sql_window,SQL 执行,current,4,9,0.295500
+sql_window,SQL 执行,current,4,10,0.290200
+sql_window,SQL 执行,current,5,1,0.313700
+sql_window,SQL 执行,current,5,2,0.311500
+sql_window,SQL 执行,current,5,3,0.314700
+sql_window,SQL 执行,current,5,4,0.325600
+sql_window,SQL 执行,current,5,5,0.347000
+sql_window,SQL 执行,current,5,6,0.336300
+sql_window,SQL 执行,current,5,7,0.321800
+sql_window,SQL 执行,current,5,8,0.324500
+sql_window,SQL 执行,current,5,9,0.366100
+sql_window,SQL 执行,current,5,10,0.464300
+sql_join,SQL 执行,current,1,1,0.440200
+sql_join,SQL 执行,current,1,2,0.359400
+sql_join,SQL 执行,current,1,3,0.345900
+sql_join,SQL 执行,current,1,4,0.366300
+sql_join,SQL 执行,current,1,5,0.363800
+sql_join,SQL 执行,current,1,6,0.392300
+sql_join,SQL 执行,current,1,7,0.365000
+sql_join,SQL 执行,current,1,8,0.342400
+sql_join,SQL 执行,current,1,9,0.337000
+sql_join,SQL 执行,current,1,10,0.348500
+sql_join,SQL 执行,current,2,1,0.470100
+sql_join,SQL 执行,current,2,2,0.386300
+sql_join,SQL 执行,current,2,3,0.385100
+sql_join,SQL 执行,current,2,4,0.405300
+sql_join,SQL 执行,current,2,5,0.355300
+sql_join,SQL 执行,current,2,6,0.393500
+sql_join,SQL 执行,current,2,7,0.355600
+sql_join,SQL 执行,current,2,8,0.389800
+sql_join,SQL 执行,current,2,9,0.375400
+sql_join,SQL 执行,current,2,10,0.375700
+sql_join,SQL 执行,current,3,1,0.472600
+sql_join,SQL 执行,current,3,2,0.348000
+sql_join,SQL 执行,current,3,3,0.332500
+sql_join,SQL 执行,current,3,4,0.341200
+sql_join,SQL 执行,current,3,5,0.339600
+sql_join,SQL 执行,current,3,6,0.343700
+sql_join,SQL 执行,current,3,7,0.342200
+sql_join,SQL 执行,current,3,8,0.340600
+sql_join,SQL 执行,current,3,9,0.356200
+sql_join,SQL 执行,current,3,10,0.359000
+sql_join,SQL 执行,current,4,1,0.585800
+sql_join,SQL 执行,current,4,2,0.399000
+sql_join,SQL 执行,current,4,3,0.338100
+sql_join,SQL 执行,current,4,4,0.327600
+sql_join,SQL 执行,current,4,5,0.338900
+sql_join,SQL 执行,current,4,6,0.291300
+sql_join,SQL 执行,current,4,7,0.300500
+sql_join,SQL 执行,current,4,8,0.293000
+sql_join,SQL 执行,current,4,9,0.316300
+sql_join,SQL 执行,current,4,10,0.330900
+sql_join,SQL 执行,current,5,1,0.472900
+sql_join,SQL 执行,current,5,2,0.397600
+sql_join,SQL 执行,current,5,3,0.346900
+sql_join,SQL 执行,current,5,4,0.348100
+sql_join,SQL 执行,current,5,5,1.145900
+sql_join,SQL 执行,current,5,6,1.105700
+sql_join,SQL 执行,current,5,7,0.523500
+sql_join,SQL 执行,current,5,8,0.484100
+sql_join,SQL 执行,current,5,9,0.373800
+sql_join,SQL 执行,current,5,10,0.367700
+pstore_scan,存储引擎,current,1,1,1.008000
+pstore_scan,存储引擎,current,1,2,1.111800
+pstore_scan,存储引擎,current,1,3,1.013400
+pstore_scan,存储引擎,current,1,4,1.107700
+pstore_scan,存储引擎,current,1,5,0.962200
+pstore_scan,存储引擎,current,1,6,1.072500
+pstore_scan,存储引擎,current,1,7,0.986100
+pstore_scan,存储引擎,current,1,8,1.057700
+pstore_scan,存储引擎,current,1,9,0.973400
+pstore_scan,存储引擎,current,1,10,0.996100
+pstore_scan,存储引擎,current,2,1,0.992100
+pstore_scan,存储引擎,current,2,2,1.010200
+pstore_scan,存储引擎,current,2,3,1.083700
+pstore_scan,存储引擎,current,2,4,1.093400
+pstore_scan,存储引擎,current,2,5,1.091200
+pstore_scan,存储引擎,current,2,6,1.005200
+pstore_scan,存储引擎,current,2,7,1.030900
+pstore_scan,存储引擎,current,2,8,1.155700
+pstore_scan,存储引擎,current,2,9,1.013600
+pstore_scan,存储引擎,current,2,10,1.084800
+pstore_scan,存储引擎,current,3,1,1.038800
+pstore_scan,存储引擎,current,3,2,1.141000
+pstore_scan,存储引擎,current,3,3,1.186100
+pstore_scan,存储引擎,current,3,4,1.197800
+pstore_scan,存储引擎,current,3,5,1.017600
+pstore_scan,存储引擎,current,3,6,1.065400
+pstore_scan,存储引擎,current,3,7,1.041100
+pstore_scan,存储引擎,current,3,8,0.983400
+pstore_scan,存储引擎,current,3,9,1.020100
+pstore_scan,存储引擎,current,3,10,1.059800
+pstore_scan,存储引擎,current,4,1,1.217300
+pstore_scan,存储引擎,current,4,2,1.090400
+pstore_scan,存储引擎,current,4,3,1.107200
+pstore_scan,存储引擎,current,4,4,1.465700
+pstore_scan,存储引擎,current,4,5,1.148800
+pstore_scan,存储引擎,current,4,6,1.308000
+pstore_scan,存储引擎,current,4,7,1.052700
+pstore_scan,存储引擎,current,4,8,1.117500
+pstore_scan,存储引擎,current,4,9,1.272700
+pstore_scan,存储引擎,current,4,10,1.334700
+pstore_scan,存储引擎,current,5,1,1.058600
+pstore_scan,存储引擎,current,5,2,2.145300
+pstore_scan,存储引擎,current,5,3,1.025500
+pstore_scan,存储引擎,current,5,4,1.137900
+pstore_scan,存储引擎,current,5,5,1.026300
+pstore_scan,存储引擎,current,5,6,1.013100
+pstore_scan,存储引擎,current,5,7,1.039000
+pstore_scan,存储引擎,current,5,8,1.163700
+pstore_scan,存储引擎,current,5,9,1.061000
+pstore_scan,存储引擎,current,5,10,1.034400
+txn_put,存储引擎,current,1,1,220.980400
+txn_put,存储引擎,current,1,2,172.380900
+txn_put,存储引擎,current,1,3,206.495900
+txn_put,存储引擎,current,1,4,170.053900
+txn_put,存储引擎,current,1,5,206.241700
+txn_put,存储引擎,current,1,6,170.231000
+txn_put,存储引擎,current,1,7,204.267000
+txn_put,存储引擎,current,1,8,171.201500
+txn_put,存储引擎,current,1,9,211.638500
+txn_put,存储引擎,current,1,10,234.558000
+txn_put,存储引擎,current,2,1,195.796100
+txn_put,存储引擎,current,2,2,187.089600
+txn_put,存储引擎,current,2,3,187.137600
+txn_put,存储引擎,current,2,4,184.923800
+txn_put,存储引擎,current,2,5,201.623200
+txn_put,存储引擎,current,2,6,226.563400
+txn_put,存储引擎,current,2,7,162.699800
+txn_put,存储引擎,current,2,8,203.667600
+txn_put,存储引擎,current,2,9,176.519500
+txn_put,存储引擎,current,2,10,210.370700
+txn_put,存储引擎,current,3,1,219.265500
+txn_put,存储引擎,current,3,2,181.788600
+txn_put,存储引擎,current,3,3,227.011000
+txn_put,存储引擎,current,3,4,199.399900
+txn_put,存储引擎,current,3,5,190.514600
+txn_put,存储引擎,current,3,6,198.606600
+txn_put,存储引擎,current,3,7,186.306100
+txn_put,存储引擎,current,3,8,204.966400
+txn_put,存储引擎,current,3,9,170.217000
+txn_put,存储引擎,current,3,10,223.260200
+txn_put,存储引擎,current,4,1,207.484800
+txn_put,存储引擎,current,4,2,168.646600
+txn_put,存储引擎,current,4,3,215.055400
+txn_put,存储引擎,current,4,4,190.425700
+txn_put,存储引擎,current,4,5,168.566900
+txn_put,存储引擎,current,4,6,198.778300
+txn_put,存储引擎,current,4,7,164.469300
+txn_put,存储引擎,current,4,8,243.012400
+txn_put,存储引擎,current,4,9,168.169000
+txn_put,存储引擎,current,4,10,206.100800
+txn_put,存储引擎,current,5,1,179.698300
+txn_put,存储引擎,current,5,2,185.307800
+txn_put,存储引擎,current,5,3,196.850300
+txn_put,存储引擎,current,5,4,186.497100
+txn_put,存储引擎,current,5,5,183.812600
+txn_put,存储引擎,current,5,6,188.179300
+txn_put,存储引擎,current,5,7,179.471100
+txn_put,存储引擎,current,5,8,208.931100
+txn_put,存储引擎,current,5,9,174.316200
+txn_put,存储引擎,current,5,10,221.921100
+pgwire_roundtrip,协议接口,current,1,1,0.121547
+pgwire_roundtrip,协议接口,current,1,2,0.108591
+pgwire_roundtrip,协议接口,current,1,3,0.113425
+pgwire_roundtrip,协议接口,current,1,4,0.108528
+pgwire_roundtrip,协议接口,current,1,5,0.114275
+pgwire_roundtrip,协议接口,current,1,6,0.106597
+pgwire_roundtrip,协议接口,current,1,7,0.120963
+pgwire_roundtrip,协议接口,current,1,8,0.112069
+pgwire_roundtrip,协议接口,current,1,9,0.105875
+pgwire_roundtrip,协议接口,current,1,10,0.113981
+pgwire_roundtrip,协议接口,current,2,1,0.108959
+pgwire_roundtrip,协议接口,current,2,2,0.110887
+pgwire_roundtrip,协议接口,current,2,3,0.121737
+pgwire_roundtrip,协议接口,current,2,4,0.120009
+pgwire_roundtrip,协议接口,current,2,5,0.106934
+pgwire_roundtrip,协议接口,current,2,6,0.116947
+pgwire_roundtrip,协议接口,current,2,7,0.128628
+pgwire_roundtrip,协议接口,current,2,8,0.118509
+pgwire_roundtrip,协议接口,current,2,9,0.109009
+pgwire_roundtrip,协议接口,current,2,10,0.109066
+pgwire_roundtrip,协议接口,current,3,1,0.120228
+pgwire_roundtrip,协议接口,current,3,2,0.147728
+pgwire_roundtrip,协议接口,current,3,3,0.232428
+pgwire_roundtrip,协议接口,current,3,4,0.157363
+pgwire_roundtrip,协议接口,current,3,5,0.125153
+pgwire_roundtrip,协议接口,current,3,6,0.202972
+pgwire_roundtrip,协议接口,current,3,7,0.184269
+pgwire_roundtrip,协议接口,current,3,8,0.119766
+pgwire_roundtrip,协议接口,current,3,9,0.146441
+pgwire_roundtrip,协议接口,current,3,10,0.161200
+pgwire_roundtrip,协议接口,current,4,1,0.177166
+pgwire_roundtrip,协议接口,current,4,2,0.144291
+pgwire_roundtrip,协议接口,current,4,3,0.151947
+pgwire_roundtrip,协议接口,current,4,4,0.119216
+pgwire_roundtrip,协议接口,current,4,5,0.123247
+pgwire_roundtrip,协议接口,current,4,6,0.108434
+pgwire_roundtrip,协议接口,current,4,7,0.105612
+pgwire_roundtrip,协议接口,current,4,8,0.124450
+pgwire_roundtrip,协议接口,current,4,9,0.129781
+pgwire_roundtrip,协议接口,current,4,10,0.122813
+pgwire_roundtrip,协议接口,current,5,1,0.115369
+pgwire_roundtrip,协议接口,current,5,2,0.115375
+pgwire_roundtrip,协议接口,current,5,3,0.129941
+pgwire_roundtrip,协议接口,current,5,4,0.118844
+pgwire_roundtrip,协议接口,current,5,5,0.116834
+pgwire_roundtrip,协议接口,current,5,6,0.112388
+pgwire_roundtrip,协议接口,current,5,7,0.112678
+pgwire_roundtrip,协议接口,current,5,8,0.119409
+pgwire_roundtrip,协议接口,current,5,9,0.113862
+pgwire_roundtrip,协议接口,current,5,10,0.112456
+ann_knn,索引与图,current,1,1,0.048000
+ann_knn,索引与图,current,1,2,0.044900
+ann_knn,索引与图,current,1,3,0.044300
+ann_knn,索引与图,current,1,4,0.041700
+ann_knn,索引与图,current,1,5,0.201000
+ann_knn,索引与图,current,1,6,0.066000
+ann_knn,索引与图,current,1,7,0.052400
+ann_knn,索引与图,current,1,8,0.051500
+ann_knn,索引与图,current,1,9,0.045600
+ann_knn,索引与图,current,1,10,0.043500
+ann_knn,索引与图,current,2,1,0.050100
+ann_knn,索引与图,current,2,2,0.046400
+ann_knn,索引与图,current,2,3,0.044300
+ann_knn,索引与图,current,2,4,0.042100
+ann_knn,索引与图,current,2,5,0.040700
+ann_knn,索引与图,current,2,6,0.040400
+ann_knn,索引与图,current,2,7,0.040400
+ann_knn,索引与图,current,2,8,0.040500
+ann_knn,索引与图,current,2,9,0.040200
+ann_knn,索引与图,current,2,10,0.039500
+ann_knn,索引与图,current,3,1,0.056400
+ann_knn,索引与图,current,3,2,0.051500
+ann_knn,索引与图,current,3,3,0.052500
+ann_knn,索引与图,current,3,4,0.056300
+ann_knn,索引与图,current,3,5,0.055500
+ann_knn,索引与图,current,3,6,0.048600
+ann_knn,索引与图,current,3,7,0.047800
+ann_knn,索引与图,current,3,8,0.045900
+ann_knn,索引与图,current,3,9,0.052400
+ann_knn,索引与图,current,3,10,0.046600
+ann_knn,索引与图,current,4,1,0.055600
+ann_knn,索引与图,current,4,2,0.052900
+ann_knn,索引与图,current,4,3,0.056400
+ann_knn,索引与图,current,4,4,0.053800
+ann_knn,索引与图,current,4,5,0.049700
+ann_knn,索引与图,current,4,6,0.050500
+ann_knn,索引与图,current,4,7,0.052100
+ann_knn,索引与图,current,4,8,0.052900
+ann_knn,索引与图,current,4,9,0.053500
+ann_knn,索引与图,current,4,10,0.050100
+ann_knn,索引与图,current,5,1,0.056300
+ann_knn,索引与图,current,5,2,0.060800
+ann_knn,索引与图,current,5,3,0.049300
+ann_knn,索引与图,current,5,4,0.050400
+ann_knn,索引与图,current,5,5,0.053400
+ann_knn,索引与图,current,5,6,0.052800
+ann_knn,索引与图,current,5,7,0.053500
+ann_knn,索引与图,current,5,8,0.058000
+ann_knn,索引与图,current,5,9,0.051000
+ann_knn,索引与图,current,5,10,0.052800
+graph_reach,索引与图,current,1,1,0.000600
+graph_reach,索引与图,current,1,2,0.000700
+graph_reach,索引与图,current,2,1,0.000500
+graph_reach,索引与图,current,2,2,0.000500
+graph_reach,索引与图,current,3,1,0.000400
+graph_reach,索引与图,current,3,2,0.000600
+graph_reach,索引与图,current,4,1,0.000600
+graph_reach,索引与图,current,4,2,0.000400
+graph_reach,索引与图,current,5,1,0.000500
+graph_reach,索引与图,current,5,2,0.000500
