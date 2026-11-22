@@ -3,66 +3,66 @@
 <rect x="0" y="0" width="1080" height="650" fill="#ffffff"/>
 <rect x="0.5" y="0.5" width="1079" height="649" fill="none" stroke="#d0d7de"/>
 <text class="t" x="14" y="30">trit-db benchmark — median latency vs baseline (write path A/B)</text>
-<text class="s" x="14" y="50">windows-x86_64 · baseline 2026-11-21 (3e90ba0) → latest 2026-11-22 (6ea161d) · median of 5 runs</text>
-<text class="s" x="14" y="70">15 cases · 4 faster · 10 flat · 0 slower · 1 below 0.01 ms — lower is better</text>
+<text class="s" x="14" y="50">windows-x86_64 · baseline 2026-11-21 (3e90ba0) → latest 2026-11-22 (1865f65) · median of 5 runs</text>
+<text class="s" x="14" y="70">15 cases · 4 faster · 7 flat · 3 slower · 1 below 0.01 ms — lower is better</text>
 <rect x="14" y="83" width="10" height="10" fill="#2da44e"/>
 <text class="g" x="30" y="92">faster</text>
 <rect x="88" y="83" width="10" height="10" fill="#8b949e"/>
 <text class="g" x="104" y="92">flat (±5%)</text>
 <rect x="200" y="83" width="10" height="10" fill="#cf222e"/>
 <text class="g" x="216" y="92">slower</text>
-<line x1="252.4" y1="110" x2="252.4" y2="596" stroke="#eaeef2" stroke-width="1"/>
-<text class="g" x="252.4" y="612" text-anchor="middle">-60%</text>
-<line x1="421.8" y1="110" x2="421.8" y2="596" stroke="#eaeef2" stroke-width="1"/>
-<text class="g" x="421.8" y="612" text-anchor="middle">-40%</text>
-<line x1="591.2" y1="110" x2="591.2" y2="596" stroke="#eaeef2" stroke-width="1"/>
-<text class="g" x="591.2" y="612" text-anchor="middle">-20%</text>
-<line x1="760.6" y1="110" x2="760.6" y2="596" stroke="#eaeef2" stroke-width="1"/>
-<text class="g" x="760.6" y="612" text-anchor="middle">0%</text>
-<line x1="930.0" y1="110" x2="930.0" y2="596" stroke="#eaeef2" stroke-width="1"/>
-<text class="g" x="930.0" y="612" text-anchor="middle">+20%</text>
-<line x1="760.6" y1="110" x2="760.6" y2="596" stroke="#8b949e" stroke-width="1.5"/>
+<line x1="246.0" y1="110" x2="246.0" y2="596" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="246.0" y="612" text-anchor="middle">-60%</text>
+<line x1="390.0" y1="110" x2="390.0" y2="596" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="390.0" y="612" text-anchor="middle">-40%</text>
+<line x1="534.0" y1="110" x2="534.0" y2="596" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="534.0" y="612" text-anchor="middle">-20%</text>
+<line x1="678.0" y1="110" x2="678.0" y2="596" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="678.0" y="612" text-anchor="middle">0%</text>
+<line x1="822.0" y1="110" x2="822.0" y2="596" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="822.0" y="612" text-anchor="middle">+20%</text>
+<line x1="678.0" y1="110" x2="678.0" y2="596" stroke="#8b949e" stroke-width="1.5"/>
 <text class="v" x="14" y="132">sql_subquery</text>
-<rect x="316.0" y="120" width="444.6" height="22" fill="#2da44e" rx="2"/>
-<text class="v" x="310.0" y="135" text-anchor="end">-52.5%</text>
-<text class="v" x="14" y="166">sql_scan</text>
-<rect x="640.9" y="154" width="119.7" height="22" fill="#2da44e" rx="2"/>
-<text class="v" x="634.9" y="169" text-anchor="end">-14.1%</text>
-<text class="v" x="14" y="200">sql_group</text>
-<rect x="693.9" y="188" width="66.7" height="22" fill="#2da44e" rx="2"/>
-<text class="v" x="687.9" y="203" text-anchor="end">-7.9%</text>
+<rect x="266.6" y="120" width="411.4" height="22" fill="#2da44e" rx="2"/>
+<text class="v" x="260.6" y="135" text-anchor="end">-57.1%</text>
+<text class="v" x="14" y="166">sql_join</text>
+<rect x="562.7" y="154" width="115.3" height="22" fill="#2da44e" rx="2"/>
+<text class="v" x="556.7" y="169" text-anchor="end">-16.0%</text>
+<text class="v" x="14" y="200">pgwire_roundtrip</text>
+<rect x="592.3" y="188" width="85.7" height="22" fill="#2da44e" rx="2"/>
+<text class="v" x="586.3" y="203" text-anchor="end">-11.9%</text>
 <text class="v" x="14" y="234">pstore_scan</text>
-<rect x="707.6" y="222" width="53.0" height="22" fill="#2da44e" rx="2"/>
-<text class="v" x="701.6" y="237" text-anchor="end">-6.3%</text>
-<text class="v" x="14" y="268">sql_join</text>
-<rect x="742.9" y="256" width="17.7" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="736.9" y="271" text-anchor="end">-2.1%</text>
-<text class="v" x="14" y="302">ann_knn</text>
-<rect x="743.3" y="290" width="17.3" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="737.3" y="305" text-anchor="end">-2.0%</text>
-<text class="v" x="14" y="336">txn_put</text>
-<rect x="744.8" y="324" width="15.8" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="738.8" y="339" text-anchor="end">-1.9%</text>
+<rect x="624.7" y="222" width="53.3" height="22" fill="#2da44e" rx="2"/>
+<text class="v" x="618.7" y="237" text-anchor="end">-7.4%</text>
+<text class="v" x="14" y="268">txn_put</text>
+<rect x="659.7" y="256" width="18.3" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="653.7" y="271" text-anchor="end">-2.5%</text>
+<text class="v" x="14" y="302">sql_point</text>
+<rect x="663.7" y="290" width="14.3" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="657.7" y="305" text-anchor="end">-2.0%</text>
+<text class="v" x="14" y="336">sql_insert</text>
+<rect x="665.1" y="324" width="12.9" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="659.1" y="339" text-anchor="end">-1.8%</text>
 <text class="v" x="14" y="370">sql_sort</text>
-<rect x="745.6" y="358" width="15.0" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="739.6" y="373" text-anchor="end">-1.8%</text>
-<text class="v" x="14" y="404">pgwire_roundtrip</text>
-<rect x="760.6" y="392" width="2.0" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="766.6" y="407" text-anchor="start">0.0%</text>
+<rect x="678.0" y="358" width="6.4" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="690.4" y="373" text-anchor="start">+0.9%</text>
+<text class="v" x="14" y="404">sql_group</text>
+<rect x="678.0" y="392" width="8.7" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="692.7" y="407" text-anchor="start">+1.2%</text>
 <text class="v" x="14" y="438">sql_delete</text>
-<rect x="760.6" y="426" width="6.9" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="773.5" y="441" text-anchor="start">+0.8%</text>
+<rect x="678.0" y="426" width="8.8" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="692.8" y="441" text-anchor="start">+1.2%</text>
 <text class="v" x="14" y="472">sql_update</text>
-<rect x="760.6" y="460" width="6.9" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="773.5" y="475" text-anchor="start">+0.8%</text>
-<text class="v" x="14" y="506">sql_window</text>
-<rect x="760.6" y="494" width="20.4" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="787.0" y="509" text-anchor="start">+2.4%</text>
-<text class="v" x="14" y="540">sql_insert</text>
-<rect x="760.6" y="528" width="21.4" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="788.0" y="543" text-anchor="start">+2.5%</text>
-<text class="v" x="14" y="574">sql_point</text>
-<rect x="760.6" y="562" width="25.2" height="22" fill="#8b949e" rx="2"/>
-<text class="v" x="791.7" y="577" text-anchor="start">+3.0%</text>
+<rect x="678.0" y="460" width="19.2" height="22" fill="#8b949e" rx="2"/>
+<text class="v" x="703.2" y="475" text-anchor="start">+2.7%</text>
+<text class="v" x="14" y="506">ann_knn</text>
+<rect x="678.0" y="494" width="44.1" height="22" fill="#cf222e" rx="2"/>
+<text class="v" x="728.1" y="509" text-anchor="start">+6.1%</text>
+<text class="v" x="14" y="540">sql_window</text>
+<rect x="678.0" y="528" width="84.1" height="22" fill="#cf222e" rx="2"/>
+<text class="v" x="768.1" y="543" text-anchor="start">+11.7%</text>
+<text class="v" x="14" y="574">sql_scan</text>
+<rect x="678.0" y="562" width="156.5" height="22" fill="#cf222e" rx="2"/>
+<text class="v" x="840.5" y="577" text-anchor="start">+21.7%</text>
 <text class="g" x="14" y="634">Generated by tools/bench/dashboard.py · docs/results/BENCH-DASHBOARD.md · write path = A/B</text>
 </svg>

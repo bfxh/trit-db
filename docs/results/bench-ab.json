@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "generated_at": "2026-11-22T09:51:43+08:00",
+  "generated_at": "2026-11-22T14:12:08+08:00",
   "platform": "windows-x86_64",
   "baseline_commit": "3e90ba0",
-  "current_commit": "6ea161d",
+  "current_commit": "1865f65",
   "method": "同一时间窗内基线/当前二进制交替运行；每对先跑基线再跑当前，下一对交换顺序；取每侧 median-of-medians",
   "pairs": 20,
   "cases": [
@@ -20,12 +20,12 @@
         "--rounds",
         "5"
       ],
-      "baseline_ms": 192.5495,
-      "current_ms": 188.9745,
-      "delta_pct": -1.86,
+      "baseline_ms": 212.964,
+      "current_ms": 207.565,
+      "delta_pct": -2.54,
       "status": "持平",
-      "current_faster": 12,
-      "baseline_faster": 8,
+      "current_faster": 11,
+      "baseline_faster": 9,
       "ties": 0
     },
     {
@@ -41,12 +41,12 @@
         "--rounds",
         "20"
       ],
-      "baseline_ms": 2.5595,
-      "current_ms": 2.5805,
-      "delta_pct": 0.82,
+      "baseline_ms": 2.5255,
+      "current_ms": 2.593,
+      "delta_pct": 2.67,
       "status": "持平",
-      "current_faster": 11,
-      "baseline_faster": 9,
+      "current_faster": 8,
+      "baseline_faster": 12,
       "ties": 0
     },
     {
@@ -62,12 +62,12 @@
         "--rounds",
         "20"
       ],
-      "baseline_ms": 2.631,
-      "current_ms": 2.6525,
-      "delta_pct": 0.82,
+      "baseline_ms": 2.542,
+      "current_ms": 2.573,
+      "delta_pct": 1.22,
       "status": "持平",
-      "current_faster": 7,
-      "baseline_faster": 13,
+      "current_faster": 10,
+      "baseline_faster": 10,
       "ties": 0
     },
     {
@@ -81,9 +81,9 @@
         "--rounds",
         "20"
       ],
-      "baseline_ms": 2.71,
-      "current_ms": 2.7785,
-      "delta_pct": 2.53,
+      "baseline_ms": 2.8245,
+      "current_ms": 2.774,
+      "delta_pct": -1.79,
       "status": "持平",
       "current_faster": 10,
       "baseline_faster": 10,

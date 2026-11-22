@@ -1,1 +1,130 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="120" viewBox="0 0 1080 120" role="img" aria-label="no benchmark samples"><rect x="0" y="0" width="1080" height="120" fill="#ffffff"/><text x="14" y="34" font-family="monospace" font-size="13" fill="#1f2328">trit-db benchmark — distribution</text><text x="14" y="58" font-family="monospace" font-size="11" fill="#57606a">no raw samples yet</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="698" viewBox="0 0 1080 698" role="img" aria-label="trit-db per-round latency distribution">
+<style>text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;}.t{fill:#1f2328;font-size:13px}.s{fill:#57606a;font-size:11px}.v{fill:#1f2328;font-size:12px}.g{fill:#8b949e;font-size:10px}</style>
+<rect x="0" y="0" width="1080" height="698" fill="#ffffff"/>
+<rect x="0.5" y="0.5" width="1079" height="697" fill="none" stroke="#d0d7de"/>
+<text class="t" x="14" y="30">trit-db benchmark — per-round latency distribution</text>
+<text class="s" x="14" y="50">baseline 3e90ba0 · 15 cases · log scale · box = p25–p75, line = median, dot = p90</text>
+<text class="s" x="14" y="70">lower is better · samples are every round of the newest run batch</text>
+<line x1="235.0" y1="96" x2="235.0" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="235.0" y="664" text-anchor="middle">0.0001</text>
+<line x1="344.3" y1="96" x2="344.3" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="344.3" y="664" text-anchor="middle">0.0010</text>
+<line x1="453.6" y1="96" x2="453.6" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="453.6" y="664" text-anchor="middle">0.0100</text>
+<line x1="562.9" y1="96" x2="562.9" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="562.9" y="664" text-anchor="middle">0.1000</text>
+<line x1="672.1" y1="96" x2="672.1" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="672.1" y="664" text-anchor="middle">1.000</text>
+<line x1="781.4" y1="96" x2="781.4" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="781.4" y="664" text-anchor="middle">10.000</text>
+<line x1="890.7" y1="96" x2="890.7" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="890.7" y="664" text-anchor="middle">100.0</text>
+<line x1="1000.0" y1="96" x2="1000.0" y2="648" stroke="#eaeef2" stroke-width="1"/>
+<text class="g" x="1000.0" y="664" text-anchor="middle">1000.0</text>
+<text class="v" x="14" y="119">sql_subquery</text>
+<text class="g" x="14" y="133">SQL 执行 · n=50</text>
+<line x1="564.8" y1="121" x2="618.0" y2="121" stroke="#8b949e" stroke-width="1"/>
+<rect x="575.0" y="111" width="9.3" height="20" fill="#2da44e" fill-opacity="0.35" stroke="#2da44e" stroke-width="1"/>
+<line x1="579.9" y1="111" x2="579.9" y2="131" stroke="#2da44e" stroke-width="2"/>
+<circle cx="588.0" cy="121" r="3" fill="#2da44e"/>
+<text class="g" x="624.0" y="119">0.1433</text>
+<text class="v" x="14" y="155">sql_update</text>
+<text class="g" x="14" y="169">SQL 执行 · n=50</text>
+<line x1="669.9" y1="157" x2="777.1" y2="157" stroke="#8b949e" stroke-width="1"/>
+<rect x="705.9" y="147" width="20.4" height="20" fill="#2da44e" fill-opacity="0.35" stroke="#2da44e" stroke-width="1"/>
+<line x1="714.9" y1="147" x2="714.9" y2="167" stroke="#2da44e" stroke-width="2"/>
+<circle cx="737.7" cy="157" r="3" fill="#2da44e"/>
+<text class="g" x="783.1" y="155">2.461</text>
+<text class="v" x="14" y="191">sql_delete</text>
+<text class="g" x="14" y="205">SQL 执行 · n=50</text>
+<line x1="663.0" y1="193" x2="752.0" y2="193" stroke="#8b949e" stroke-width="1"/>
+<rect x="704.4" y="183" width="15.4" height="20" fill="#2da44e" fill-opacity="0.35" stroke="#2da44e" stroke-width="1"/>
+<line x1="714.4" y1="183" x2="714.4" y2="203" stroke="#2da44e" stroke-width="2"/>
+<circle cx="741.4" cy="193" r="3" fill="#2da44e"/>
+<text class="g" x="758.0" y="191">2.438</text>
+<text class="v" x="14" y="227">sql_join</text>
+<text class="g" x="14" y="241">SQL 执行 · n=50</text>
+<line x1="613.6" y1="229" x2="678.6" y2="229" stroke="#8b949e" stroke-width="1"/>
+<rect x="621.1" y="219" width="6.7" height="20" fill="#2da44e" fill-opacity="0.35" stroke="#2da44e" stroke-width="1"/>
+<line x1="623.5" y1="219" x2="623.5" y2="239" stroke="#2da44e" stroke-width="2"/>
+<circle cx="636.7" cy="229" r="3" fill="#2da44e"/>
+<text class="g" x="684.6" y="227">0.3592</text>
+<text class="v" x="14" y="263">sql_insert</text>
+<text class="g" x="14" y="277">SQL 执行 · n=50</text>
+<line x1="664.5" y1="265" x2="775.0" y2="265" stroke="#8b949e" stroke-width="1"/>
+<rect x="709.4" y="255" width="25.0" height="20" fill="#8b949e" fill-opacity="0.35" stroke="#8b949e" stroke-width="1"/>
+<line x1="716.0" y1="255" x2="716.0" y2="275" stroke="#8b949e" stroke-width="2"/>
+<circle cx="746.2" cy="265" r="3" fill="#8b949e"/>
+<text class="g" x="781.0" y="263">2.517</text>
+<text class="v" x="14" y="299">sql_point</text>
+<text class="g" x="14" y="313">SQL 执行 · n=320</text>
+<line x1="536.1" y1="301" x2="602.9" y2="301" stroke="#8b949e" stroke-width="1"/>
+<rect x="555.3" y="291" width="10.1" height="20" fill="#8b949e" fill-opacity="0.35" stroke="#8b949e" stroke-width="1"/>
+<line x1="562.7" y1="291" x2="562.7" y2="311" stroke="#8b949e" stroke-width="2"/>
+<circle cx="567.5" cy="301" r="3" fill="#8b949e"/>
+<text class="g" x="608.9" y="299">0.0996</text>
+<text class="v" x="14" y="335">sql_sort</text>
+<text class="g" x="14" y="349">SQL 执行 · n=50</text>
+<line x1="590.9" y1="337" x2="616.6" y2="337" stroke="#8b949e" stroke-width="1"/>
+<rect x="599.9" y="327" width="4.8" height="20" fill="#8b949e" fill-opacity="0.35" stroke="#8b949e" stroke-width="1"/>
+<line x1="601.8" y1="327" x2="601.8" y2="347" stroke="#8b949e" stroke-width="2"/>
+<circle cx="607.7" cy="337" r="3" fill="#8b949e"/>
+<text class="g" x="622.6" y="335">0.2271</text>
+<text class="v" x="14" y="371">sql_group</text>
+<text class="g" x="14" y="385">SQL 执行 · n=50</text>
+<line x1="581.0" y1="373" x2="594.1" y2="373" stroke="#8b949e" stroke-width="1"/>
+<rect x="585.5" y="363" width="5.0" height="20" fill="#8b949e" fill-opacity="0.35" stroke="#8b949e" stroke-width="1"/>
+<line x1="587.7" y1="363" x2="587.7" y2="383" stroke="#8b949e" stroke-width="2"/>
+<circle cx="592.8" cy="373" r="3" fill="#8b949e"/>
+<text class="g" x="600.1" y="371">0.1689</text>
+<text class="v" x="14" y="407">sql_window</text>
+<text class="g" x="14" y="421">SQL 执行 · n=50</text>
+<line x1="609.9" y1="409" x2="640.8" y2="409" stroke="#8b949e" stroke-width="1"/>
+<rect x="616.6" y="399" width="4.1" height="20" fill="#cf222e" fill-opacity="0.35" stroke="#cf222e" stroke-width="1"/>
+<line x1="618.3" y1="399" x2="618.3" y2="419" stroke="#cf222e" stroke-width="2"/>
+<circle cx="632.0" cy="409" r="3" fill="#cf222e"/>
+<text class="g" x="646.8" y="407">0.3219</text>
+<text class="v" x="14" y="443">sql_scan</text>
+<text class="g" x="14" y="457">SQL 执行 · n=50</text>
+<line x1="559.9" y1="445" x2="607.5" y2="445" stroke="#8b949e" stroke-width="1"/>
+<rect x="566.0" y="435" width="4.0" height="20" fill="#cf222e" fill-opacity="0.35" stroke="#cf222e" stroke-width="1"/>
+<line x1="567.6" y1="435" x2="567.6" y2="455" stroke="#cf222e" stroke-width="2"/>
+<circle cx="572.9" cy="445" r="3" fill="#cf222e"/>
+<text class="g" x="613.5" y="443">0.1106</text>
+<text class="v" x="14" y="479">pstore_scan</text>
+<text class="g" x="14" y="493">存储引擎 · n=50</text>
+<line x1="670.3" y1="481" x2="708.4" y2="481" stroke="#8b949e" stroke-width="1"/>
+<rect x="673.0" y="471" width="5.1" height="20" fill="#2da44e" fill-opacity="0.35" stroke="#2da44e" stroke-width="1"/>
+<line x1="674.9" y1="471" x2="674.9" y2="491" stroke="#2da44e" stroke-width="2"/>
+<circle cx="681.7" cy="481" r="3" fill="#2da44e"/>
+<text class="g" x="714.4" y="479">1.060</text>
+<text class="v" x="14" y="515">txn_put</text>
+<text class="g" x="14" y="529">存储引擎 · n=50</text>
+<line x1="913.8" y1="517" x2="932.9" y2="517" stroke="#8b949e" stroke-width="1"/>
+<rect x="918.5" y="507" width="6.8" height="20" fill="#8b949e" fill-opacity="0.35" stroke="#8b949e" stroke-width="1"/>
+<line x1="922.0" y1="507" x2="922.0" y2="527" stroke="#8b949e" stroke-width="2"/>
+<circle cx="928.6" cy="517" r="3" fill="#8b949e"/>
+<text class="g" x="938.9" y="515">193.2</text>
+<text class="v" x="14" y="551">pgwire_roundtrip</text>
+<text class="g" x="14" y="565">协议接口 · n=50</text>
+<line x1="565.4" y1="553" x2="602.9" y2="553" stroke="#8b949e" stroke-width="1"/>
+<rect x="568.4" y="543" width="6.1" height="20" fill="#2da44e" fill-opacity="0.35" stroke="#2da44e" stroke-width="1"/>
+<line x1="571.1" y1="543" x2="571.1" y2="563" stroke="#2da44e" stroke-width="2"/>
+<circle cx="584.5" cy="553" r="3" fill="#2da44e"/>
+<text class="g" x="608.9" y="551">0.1190</text>
+<text class="v" x="14" y="587">graph_reach</text>
+<text class="g" x="14" y="601">索引与图 · n=10</text>
+<line x1="300.8" y1="589" x2="327.4" y2="589" stroke="#8b949e" stroke-width="1"/>
+<rect x="311.4" y="579" width="8.7" height="20" fill="#8b949e" fill-opacity="0.35" stroke="#8b949e" stroke-width="1"/>
+<line x1="311.4" y1="579" x2="311.4" y2="599" stroke="#8b949e" stroke-width="2"/>
+<circle cx="320.8" cy="589" r="3" fill="#8b949e"/>
+<text class="g" x="333.4" y="587">0.0005</text>
+<text class="v" x="14" y="623">ann_knn</text>
+<text class="g" x="14" y="637">索引与图 · n=50</text>
+<line x1="518.8" y1="625" x2="596.0" y2="625" stroke="#8b949e" stroke-width="1"/>
+<rect x="525.7" y="615" width="7.5" height="20" fill="#cf222e" fill-opacity="0.35" stroke="#cf222e" stroke-width="1"/>
+<line x1="530.7" y1="615" x2="530.7" y2="635" stroke="#cf222e" stroke-width="2"/>
+<circle cx="535.7" cy="625" r="3" fill="#cf222e"/>
+<text class="g" x="602.0" y="623">0.0508</text>
+<text class="g" x="14" y="686">Generated by tools/bench/dashboard.py · samples from tritdb-bench record</text>
+</svg>
