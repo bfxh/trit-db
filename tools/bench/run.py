@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="docs/results/bench-runs")
     parser.add_argument("--label", default="", help="optional filename suffix, e.g. ci or local")
     parser.add_argument("--repeat", type=int, default=1, help="record the suite N times (default 1)")
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=0,
+        help="override --rounds for cases that support it (0 keeps suite defaults)",
+    )
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
     return parser.parse_args()
@@ -49,28 +55,27 @@ def git(*args: str) -> str:
     return completed.stdout.strip()
 
 
-def run_record(out_dir: Path) -> Path:
+def run_record(out_dir: Path, rounds: int = 0) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     temp = out_dir / ".tmp-bench-run.json"
     if temp.exists():
         temp.unlink()
     print("running cargo record ...", flush=True)
-    completed = subprocess.run(
-        [
-            "cargo",
-            "run",
-            "--quiet",
-            "--release",
-            "-p",
-            "tritdb-bench",
-            "--",
-            "record",
-            "--out",
-            str(temp),
-        ],
-        cwd=ROOT,
-        check=False,
-    )
+    command = [
+        "cargo",
+        "run",
+        "--quiet",
+        "--release",
+        "-p",
+        "tritdb-bench",
+        "--",
+        "record",
+        "--out",
+        str(temp),
+    ]
+    if rounds > 0:
+        command.extend(["--rounds", str(rounds)])
+    completed = subprocess.run(command, cwd=ROOT, check=False)
     if completed.returncode != 0:
         raise SystemExit(f"cargo record failed with exit code {completed.returncode}")
     if not temp.exists():
@@ -120,7 +125,7 @@ def main() -> int:
     for index in range(max(1, args.repeat)):
         if args.repeat > 1:
             print(f"--- repeat {index + 1}/{args.repeat} ---", flush=True)
-        temp = run_record(out_dir)
+        temp = run_record(out_dir, args.rounds)
         data = json.loads(temp.read_text(encoding="utf-8"))
         data = stamp_metadata(data, args.label)
         path = target_path(out_dir, data)

@@ -30,6 +30,9 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
@@ -143,7 +146,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # The committed baseline was recorded on windows-x86_64; shared runners
       # are noisy, so CI only gates order-of-magnitude regressions (>3x).
-      - run: cargo run --locked --release -p tritdb-bench -- check --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05
+      - run: cargo run --locked --release -p tritdb-bench -- check --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05 --rounds 10 --retries 2
 
   python-crosscheck:
     name: python crosscheck (${{ matrix.os }})

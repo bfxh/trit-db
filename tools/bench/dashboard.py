@@ -693,6 +693,12 @@ def noise_grade(ratio: float) -> str:
     return "剧烈"
 
 
+def ranges_overlap(left: list[float], right: list[float]) -> bool:
+    if not left or not right:
+        return False
+    return max(min(left), min(right)) <= min(max(left), max(right))
+
+
 def method_table(
     rows: list[dict], count: dict[str, int], single: dict | None, ab: dict | None = None
 ) -> str:
@@ -858,6 +864,7 @@ def combined_table(rows: list[dict], single: dict | None) -> str:
             latest_values = case_values(single["latest_runs"], row["bench_id"])
             range_cell = f"{value_range(base_values)} / {value_range(latest_values)}"
             noise = noise_grade(max(volatility_ratio(base_values), volatility_ratio(latest_values)))
+            noise += " / 区间重叠" if ranges_overlap(base_values, latest_values) else " / 区间分离"
         data.append(
             [
                 row["layer"],
@@ -881,7 +888,7 @@ def combined_table(rows: list[dict], single: dict | None) -> str:
             "单次 Δ%",
             "对照",
             "5 次区间（基线 / 当前）",
-            "噪声",
+            "噪声 / 区间",
         ],
         data,
     )
@@ -924,7 +931,7 @@ def suggestion_table(
         data.append(
             [
                 "P0",
-                "微基准加轮次：insert / update / delete `--rounds` 2 → 20；txn-put 3 → 5",
+                "微基准加轮次：update / delete / txn-put 提到 10 轮；insert 保持 2 轮（每轮累积行）",
                 "`sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5%",
             ]
         )
@@ -1051,10 +1058,16 @@ def build_markdown(
     parts.append("")
     parts.append("```bash")
     parts.append("python tools/bench/run.py --repeat 5   # 跑 5 轮并写 docs/results/bench-runs/")
+    parts.append(
+        "python tools/bench/run.py --repeat 5 --rounds 10   # 可选：非累积型 case 提到 10 轮"
+    )
     parts.append("python tools/bench/ab.py --baseline-bin <baseline-bin> --pairs 20   # 写路径 A/B")
     parts.append("python tools/bench/dashboard.py      # 只重建看板")
     parts.append("cargo run --release -p tritdb-bench -- check \\")
-    parts.append("  --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05")
+    parts.append(
+        "  --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05 \\"
+    )
+    parts.append("  --rounds 10 --retries 2")
     parts.append("```")
     parts.append("")
     parts.append(

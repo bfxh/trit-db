@@ -98,8 +98,10 @@ fn print_help() {
     println!("  pgwire --rows 256 --queries 200 --rounds 3");
     println!("  ann-knn --points 4096 --dims 8 --k 10 --rounds 5");
     println!("  graph-reach --nodes 1024 --fanout 4 --hops 8 --rounds 5");
-    println!("  record --out <json> [--markdown <md>] [--suite ci]");
-    println!("  check --baseline <json> [--tolerance 0.5] [--min-ms 0.05] [--retries 1]");
+    println!("  record --out <json> [--markdown <md>] [--suite ci] [--rounds N]");
+    println!(
+        "  check --baseline <json> [--tolerance 0.5] [--min-ms 0.05] [--retries 1] [--rounds N]"
+    );
 }
 
 fn run_radix(args: &[String]) {
@@ -2359,10 +2361,39 @@ fn find_ms_triplet(line: &str) -> Option<(f64, f64, f64)> {
     Some((min, median, max))
 }
 
+/// Optional `--rounds` override applied to every case that has the flag.
+fn rounds_override(args: &[String]) -> Option<usize> {
+    arg_value(args, "--rounds").map(|value| {
+        value.parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("bad --rounds: {value}");
+            std::process::exit(2);
+        })
+    })
+}
+
+fn case_args(spec: &CaseSpec, rounds: Option<usize>) -> Vec<String> {
+    let mut args: Vec<String> = spec.args.iter().map(|arg| arg.to_string()).collect();
+    // sql_insert keeps appending rows across rounds, so raising --rounds
+    // changes the workload shape instead of reducing noise.  Leave its two
+    // rounds alone; use repeated `record` runs for that case.
+    let scalable = spec.bench_id != "sql_insert";
+    if let Some(rounds) = rounds.filter(|_| scalable) {
+        if let Some(index) = args.iter().position(|arg| arg == "--rounds") {
+            if index + 1 < args.len() {
+                args[index + 1] = rounds.to_string();
+            } else {
+                args.push(rounds.to_string());
+            }
+        }
+    }
+    args
+}
+
 /// Runs one benchmark case as a child process and parses its measurement.
-fn run_case(exe: &Path, spec: &CaseSpec) -> Result<(f64, f64, f64), String> {
+fn run_case(exe: &Path, spec: &CaseSpec, rounds: Option<usize>) -> Result<(f64, f64, f64), String> {
+    let args = case_args(spec, rounds);
     let output = std::process::Command::new(exe)
-        .args(spec.args)
+        .args(&args)
         .output()
         .map_err(|error| format!("{}: spawn failed: {error}", spec.bench_id))?;
     if !output.status.success() {
@@ -2394,14 +2425,16 @@ fn run_record(args: &[String]) {
         eprintln!("unknown --suite {suite}; only \"ci\" is implemented");
         std::process::exit(2);
     }
+    let rounds = rounds_override(args);
 
     let exe = std::env::current_exe().expect("current exe");
     let platform = platform_tag();
     let mut recorded = Vec::with_capacity(CI_CASES.len());
     for spec in CI_CASES {
         eprintln!("recording {}", spec.bench_id);
-        match run_case(&exe, spec) {
-            Ok(triplet) => recorded.push((spec, triplet)),
+        let case_args = case_args(spec, rounds);
+        match run_case(&exe, spec, rounds) {
+            Ok(triplet) => recorded.push((spec, case_args, triplet)),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -2413,12 +2446,12 @@ fn run_record(args: &[String]) {
     json.push_str("{\n  \"format\": 1,\n  \"suite\": \"ci\",\n");
     writeln!(&mut json, "  \"platform\": \"{platform}\",").expect("write baseline");
     json.push_str("  \"cases\": [\n");
-    for (index, (spec, (min, median, max))) in recorded.iter().enumerate() {
+    for (index, (spec, case_args, (min, median, max))) in recorded.iter().enumerate() {
         writeln!(
             &mut json,
             "    {{\"bench_id\":\"{}\",\"args\":\"{}\",\"min_ms\":{:.6},\"median_ms\":{:.6},\"max_ms\":{:.6}}}{}",
             spec.bench_id,
-            spec.args.join(" "),
+            case_args.join(" "),
             min,
             median,
             max,
@@ -2440,12 +2473,12 @@ fn run_record(args: &[String]) {
         md.push_str(
             "| case | 参数 | min (ms) | median (ms) | max (ms) |\n|---|---|---:|---:|---:|\n",
         );
-        for (spec, (min, median, max)) in &recorded {
+        for (spec, case_args, (min, median, max)) in &recorded {
             writeln!(
                 &mut md,
                 "| `{}` | `{}` | {:.4} | {:.4} | {:.4} |",
                 spec.bench_id,
-                spec.args.join(" "),
+                case_args.join(" "),
                 min,
                 median,
                 max
@@ -2520,7 +2553,8 @@ fn run_check(args: &[String]) {
         })
         .unwrap_or(0.05);
     // Shared CI disks occasionally produce a single slow sample (fsync
-    // jitter); re-run a regressed case and keep its fastest measurement.
+    // jitter); re-run a regressed case and keep the median of attempts.  Using
+    // the fastest sample would bias every gate toward "no regression".
     let retries = arg_value(args, "--retries")
         .map(|value| {
             value.parse::<usize>().unwrap_or_else(|_| {
@@ -2529,6 +2563,7 @@ fn run_check(args: &[String]) {
             })
         })
         .unwrap_or(1);
+    let rounds = rounds_override(args);
     let text = fs::read_to_string(&baseline_path).expect("read baseline");
     let baseline = parse_baseline(&text);
     if baseline.is_empty() {
@@ -2548,27 +2583,33 @@ fn run_check(args: &[String]) {
             println!("{bench_id}\t{baseline_median:.4}\t-\t-\tskip (baseline below --min-ms)");
             continue;
         }
-        let mut current_median = match run_case(&exe, spec) {
-            Ok((_, median, _)) => median,
+        let mut current_samples = Vec::new();
+        match run_case(&exe, spec, rounds) {
+            Ok((_, median, _)) => current_samples.push(median),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
-        };
+        }
         let mut attempts = 0;
-        while current_median / baseline_median.max(f64::MIN_POSITIVE) > 1.0 + tolerance
-            && attempts < retries
-        {
+        loop {
+            let current_median = Stats::new(current_samples.clone()).median;
+            if current_median / baseline_median.max(f64::MIN_POSITIVE) <= 1.0 + tolerance
+                || attempts >= retries
+            {
+                break;
+            }
             attempts += 1;
             eprintln!("{bench_id}: over tolerance, re-running (attempt {attempts}/{retries})");
-            match run_case(&exe, spec) {
-                Ok((_, median, _)) => current_median = current_median.min(median),
+            match run_case(&exe, spec, rounds) {
+                Ok((_, median, _)) => current_samples.push(median),
                 Err(error) => {
                     eprintln!("{error}");
                     std::process::exit(1);
                 }
             }
         }
+        let current_median = Stats::new(current_samples).median;
         let ratio = current_median / baseline_median.max(f64::MIN_POSITIVE);
         let regressed = ratio > 1.0 + tolerance;
         if regressed {
@@ -2781,7 +2822,7 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_baseline;
+    use super::{case_args, parse_baseline, CaseSpec};
 
     #[test]
     fn parses_pretty_and_compact_baseline_cases() {
@@ -2798,6 +2839,43 @@ mod tests {
                 ("sql_scan".to_string(), 0.092),
                 ("txn_put".to_string(), 195.774)
             ]
+        );
+    }
+
+    #[test]
+    fn rounds_override_replaces_and_skips_cumulative_insert() {
+        let update = CaseSpec {
+            bench_id: "sql_update",
+            args: &[
+                "sql-update",
+                "--rows",
+                "512",
+                "--cutoff",
+                "64",
+                "--rounds",
+                "2",
+            ],
+        };
+        assert_eq!(
+            case_args(&update, Some(10)),
+            vec![
+                "sql-update",
+                "--rows",
+                "512",
+                "--cutoff",
+                "64",
+                "--rounds",
+                "10"
+            ]
+        );
+
+        let insert = CaseSpec {
+            bench_id: "sql_insert",
+            args: &["sql-insert", "--rows", "128", "--rounds", "2"],
+        };
+        assert_eq!(
+            case_args(&insert, Some(10)),
+            vec!["sql-insert", "--rows", "128", "--rounds", "2"]
         );
     }
 }

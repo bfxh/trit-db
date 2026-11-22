@@ -24,6 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - run: python tools/bench/test_dashboard.py
       # Regenerate every table/chart/badge from the committed baseline and run
       # history. If the result differs from what is checked in, the PR forgot
       # to run `python tools/bench/dashboard.py`.
