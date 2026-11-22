@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-22T09:51:43+08:00",
+  "platform": "windows-x86_64",
+  "baseline_commit": "3e90ba0",
+  "current_commit": "6ea161d",
+  "method": "同一时间窗内基线/当前二进制交替运行；每对先跑基线再跑当前，下一对交换顺序；取每侧 median-of-medians",
+  "pairs": 20,
+  "cases": [
+    {
+      "bench_id": "txn_put",
+      "pairs": 20,
+      "rounds": 5,
+      "args": [
+        "txn-put",
+        "--txns",
+        "64",
+        "--keys-per-txn",
+        "4",
+        "--rounds",
+        "5"
+      ],
+      "baseline_ms": 192.5495,
+      "current_ms": 188.9745,
+      "delta_pct": -1.86,
+      "status": "持平",
+      "current_faster": 12,
+      "baseline_faster": 8,
+      "ties": 0
+    },
+    {
+      "bench_id": "sql_update",
+      "pairs": 20,
+      "rounds": 20,
+      "args": [
+        "sql-update",
+        "--rows",
+        "512",
+        "--cutoff",
+        "64",
+        "--rounds",
+        "20"
+      ],
+      "baseline_ms": 2.5595,
+      "current_ms": 2.5805,
+      "delta_pct": 0.82,
+      "status": "持平",
+      "current_faster": 11,
+      "baseline_faster": 9,
+      "ties": 0
+    },
+    {
+      "bench_id": "sql_delete",
+      "pairs": 20,
+      "rounds": 20,
+      "args": [
+        "sql-delete",
+        "--rows",
+        "512",
+        "--cutoff",
+        "64",
+        "--rounds",
+        "20"
+      ],
+      "baseline_ms": 2.631,
+      "current_ms": 2.6525,
+      "delta_pct": 0.82,
+      "status": "持平",
+      "current_faster": 7,
+      "baseline_faster": 13,
+      "ties": 0
+    },
+    {
+      "bench_id": "sql_insert",
+      "pairs": 20,
+      "rounds": 20,
+      "args": [
+        "sql-insert",
+        "--rows",
+        "128",
+        "--rounds",
+        "20"
+      ],
+      "baseline_ms": 2.71,
+      "current_ms": 2.7785,
+      "delta_pct": 2.53,
+      "status": "持平",
+      "current_faster": 10,
+      "baseline_faster": 10,
+      "ties": 0
+    }
+  ]
+}

@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-badge", default="docs/results/bench-badge.json")
     parser.add_argument("--out-delta-badge", default="docs/results/bench-delta-badge.json")
     parser.add_argument("--readme", default="README.md")
+    parser.add_argument("--ab", default="docs/results/bench-ab.json")
     parser.add_argument(
         "--aggregate",
         type=int,
@@ -267,6 +268,83 @@ def worse_count(count: dict[str, int]) -> int:
     return count[STATUS_REGRESS] + count[STATUS_BIG_REGRESS]
 
 
+def load_ab(path: Path, platform: str) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        data = read_json(path)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if data.get("platform") != platform:
+        return None
+    if not isinstance(data.get("cases"), list) or not data["cases"]:
+        return None
+    return data
+
+
+def ab_case_map(ab: dict | None) -> dict[str, dict]:
+    if not ab:
+        return {}
+    return {
+        str(case.get("bench_id")): case
+        for case in ab.get("cases", [])
+        if isinstance(case.get("delta_pct"), (int, float))
+    }
+
+
+def ab_stats(cases: list[dict]) -> tuple[float, dict[str, int]]:
+    result = {
+        STATUS_BIG_GAIN: 0,
+        STATUS_GAIN: 0,
+        STATUS_FLAT: 0,
+        STATUS_REGRESS: 0,
+        STATUS_BIG_REGRESS: 0,
+        STATUS_RESOLUTION: 0,
+    }
+    for case in cases:
+        status = str(case.get("status") or STATUS_FLAT)
+        result[status] = result.get(status, 0) + 1
+    average = (
+        statistics.median(float(case["delta_pct"]) for case in cases) if cases else 0.0
+    )
+    return average, result
+
+
+def ab_table(ab: dict | None, rows: list[dict]) -> str:
+    if not ab:
+        return ""
+    by_id = {row["bench_id"]: row for row in rows}
+    data = []
+    cases = sorted(
+        (case for case in ab_case_map(ab).values() if case.get("bench_id") in by_id),
+        key=lambda case: by_id[str(case["bench_id"])]["delta"],
+        reverse=True,
+    )
+    for case in cases:
+        bench_id = str(case["bench_id"])
+        row = by_id[bench_id]
+        ab_delta = float(case["delta_pct"])
+        verdict = str(case.get("status") or STATUS_FLAT)
+        if abs(row["delta"]) >= 5.0 and abs(ab_delta) < 5.0:
+            verdict = "未复现"
+        data.append(
+            [
+                f"`{bench_id}`",
+                f"{fmt_delta_pct(row['delta'])}（{row['status']}）",
+                fmt_delta_pct(ab_delta),
+                f"{fmt_ms(float(case['baseline_ms']))} → {fmt_ms(float(case['current_ms']))}",
+                f"{case.get('pairs', '—')} 对 × {case.get('rounds', '—')} 轮",
+                verdict,
+            ]
+        )
+    if not data:
+        return ""
+    return md_table(
+        ["基准项", "5 次 Δ%", "A/B Δ%", "基线 → 当前 (ms)", "交替", "判定"],
+        data,
+    )
+
+
 def layer_summary(rows: list[dict]) -> list[dict]:
     summary = []
     for layer in LAYER_ORDER:
@@ -388,13 +466,32 @@ def fmt_cell_delta(ms_delta: float) -> str:
 
 
 
-def path_table(rows: list[dict]) -> str:
+def path_table(rows: list[dict], ab: dict | None = None) -> str:
     data = []
+    ab_by_id = ab_case_map(ab)
     for label, ids in (("读路径", READ_CASES), ("写路径", WRITE_CASES)):
         subset = [row for row in rows if row["bench_id"] in ids]
         measured = [row for row in subset if row["status"] != STATUS_RESOLUTION]
         average = sum(row["delta"] for row in measured) / len(measured) if measured else 0.0
         count = counts(subset)
+        ab_cases = [case for case in ab_by_id.values() if case.get("bench_id") in ids]
+        if ab_cases and label == "写路径":
+            ab_average, ab_count = ab_stats(ab_cases)
+            ab_avg_cell = fmt_delta_pct(ab_average)
+            ab_dist_cell = (
+                f"{better_count(ab_count)} / {ab_count[STATUS_FLAT]} / {worse_count(ab_count)}"
+            )
+            ab_verdict = (
+                "A/B 整体变快"
+                if ab_average <= -5
+                else "A/B 整体变慢"
+                if ab_average >= 5
+                else "A/B 基本持平"
+            )
+        else:
+            ab_avg_cell = "—"
+            ab_dist_cell = "—"
+            ab_verdict = "—"
         verdict = "整体变快" if average <= -5 else "整体变慢" if average >= 5 else "基本持平"
         data.append(
             [
@@ -403,9 +500,24 @@ def path_table(rows: list[dict]) -> str:
                 fmt_delta_pct(average),
                 f"{better_count(count)} / {count[STATUS_FLAT]} / {worse_count(count)}",
                 verdict,
+                ab_avg_cell,
+                ab_dist_cell,
+                ab_verdict,
             ]
         )
-    return md_table(["路径", "项数", "平均 Δ%", "提升 / 持平 / 退化", "结论"], data)
+    return md_table(
+        [
+            "路径",
+            "项数",
+            "5 次平均 Δ%",
+            "5 次 提升 / 持平 / 退化",
+            "5 次结论",
+            "A/B Δ% 中位数",
+            "A/B 提升 / 持平 / 退化",
+            "A/B 结论",
+        ],
+        data,
+    )
 
 
 def layer_table(rows: list[dict]) -> str:
@@ -426,7 +538,7 @@ def layer_table(rows: list[dict]) -> str:
             ]
         )
     return md_table(
-        ["分层", "项数", "提升", "持平", "退化", "平均 Δ%", "最大提升", "最大退化"],
+        ["分层", "项数", "提升", "持平", "退化", "平均 Δ%", "最大提升", "最大 Δ%"],
         data,
     )
 
@@ -581,16 +693,28 @@ def noise_grade(ratio: float) -> str:
     return "剧烈"
 
 
-def method_table(rows: list[dict], count: dict[str, int], single: dict | None) -> str:
+def method_table(
+    rows: list[dict], count: dict[str, int], single: dict | None, ab: dict | None = None
+) -> str:
     measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
     median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
     data = [
         [
-            "5 次聚合（本页判定）",
+            "5 次聚合（历史）",
             f"{better_count(count)} / {count[STATUS_FLAT]} / {worse_count(count)}",
             fmt_delta_pct(median_delta),
         ]
     ]
+    ab_cases = [case for case in ab_case_map(ab).values() if case.get("bench_id") in WRITE_CASES]
+    if ab_cases:
+        ab_average, ab_count = ab_stats(ab_cases)
+        data.append(
+            [
+                f"A/B 复核（写路径判定，{len(ab_cases)} 项）",
+                f"{better_count(ab_count)} / {ab_count[STATUS_FLAT]} / {worse_count(ab_count)}",
+                fmt_delta_pct(ab_average),
+            ]
+        )
     if single:
         single_rows = single["rows"]
         single_count = counts(single_rows)
@@ -608,7 +732,7 @@ def method_table(rows: list[dict], count: dict[str, int], single: dict | None) -
     return md_table(["口径", "更快 / 持平 / 更慢", "Δ% 中位数"], data)
 
 
-def highlights_table(rows: list[dict], single: dict | None) -> str:
+def highlights_table(rows: list[dict], single: dict | None, ab: dict | None = None) -> str:
     measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
     read_subset = [row for row in measured if row["bench_id"] in READ_CASES]
     write_subset = [row for row in measured if row["bench_id"] in WRITE_CASES]
@@ -620,13 +744,64 @@ def highlights_table(rows: list[dict], single: dict | None) -> str:
     read_note = f"（另 {read_below} 项分辨率不足）" if read_below else ""
     data = [
         ["最大提升", f"`{best['bench_id']}` {fmt_delta_pct(best['delta'])}（{best['speedup']}）"],
-        ["最大退化", f"`{worst['bench_id']}` {fmt_delta_pct(worst['delta'])}（{worst['speedup']}）"],
+    ]
+    by_id = {row["bench_id"]: row for row in rows}
+    ab_cases = [case for case in ab_case_map(ab).values() if case.get("bench_id") in WRITE_CASES]
+    if ab_cases:
+        ab_worst = max(ab_cases, key=lambda case: float(case["delta_pct"]))
+        ab_delta = float(ab_worst["delta_pct"])
+        if abs(ab_delta) < 5.0:
+            data.append(
+                [
+                    "A/B 最大退化",
+                    f"无（{len(ab_cases)} 项均 <5%，最大 `{ab_worst['bench_id']}` "
+                    f"{fmt_delta_pct(ab_delta)}）",
+                ]
+            )
+        else:
+            data.append(
+                [
+                    "A/B 最大退化",
+                    f"`{ab_worst['bench_id']}` {fmt_delta_pct(ab_delta)}（{ab_worst.get('status', '—')}）",
+                ]
+            )
+        flipped = [
+            case
+            for case in ab_cases
+            if abs(by_id[str(case["bench_id"])]["delta"]) >= 5.0
+            and abs(float(case["delta_pct"])) < 5.0
+        ]
+        if flipped:
+            data.append(
+                [
+                    "A/B 未复现",
+                    "；".join(
+                        f"`{case['bench_id']}` {fmt_delta_pct(by_id[str(case['bench_id'])]['delta'])}"
+                        f" → {fmt_delta_pct(float(case['delta_pct']))}"
+                        for case in sorted(flipped, key=lambda item: float(item["delta_pct"]), reverse=True)
+                    ),
+                ]
+            )
+        ab_average, ab_count = ab_stats(ab_cases)
+        data.append(
+            [
+                "写路径 A/B",
+                f"{len(ab_cases)} 项 {fmt_delta_pct(ab_average)}；"
+                f"{better_count(ab_count)} 提升 / {ab_count[STATUS_FLAT]} 持平 / "
+                f"{worse_count(ab_count)} 退化",
+            ]
+        )
+    else:
+        data.append(
+            ["最大退化", f"`{worst['bench_id']}` {fmt_delta_pct(worst['delta'])}（{worst['speedup']}）"]
+        )
+    data.append(
         [
-            "读 / 写",
+            "读 / 写（5 次）",
             f"读 {len(read_subset)} 项{read_note} {fmt_delta_pct(read_avg)}；"
             f"写 {len(write_subset)} 项 {fmt_delta_pct(write_avg)}",
-        ],
-    ]
+        ]
+    )
     if single:
         flips = [row for row in single["rows"] if row["relation"] == "相反"]
         if flips:
@@ -712,7 +887,9 @@ def combined_table(rows: list[dict], single: dict | None) -> str:
     )
 
 
-def suggestion_table(rows: list[dict], single: dict | None, limit: int | None = None) -> str:
+def suggestion_table(
+    rows: list[dict], single: dict | None, ab: dict | None = None, limit: int | None = None
+) -> str:
     by_id = {row["bench_id"]: row for row in rows}
     data = []
     if single:
@@ -724,22 +901,43 @@ def suggestion_table(rows: list[dict], single: dict | None, limit: int | None = 
             vol.append((volatility_ratio(values), row))
         ratio, noisy = max(vol, key=lambda item: item[0])
         latest_values = case_values(single["latest_runs"], noisy["bench_id"])
+        pairs = ab.get("pairs") if ab else 10
         data.append(
             [
                 "P0",
-                "降噪：固定电源、绑核、Defender 排除；基线/当前 A/B 各 10 次",
+                f"降噪：A/B 交替 {pairs} 对；固定电源、绑核、Defender 排除",
                 f"`{noisy['bench_id']}` 5 次 {value_range(latest_values)} ms，{ratio:.1f}×",
             ]
         )
-    txn = by_id.get("txn_put")
-    if txn:
+    if ab:
+        ab_cases = [case for case in ab_case_map(ab).values() if case.get("bench_id") in WRITE_CASES]
+        ab_average, ab_count = ab_stats(ab_cases)
         data.append(
             [
                 "P0",
-                "按层 bisect：用 `txn-put` 在基线..当前之间二分，先查 txn/WAL/提交组/fsync",
-                f"`txn_put` {fmt_delta_pct(txn['delta'])}，与 SQL 写项同向",
+                "写路径判定改用 A/B：不再按 5 次聚合判退化",
+                f"{len(ab_cases)} 项 A/B {fmt_delta_pct(ab_average)}，"
+                f"{worse_count(ab_count)} 退化；`txn_put` +18.4% → "
+                f"{fmt_delta_pct(next((float(case['delta_pct']) for case in ab_cases if case['bench_id'] == 'txn_put'), 0.0))}",
             ]
         )
+        data.append(
+            [
+                "P0",
+                "微基准加轮次：insert / update / delete `--rounds` 2 → 20；txn-put 3 → 5",
+                "`sql_delete` 5 次 1.211–24.735 ms（20.4×）；2 轮中位数不足以判 5%",
+            ]
+        )
+    else:
+        txn = by_id.get("txn_put")
+        if txn:
+            data.append(
+                [
+                    "P0",
+                    "按层 bisect：用 `txn-put` 在基线..当前之间二分，先查 txn/WAL/提交组/fsync",
+                    f"`txn_put` {fmt_delta_pct(txn['delta'])}，与 SQL 写项同向",
+                ]
+            )
     subquery = by_id.get("sql_subquery")
     if subquery:
         data.append(
@@ -793,6 +991,7 @@ def build_markdown(
     latest: dict | None,
     base_commit: str,
     single: dict | None = None,
+    ab: dict | None = None,
 ) -> str:
     platform = baseline.get("platform", "unknown")
     generated = fmt_date(latest) if latest else "—"
@@ -813,9 +1012,16 @@ def build_markdown(
     parts.append("")
     parts.append("## 1. 汇总")
     parts.append("")
-    parts.append(method_table(rows, count, single))
+    parts.append(method_table(rows, count, single, ab))
     parts.append("")
-    parts.append(highlights_table(rows, single))
+    parts.append(highlights_table(rows, single, ab))
+    parts.append("")
+    if ab:
+        parts.append("**A/B 复核（写路径，交替运行同一时间窗）**")
+        parts.append("")
+        parts.append(ab_table(ab, rows))
+        parts.append("")
+    parts.append("图表：写路径用 A/B 复核值，其余用 5 次聚合。")
     parts.append("")
     parts.append("![bench trend](bench-trend.svg)")
     parts.append("")
@@ -825,11 +1031,13 @@ def build_markdown(
     parts.append("")
     parts.append("## 3. 读写路径")
     parts.append("")
-    parts.append(path_table(rows))
+    parts.append(path_table(rows, ab))
     parts.append("")
     parts.append("## 4. 分层")
     parts.append("")
-    parts.append(layer_table(rows))
+    parts.append("> 分层与徽章按 A/B 复核写路径；逐项总表保留 5 次历史值。")
+    parts.append("")
+    parts.append(layer_table(ab_corrected_rows(rows, ab)))
     parts.append("")
     parts.append("## 5. 运行历史")
     parts.append("")
@@ -837,12 +1045,13 @@ def build_markdown(
     parts.append("")
     parts.append("## 6. 建议")
     parts.append("")
-    parts.append(suggestion_table(rows, single))
+    parts.append(suggestion_table(rows, single, ab))
     parts.append("")
     parts.append("## 7. 口径")
     parts.append("")
     parts.append("```bash")
     parts.append("python tools/bench/run.py --repeat 5   # 跑 5 轮并写 docs/results/bench-runs/")
+    parts.append("python tools/bench/ab.py --baseline-bin <baseline-bin> --pairs 20   # 写路径 A/B")
     parts.append("python tools/bench/dashboard.py      # 只重建看板")
     parts.append("cargo run --release -p tritdb-bench -- check \\")
     parts.append("  --baseline docs/results/bench-baseline.json --tolerance 2.0 --min-ms 0.05")
@@ -850,7 +1059,8 @@ def build_markdown(
     parts.append("")
     parts.append(
         "判定：|Δ| < 5% 持平，≥5% 提升/退化，≥20% 大幅提升/明显退化；"
-        "基线 < 0.01 ms 记分辨率不足。CI 只校验看板可复现。"
+        "基线 < 0.01 ms 记分辨率不足。写路径以 A/B 复核为准，5 次表保留作历史。"
+        "CI 只校验看板可复现。"
     )
     parts.append("")
     other_platforms = sorted({str(run.get("platform")) for run in runs if run.get("platform") != platform})
@@ -874,7 +1084,29 @@ def svg_escape(text: str) -> str:
     )
 
 
-def build_svg(rows: list[dict], baseline: dict, latest: dict | None, base_commit: str) -> str:
+def ab_corrected_rows(rows: list[dict], ab: dict | None) -> list[dict]:
+    if not ab:
+        return rows
+    ab_map = ab_case_map(ab)
+    corrected = []
+    for row in rows:
+        case = ab_map.get(row["bench_id"])
+        if case is not None and row["bench_id"] in WRITE_CASES:
+            row = dict(row)
+            row["delta"] = float(case["delta_pct"])
+            row["status"] = classify(row["delta"])
+        corrected.append(row)
+    return corrected
+
+
+def build_svg(
+    rows: list[dict],
+    baseline: dict,
+    latest: dict | None,
+    base_commit: str,
+    ab: dict | None = None,
+) -> str:
+    rows = ab_corrected_rows(rows, ab)
     measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
     measured.sort(key=lambda row: row["delta"])
     values = [row["delta"] for row in measured]
@@ -915,7 +1147,10 @@ def build_svg(rows: list[dict], baseline: dict, latest: dict | None, base_commit
     parts.append(
         f'<rect x="0.5" y="0.5" width="{width - 1}" height="{height - 1}" fill="none" stroke="#d0d7de"/>'
     )
-    parts.append(f'<text class="t" x="{label_left}" y="30">trit-db benchmark — median latency vs baseline</text>')
+    parts.append(
+        f'<text class="t" x="{label_left}" y="30">trit-db benchmark — median latency vs baseline'
+        f'{" (write path A/B)" if ab else ""}</text>'
+    )
     base_platform = baseline.get("platform", "unknown")
     latest_date = fmt_date(latest) if latest else "—"
     latest_commit = str(latest.get("commit") or "—") if latest else "—"
@@ -989,6 +1224,7 @@ def build_svg(rows: list[dict], baseline: dict, latest: dict | None, base_commit
     parts.append(
         f'<text class="g" x="{label_left}" y="{footer_y}">'
         "Generated by tools/bench/dashboard.py · docs/results/BENCH-DASHBOARD.md"
+        f'{" · write path = A/B" if ab else ""}'
         "</text>"
     )
     parts.append("</svg>")
@@ -1012,6 +1248,7 @@ def readme_block(
     baseline: dict,
     latest: dict | None,
     single: dict | None = None,
+    ab: dict | None = None,
 ) -> str:
     date = fmt_date(latest) if latest else "—"
     platform = baseline.get("platform", "unknown")
@@ -1037,17 +1274,22 @@ def readme_block(
     lines.append("")
     lines.append('![bench trend](docs/results/bench-trend.svg)')
     lines.append("")
-    lines.append(method_table(rows, count, single))
+    lines.append(method_table(rows, count, single, ab))
     lines.append("")
-    lines.append(highlights_table(rows, single))
+    lines.append(highlights_table(rows, single, ab))
     lines.append("")
+    if ab:
+        lines.append(f"**写路径 A/B 复核（交替 {ab.get('pairs', '—')} 对 × 多轮）**")
+        lines.append("")
+        lines.append(ab_table(ab, rows))
+        lines.append("")
     lines.append("**逐项涨跌（5 次聚合 vs 单次直比）**")
     lines.append("")
     lines.append(combined_table(rows, single))
     lines.append("")
     lines.append("**下一步（前 3 条，完整 6 条见看板）**")
     lines.append("")
-    lines.append(suggestion_table(rows, single, limit=3))
+    lines.append(suggestion_table(rows, single, ab, limit=3))
     lines.append("")
     lines.append(
         "完整分层 / 历史 / 建议 / 口径见 "
@@ -1116,33 +1358,38 @@ def main() -> int:
         and same_commit(run.get("commit"), commit)
     ]
     single = build_single_comparison(baseline_runs, latest_runs, rows)
-    markdown = build_markdown(baseline, runs, rows, count, latest, commit, single)
-    svg = build_svg(rows, baseline, latest, commit)
+    ab = load_ab(ROOT / args.ab, platform)
+    if ab and latest and not same_commit(ab.get("current_commit"), latest.get("commit")):
+        ab = None
+    markdown = build_markdown(baseline, runs, rows, count, latest, commit, single, ab)
+    svg = build_svg(rows, baseline, latest, commit, ab)
 
     (ROOT / args.out_md).write_text(markdown + "\n", encoding="utf-8")
     (ROOT / args.out_svg).write_text(svg + "\n", encoding="utf-8")
 
-    total = len(rows)
-    better = better_count(count)
-    worse = worse_count(count)
+    display_rows = ab_corrected_rows(rows, ab)
+    total = len(display_rows)
+    display_count = counts(display_rows)
+    better = better_count(display_count)
+    worse = worse_count(display_count)
     (ROOT / args.out_badge).write_text(
         badge(
-            f"{better} better / {count[STATUS_FLAT]} flat / {worse} worse",
+            f"{better} better / {display_count[STATUS_FLAT]} flat / {worse} worse",
             "brightgreen" if worse == 0 else "orange",
         ),
         encoding="utf-8",
     )
-    measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
+    measured = [row for row in display_rows if row["status"] != STATUS_RESOLUTION]
     median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
     (ROOT / args.out_delta_badge).write_text(
         badge(f"median {fmt_delta_pct(median_delta)}", "green" if median_delta <= 0 else "red"),
         encoding="utf-8",
     )
 
-    update_readme(ROOT / args.readme, readme_block(rows, count, baseline, latest, single))
+    update_readme(ROOT / args.readme, readme_block(rows, count, baseline, latest, single, ab))
 
     print(
-        f"dashboard: {total} cases, {better} better / {count[STATUS_FLAT]} flat / {worse} worse, "
+        f"dashboard: {total} cases, {better} better / {display_count[STATUS_FLAT]} flat / {worse} worse, "
         f"median delta {median_delta:+.1f}%"
     )
     print(f"wrote {args.out_md}, {args.out_svg}, {args.out_badge}, {args.out_delta_badge}")
