@@ -1123,21 +1123,25 @@ def highlights_table(rows: list[dict], single: dict | None, ab: dict | None = No
     return md_table(["重点", "数值"], data)
 
 
-def absolute_table(rows: list[dict]) -> str:
+def absolute_table(rows: list[dict], ab: dict | None = None) -> str:
+    ab_map = ab_case_map(ab)
     data = []
     for row in rows:
         if row["status"] == STATUS_RESOLUTION:
             continue
+        case = ab_map.get(row["bench_id"])
+        base = float(case["baseline_ms"]) if case else row["base"]
+        latest = float(case["current_ms"]) if case else row["latest"]
         count, unit = CASE_META.get(row["bench_id"], ("", "", "", 1, "次/s"))[3:]
-        base_rate = ops_per_second(row["bench_id"], row["base"])
-        current_rate = ops_per_second(row["bench_id"], row["latest"])
+        base_rate = ops_per_second(row["bench_id"], base)
+        current_rate = ops_per_second(row["bench_id"], latest)
         data.append(
             [
                 row["layer"],
                 f"`{row['bench_id']}`",
                 row["scene"],
-                fmt_ms(row["base"]),
-                fmt_ms(row["latest"]),
+                fmt_ms(base),
+                fmt_ms(latest),
                 f"{fmt_rate(base_rate)} → {fmt_rate(current_rate)}",
                 unit,
                 f"{count} {unit.split('/')[0]}/轮",
@@ -1350,9 +1354,9 @@ def build_markdown(
     parts.append("")
     parts.append(combined_table(rows, single))
     parts.append("")
-    parts.append("**绝对值与吞吐**")
+    parts.append("**绝对值与吞吐（A/B 优先）**")
     parts.append("")
-    parts.append(absolute_table(rows))
+    parts.append(absolute_table(rows, ab))
     parts.append("")
     parts.append("## 3. 分布与内存")
     parts.append("")
@@ -1785,9 +1789,9 @@ def readme_block(
     lines.append("")
     lines.append(combined_table(rows, single))
     lines.append("")
-    lines.append("**绝对值与吞吐**")
+    lines.append("**绝对值与吞吐（A/B 优先）**")
     lines.append("")
-    lines.append(absolute_table(rows))
+    lines.append(absolute_table(rows, ab))
     lines.append("")
     lines.append("**下一步（前 3 条，完整 6 条见看板）**")
     lines.append("")
