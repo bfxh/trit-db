@@ -2462,24 +2462,38 @@ fn run_record(args: &[String]) {
 /// Parses `{"bench_id":"...","median_ms":...}` lines from the baseline JSON.
 fn parse_baseline(text: &str) -> Vec<(String, f64)> {
     let mut cases = Vec::new();
-    for line in text.lines() {
-        let Some(id_at) = line.find("\"bench_id\":\"") else {
-            continue;
-        };
-        let id_start = id_at + "\"bench_id\":\"".len();
-        let Some(id_len) = line[id_start..].find('"') else {
-            continue;
-        };
-        let bench_id = line[id_start..id_start + id_len].to_string();
-        let Some(median_at) = line.find("\"median_ms\":") else {
-            continue;
-        };
-        let rest = &line[median_at + "\"median_ms\":".len()..];
-        let end = rest.find([',', '}']).unwrap_or(rest.len());
-        let Ok(median) = rest[..end].trim().parse::<f64>() else {
-            continue;
-        };
-        cases.push((bench_id, median));
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find("\"bench_id\"") {
+        let start = cursor + offset;
+        let end = text[start..]
+            .find('}')
+            .map(|index| start + index + 1)
+            .unwrap_or(text.len());
+        let object = &text[start..end];
+
+        let bench_id = object
+            .find(':')
+            .and_then(|colon| object[colon + 1..].trim_start().strip_prefix('"'))
+            .and_then(|quoted| quoted.find('"').map(|quote| &quoted[..quote]));
+        let median = object
+            .find("\"median_ms\"")
+            .and_then(|key| {
+                let after_key = key + "\"median_ms\"".len();
+                object[after_key..]
+                    .find(':')
+                    .map(|colon| &object[after_key + colon + 1..])
+            })
+            .map(str::trim_start)
+            .and_then(|value| {
+                let end = value
+                    .find(|ch: char| ch == ',' || ch == '}' || ch.is_whitespace())
+                    .unwrap_or(value.len());
+                value[..end].parse::<f64>().ok()
+            });
+        if let (Some(bench_id), Some(median)) = (bench_id, median) {
+            cases.push((bench_id.to_string(), median));
+        }
+        cursor = end;
     }
     cases
 }
@@ -2762,5 +2776,28 @@ impl Rng {
 
     fn trit(&mut self) -> Trit {
         Trit::from_u8((self.next_u64() % 3) as u8).expect("0..=2")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_baseline;
+
+    #[test]
+    fn parses_pretty_and_compact_baseline_cases() {
+        let text = r#"{
+          "cases": [
+            {"bench_id": "sql_scan", "args": "sql-scan --rows 512", "median_ms": 0.092},
+            {"bench_id":"txn_put","median_ms":195.774}
+          ]
+        }"#;
+        let cases = parse_baseline(text);
+        assert_eq!(
+            cases,
+            vec![
+                ("sql_scan".to_string(), 0.092),
+                ("txn_put".to_string(), 195.774)
+            ]
+        );
     }
 }
