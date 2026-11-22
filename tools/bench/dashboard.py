@@ -2,7 +2,8 @@
 """Build the trit-db benchmark dashboard from the committed baseline and run history.
 
 Outputs:
-  docs/results/BENCH-DASHBOARD.md   full tables (KPI / per-case / per-layer / history / trend)
+  docs/results/BENCH-DASHBOARD.md   full tables (KPI / per-case / single-run / volatility /
+                                    per-path / per-layer / history / trend / next steps)
   docs/results/bench-trend.svg      horizontal bar chart of latency change vs baseline
   docs/results/bench-badge.json     shields.io endpoint badge (better/worse counts)
   docs/results/bench-delta-badge.json
@@ -72,6 +73,7 @@ STATUS_RESOLUTION = "分辨率不足"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", default="docs/results/bench-baseline.json")
+    parser.add_argument("--baseline-runs-dir", default="docs/results/bench-baseline-runs")
     parser.add_argument("--runs-dir", default="docs/results/bench-runs")
     parser.add_argument("--out-md", default="docs/results/BENCH-DASHBOARD.md")
     parser.add_argument("--out-svg", default="docs/results/bench-trend.svg")
@@ -179,6 +181,18 @@ def fmt_date(run: dict) -> str:
 def fmt_commit(run: dict) -> str:
     commit = str(run.get("commit") or "")
     return f"`{commit}`" if commit else "—"
+
+
+def same_commit(left: object, right: object) -> bool:
+    left_text = str(left or "")
+    right_text = str(right or "")
+    if not left_text or not right_text:
+        return False
+    return (
+        left_text == right_text
+        or left_text.startswith(right_text)
+        or right_text.startswith(left_text)
+    )
 
 
 def speedup_text(delta: float) -> str:
@@ -574,6 +588,269 @@ def trend_table(baseline: dict, groups: list[list[dict]], limit: int = 8) -> str
     return md_table(headers, data)
 
 
+def verdict_direction(status: str) -> int | None:
+    if status in (STATUS_BIG_GAIN, STATUS_GAIN):
+        return -1
+    if status == STATUS_FLAT:
+        return 0
+    if status in (STATUS_REGRESS, STATUS_BIG_REGRESS):
+        return 1
+    return None
+
+
+def verdict_relation(single_status: str, aggregate_status: str | None) -> str:
+    """How the single-run verdict relates to the 5-run aggregate verdict."""
+    if aggregate_status is None:
+        return "不可比"
+    if single_status == STATUS_RESOLUTION or aggregate_status == STATUS_RESOLUTION:
+        return "不可比"
+    left = verdict_direction(single_status)
+    right = verdict_direction(aggregate_status)
+    if left == right:
+        return "一致" if single_status == aggregate_status else "同向"
+    if left == 0 or right == 0:
+        return "不一致"
+    return "相反"
+
+
+def build_single_comparison(
+    baseline_runs: list[dict],
+    latest_runs: list[dict],
+    aggregate_rows: list[dict],
+) -> dict | None:
+    """The first run of each batch, compared directly, purely as a noise probe."""
+    if not baseline_runs or not latest_runs:
+        return None
+    base_run = baseline_runs[0]
+    latest_run = latest_runs[0]
+    rows = build_rows(case_map(base_run), case_map(latest_run))
+    if not rows:
+        return None
+    aggregate = {row["bench_id"]: row for row in aggregate_rows}
+    for row in rows:
+        match = aggregate.get(row["bench_id"])
+        row["aggregate_status"] = match["status"] if match else None
+        row["aggregate_delta"] = match["delta"] if match else None
+        row["relation"] = verdict_relation(row["status"], row["aggregate_status"])
+        row["gap"] = abs(row["delta"] - match["delta"]) if match else 0.0
+    return {
+        "baseline_run": base_run,
+        "latest_run": latest_run,
+        "baseline_runs": baseline_runs,
+        "latest_runs": latest_runs,
+        "rows": rows,
+    }
+
+
+def case_values(runs: list[dict], bench_id: str) -> list[float]:
+    values = []
+    for run in runs:
+        value = case_map(run).get(bench_id)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def value_range(values: list[float]) -> str:
+    if not values:
+        return "—"
+    return f"{fmt_ms(min(values))}–{fmt_ms(max(values))}"
+
+
+def volatility_ratio(values: list[float]) -> float:
+    if not values or min(values) <= 0:
+        return 1.0
+    return max(values) / min(values)
+
+
+def noise_grade(ratio: float) -> str:
+    if ratio < 1.2:
+        return "稳定"
+    if ratio < 2.0:
+        return "中等"
+    return "剧烈"
+
+
+def method_table(rows: list[dict], count: dict[str, int], single: dict | None) -> str:
+    measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
+    median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
+    data = [
+        [
+            "5 次聚合（本页判定）",
+            f"{better_count(count)} / {count[STATUS_FLAT]} / {worse_count(count)}",
+            fmt_delta_pct(median_delta),
+        ]
+    ]
+    if single:
+        single_rows = single["rows"]
+        single_count = counts(single_rows)
+        single_measured = [row for row in single_rows if row["status"] != STATUS_RESOLUTION]
+        single_median = (
+            statistics.median(row["delta"] for row in single_measured) if single_measured else 0.0
+        )
+        data.append(
+            [
+                "单次直比（仅参考）",
+                f"{better_count(single_count)} / {single_count[STATUS_FLAT]} / {worse_count(single_count)}",
+                fmt_delta_pct(single_median),
+            ]
+        )
+    return md_table(["口径", "更快 / 持平 / 更慢", "Δ% 中位数"], data)
+
+
+def single_table(single: dict) -> str:
+    data = []
+    for row in single["rows"]:
+        delta = "—" if row["status"] == STATUS_RESOLUTION else fmt_delta_pct(row["delta"])
+        data.append(
+            [
+                f"`{row['bench_id']}`",
+                row["layer"],
+                fmt_ms(row["base"]),
+                fmt_ms(row["latest"]),
+                delta,
+                row["status"],
+                row["aggregate_status"] or "—",
+                row["relation"],
+            ]
+        )
+    return md_table(
+        [
+            "基准项",
+            "分层",
+            "基线单次 (ms)",
+            "当前单次 (ms)",
+            "Δ%",
+            "单次判定",
+            "5 次聚合判定",
+            "对照",
+        ],
+        data,
+    )
+
+
+def volatility_table(single: dict) -> str:
+    records = []
+    for row in single["rows"]:
+        base_values = case_values(single["baseline_runs"], row["bench_id"])
+        latest_values = case_values(single["latest_runs"], row["bench_id"])
+        base_ratio = volatility_ratio(base_values)
+        latest_ratio = volatility_ratio(latest_values)
+        ratio = max(base_ratio, latest_ratio)
+        records.append(
+            (
+                ratio,
+                [
+                    f"`{row['bench_id']}`",
+                    row["layer"],
+                    value_range(base_values),
+                    value_range(latest_values),
+                    f"{base_ratio:.1f}× / {latest_ratio:.1f}×",
+                    noise_grade(ratio),
+                ],
+            )
+        )
+    records.sort(key=lambda item: item[0], reverse=True)
+    return md_table(
+        ["基准项", "分层", "基线 5 次区间 (ms)", "当前 5 次区间 (ms)", "波动倍数（基线 / 当前）", "噪声"],
+        [row for _, row in records],
+    )
+
+
+def readme_single_table(single: dict) -> str:
+    data = []
+    for row in single["rows"]:
+        delta = "—" if row["status"] == STATUS_RESOLUTION else fmt_delta_pct(row["delta"])
+        if row["aggregate_status"] == STATUS_RESOLUTION:
+            aggregate_delta = "—"
+        elif row["aggregate_delta"] is None:
+            aggregate_delta = "—"
+        else:
+            aggregate_delta = fmt_delta_pct(row["aggregate_delta"])
+        data.append(
+            [
+                f"`{row['bench_id']}`",
+                fmt_ms(row["base"]),
+                fmt_ms(row["latest"]),
+                delta,
+                aggregate_delta,
+                row["relation"],
+            ]
+        )
+    return md_table(
+        ["基准项", "基线单次 (ms)", "当前单次 (ms)", "单次 Δ%", "聚合 Δ%", "对照"],
+        data,
+    )
+
+
+def recommendation_lines(rows: list[dict], single: dict | None, write_avg: float) -> list[str]:
+    by_id = {row["bench_id"]: row for row in rows}
+    lines = []
+    if single:
+        vol = []
+        for row in single["rows"]:
+            values = case_values(single["baseline_runs"], row["bench_id"]) + case_values(
+                single["latest_runs"], row["bench_id"]
+            )
+            vol.append((volatility_ratio(values), row))
+        ratio, noisy = max(vol, key=lambda item: item[0])
+        base_values = case_values(single["baseline_runs"], noisy["bench_id"])
+        latest_values = case_values(single["latest_runs"], noisy["bench_id"])
+        flips = [row for row in single["rows"] if row["relation"] == "相反"]
+        gap = max(single["rows"], key=lambda row: row["gap"])
+        contrast = ""
+        if flips:
+            flip_ids = "、".join(f"`{row['bench_id']}`" for row in flips)
+            contrast = (
+                f"单次直比与 5 次聚合在 {flip_ids} 上方向相反，"
+                f"`{gap['bench_id']}` 的幅度差 {gap['gap']:.1f} 个百分点。"
+            )
+        lines.append(
+            f"1. **先降噪，再谈优化。** 同一 commit 连跑 {len(single['latest_runs'])} 次，"
+            f"`{noisy['bench_id']}` 的 median 在 "
+            f"{value_range(base_values)} / {value_range(latest_values)} ms（基线 / 当前）之间摆动，"
+            f"最高 {ratio:.1f}×；写路径 4 项平均 {fmt_delta_pct(write_avg)}，但{contrast}"
+            "建议固定电源计划、绑核运行、把 `target/` 与基准库目录加入 Defender 排除，"
+            "并让基线构建 / 当前构建 A/B 交替各跑 10 次；同时把 `ci` 套件的 DML 样本量从 "
+            "128 行 / 64 txn 提到 512 行 / 256 txn，让单次样本本身更抗噪。"
+        )
+    txn = by_id.get("txn_put")
+    if txn:
+        lines.append(
+            f"{len(lines) + 1}. **先查公共写路径，不要先改 SQL。** `txn_put` 不经过 SQL 解析也 "
+            f"{fmt_delta_pct(txn['delta'])}，和 `sql_insert` / `sql_update` / `sql_delete` 同向；"
+            "优先对比基线与当前之间的 `tritdb-txn` / `tritdb-wal` / 提交组 / fsync 路径，"
+            "用 `txn-put` 作为 bisect 判据，定位到层再改代码。"
+        )
+    subquery = by_id.get("sql_subquery")
+    if subquery:
+        lines.append(
+            f"{len(lines) + 1}. **把 `sql_subquery` 的收益锁住。** 当前 {fmt_delta_pct(subquery['delta'])}"
+            f"（{fmt_ms(subquery['base'])} → {fmt_ms(subquery['latest'])} ms）是唯一大幅且稳定的提升；"
+            "套件现在只跑 `--query in`，建议把 `exists` / `scalar` 一并纳入，"
+            "并在 `check` 里给它单独设不回退门限，避免后续改执行计划时丢掉。"
+        )
+    graph = by_id.get("graph_reach")
+    if graph:
+        lines.append(
+            f"{len(lines) + 1}. **给 `graph_reach` 一个能测的规模。** 当前 "
+            f"{fmt_ms(graph['latest'])} ms 低于 0.01 ms 分辨率，涨跌只能记 0.0%；"
+            "把 `--nodes` / `--hops` 提高一个数量级，或改成 1000 次批量计时，"
+            "让结果落到可比较的毫秒级。"
+        )
+    lines.append(
+        f"{len(lines) + 1}. **CI 门限按平台拆开。** `bench-regress` 现在拿 Windows 基线在 Ubuntu 上"
+        "用 `--tolerance 2.0` 只挡 3× 量级，挡不住 10–20% 的漂移；建议按平台各存一份基线，"
+        "或在 Windows runner 上定时跑 benchmark，PR 只比较同一 runner 上 main 的相对值。"
+    )
+    lines.append(
+        f"{len(lines) + 1}. **看板下一版补分布。** 当前 JSON 只有 min / median / max，"
+        "只能做单次表和区间表；建议 `record` 额外存原始 samples，看板加 p50 / p90 与箱线图，"
+        "这样“涨了多少”与“抖了多少”能同时看见。"
+    )
+    return lines
+
+
 def build_markdown(
     baseline: dict,
     runs: list[dict],
@@ -581,6 +858,7 @@ def build_markdown(
     count: dict[str, int],
     latest: dict | None,
     base_commit: str,
+    single: dict | None = None,
 ) -> str:
     platform = baseline.get("platform", "unknown")
     measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
@@ -630,8 +908,50 @@ def build_markdown(
     write_subset = [row for row in measured if row["bench_id"] in WRITE_CASES]
     read_avg = sum(row["delta"] for row in read_subset) / len(read_subset) if read_subset else 0.0
     write_avg = sum(row["delta"] for row in write_subset) / len(write_subset) if write_subset else 0.0
+    if single:
+        single_rows = single["rows"]
+        single_count = counts(single_rows)
+        single_measured = [row for row in single_rows if row["status"] != STATUS_RESOLUTION]
+        single_median = (
+            statistics.median(row["delta"] for row in single_measured) if single_measured else 0.0
+        )
+        flips = [row for row in single_rows if row["relation"] == "相反"]
+        gap_row = max(single_rows, key=lambda row: row["gap"])
+        flip_text = "、".join(f"`{row['bench_id']}`" for row in flips) or "无"
+        agg_gap = (
+            fmt_delta_pct(gap_row["aggregate_delta"])
+            if gap_row["aggregate_delta"] is not None
+            else "—"
+        )
+        parts.append("## 3. 单次直比（参考）")
+        parts.append("")
+        parts.append(
+            "取基线批次第 1 次与当前批次第 1 次直接相减。**单次结果只用于观察抖动，不参与判定**："
+            f"当前批次同一 commit 的 {len(single['latest_runs'])} 次运行里，DML 的 median 能差一个数量级。"
+        )
+        parts.append("")
+        parts.append(
+            f"单次直比：{better_count(single_count)} 项更快、{single_count[STATUS_FLAT]} 项持平、"
+            f"{worse_count(single_count)} 项更慢，Δ% 中位数 {fmt_delta_pct(single_median)}。"
+            f"与 5 次聚合相比，方向相反的项：{flip_text}；偏差最大的是 `{gap_row['bench_id']}`"
+            f"（单次 {fmt_delta_pct(gap_row['delta'])} vs 聚合 {agg_gap}）。"
+        )
+        parts.append("")
+        parts.append(method_table(rows, count, single))
+        parts.append("")
+        parts.append("**逐项直比**")
+        parts.append("")
+        parts.append(single_table(single))
+        parts.append("")
+        parts.append(
+            "**同 commit 5 次波动区间**"
+            "（每项 median 的 min–max；倍数越大，单次结论越不可信）"
+        )
+        parts.append("")
+        parts.append(volatility_table(single))
+        parts.append("")
     best_row = min(measured, key=lambda row: row["delta"]) if measured else None
-    parts.append("## 3. 读写路径")
+    parts.append("## 4. 读写路径")
     parts.append("")
     parts.append(
         f"读路径平均 {fmt_delta_pct(read_avg)}，写路径平均 {fmt_delta_pct(write_avg)}；"
@@ -642,11 +962,11 @@ def build_markdown(
     parts.append("")
     parts.append(path_table(rows))
     parts.append("")
-    parts.append("## 4. 分层涨跌")
+    parts.append("## 5. 分层涨跌")
     parts.append("")
     parts.append(layer_table(rows))
     parts.append("")
-    parts.append("## 5. 运行历史")
+    parts.append("## 6. 运行历史")
     parts.append("")
     parts.append(
         f"只把 `{platform}` 的运行与同平台基线比较；同一天、同一 commit 的多轮运行先取"
@@ -656,11 +976,18 @@ def build_markdown(
     parts.append("")
     parts.append(history_table(baseline, group_runs(runs, platform)))
     parts.append("")
-    parts.append("## 6. 逐项趋势（最近 8 个运行批次）")
+    parts.append("## 7. 逐项趋势（最近 8 个运行批次）")
     parts.append("")
     parts.append(trend_table(baseline, group_runs(runs, platform)))
     parts.append("")
-    parts.append("## 7. 口径与复现")
+    parts.append("## 8. 后续修改建议")
+    parts.append("")
+    parts.append("按优先级：先降噪，再定位，最后才改代码。")
+    parts.append("")
+    for line in recommendation_lines(rows, single, write_avg):
+        parts.append(line)
+        parts.append("")
+    parts.append("## 9. 口径与复现")
     parts.append("")
     parts.append("```bash")
     parts.append("# 本地跑 5 轮（同一 commit 的中位数聚合）并写进 docs/results/bench-runs/")
@@ -831,7 +1158,13 @@ README_START = "<!-- BENCH-SUMMARY:BEGIN -->"
 README_END = "<!-- BENCH-SUMMARY:END -->"
 
 
-def readme_block(rows: list[dict], count: dict[str, int], baseline: dict, latest: dict | None) -> str:
+def readme_block(
+    rows: list[dict],
+    count: dict[str, int],
+    baseline: dict,
+    latest: dict | None,
+    single: dict | None = None,
+) -> str:
     measured = [row for row in rows if row["status"] != STATUS_RESOLUTION]
     median_delta = statistics.median(row["delta"] for row in measured) if measured else 0.0
     best = min(measured, key=lambda row: row["delta"])
@@ -887,6 +1220,9 @@ def readme_block(rows: list[dict], count: dict[str, int], baseline: dict, latest
         )
     )
     lines.append("")
+    if single:
+        lines.append(method_table(rows, count, single))
+        lines.append("")
     lines.append("<details>")
     lines.append(f"<summary>逐项涨跌明细（{len(rows)} 项，点开看每一项涨了多少 / 跌了多少）</summary>")
     lines.append("")
@@ -908,9 +1244,24 @@ def readme_block(rows: list[dict], count: dict[str, int], baseline: dict, latest
     )
     lines.append("")
     lines.append("</details>")
+    if single:
+        lines.append("")
+        lines.append("<details>")
+        lines.append(
+            "<summary>单次直比（仅参考：同一 commit 连跑 5 次，DML 的 median 可差一个数量级）</summary>"
+        )
+        lines.append("")
+        lines.append(readme_single_table(single))
+        lines.append("")
+        lines.append("</details>")
     lines.append("")
     lines.append(
-        "分层汇总、每次运行的历史、逐项趋势与口径见 "
+        "> **下一步**：先降噪（A/B 各 10 次），再按层定位写路径（`txn_put` 与 SQL 写项同向）；"
+        "单次表只作噪声参考。完整建议见看板第 8 节。"
+    )
+    lines.append("")
+    lines.append(
+        "分层汇总、单次波动区间、后续修改建议与口径见 "
         "[`docs/results/BENCH-DASHBOARD.md`](docs/results/BENCH-DASHBOARD.md)；"
         "原始数据在 [`docs/results/bench-runs/`](docs/results/bench-runs/)。"
     )
@@ -957,8 +1308,10 @@ def main() -> int:
     baseline = read_json(baseline_path)
     runs = load_runs(ROOT / args.runs_dir)
     platform = baseline.get("platform", "unknown")
+    commit = str(baseline.get("commit") or baseline_commit(baseline_path))
 
-    latest = aggregate_runs(latest_window(runs, platform, args.aggregate))
+    latest_runs = latest_window(runs, platform, args.aggregate)
+    latest = aggregate_runs(latest_runs)
     latest_cases = case_map(latest) if latest else {}
     base_cases = case_map(baseline)
     rows = build_rows(base_cases, latest_cases)
@@ -966,8 +1319,15 @@ def main() -> int:
         raise SystemExit("no comparable benchmark cases: baseline and runs are empty or mismatched")
 
     count = counts(rows)
-    commit = str(baseline.get("commit") or baseline_commit(baseline_path))
-    markdown = build_markdown(baseline, runs, rows, count, latest, commit)
+    baseline_runs = [
+        run
+        for run in load_runs(ROOT / args.baseline_runs_dir)
+        if run.get("platform") == platform
+        and case_map(run)
+        and same_commit(run.get("commit"), commit)
+    ]
+    single = build_single_comparison(baseline_runs, latest_runs, rows)
+    markdown = build_markdown(baseline, runs, rows, count, latest, commit, single)
     svg = build_svg(rows, baseline, latest, commit)
 
     (ROOT / args.out_md).write_text(markdown + "\n", encoding="utf-8")
@@ -990,7 +1350,7 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    update_readme(ROOT / args.readme, readme_block(rows, count, baseline, latest))
+    update_readme(ROOT / args.readme, readme_block(rows, count, baseline, latest, single))
 
     print(
         f"dashboard: {total} cases, {better} better / {count[STATUS_FLAT]} flat / {worse} worse, "
