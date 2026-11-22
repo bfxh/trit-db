@@ -593,7 +593,7 @@ def write_samples_csv(path: Path, latest: dict | None, baseline: dict) -> None:
                 )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["bench_id", "layer", "source", "run", "round", "ms"])
         writer.writerows(rows)
 
@@ -626,7 +626,7 @@ def write_ab_samples_csv(path: Path, ab: dict | None) -> None:
                 )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["bench_id", "side", "pair", "median_ms", "rss_kb"])
         writer.writerows(rows)
 
